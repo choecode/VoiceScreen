@@ -53,6 +53,13 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
     if (!string.IsNullOrEmpty(repeatedNoise.SourceText) || !string.IsNullOrEmpty(repeatedNoise.TranslatedText))
         throw new InvalidOperationException("GG 重复幻觉仍然进入了翻译或字幕流程。");
 
+    var repeatedChineseNoise = await local.TranslateIncomingTextAsync(
+        string.Concat(Enumerable.Repeat("我去哪了", 20)), "zh", CancellationToken.None);
+    Console.WriteLine("PASS：中文短语循环 ASR 幻觉已丢弃");
+    if (!string.IsNullOrEmpty(repeatedChineseNoise.SourceText)
+        || !string.IsNullOrEmpty(repeatedChineseNoise.TranslatedText))
+        throw new InvalidOperationException("中文短语循环幻觉仍然进入了字幕流程。");
+
     var legitimateRepetition = await local.TranslateIncomingTextAsync("No, it's okay. It's okay. We can hear you.",
         "en", CancellationToken.None);
     if (string.IsNullOrWhiteSpace(legitimateRepetition.TranslatedText))

@@ -60,13 +60,13 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     {
         if (string.IsNullOrWhiteSpace(text))
             return new LocalIncomingTranslation(string.Empty, string.Empty, detectedLanguage);
-        if (detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase) || ContainsChinese(text))
-            return new LocalIncomingTranslation(text.Trim(), text.Trim(), "zh");
         if (IsLikelyIncomingHallucination(text, detectedLanguage))
         {
             VoiceScreenLog.Warn($"Incoming ASR repetition discarded: {LogExcerpt(text)}");
             return EmptyIncoming(detectedLanguage);
         }
+        if (detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase) || ContainsChinese(text))
+            return new LocalIncomingTranslation(text.Trim(), text.Trim(), "zh");
         if (detectedLanguage.StartsWith("th", StringComparison.OrdinalIgnoreCase) || ContainsThai(text))
         {
             var englishBridge = await TranslateTextWithGateAsync(text.Trim(), TranslationDirection.ThaiToEnglish,
@@ -96,9 +96,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         => new(string.Empty, string.Empty, language);
 
     internal static bool IsLikelyIncomingHallucination(string text, string detectedLanguage)
-        => !detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
-           && !ContainsChinese(text)
-           && IsPathologicalRepetition(text);
+        => IsPathologicalRepetition(text);
 
     private static bool IsUnsafeTranslation(string source, string translated)
         => translated.Length > Math.Max(120, source.Length * 12)
@@ -116,6 +114,11 @@ public sealed class LocalOutgoingService : IAsyncDisposable
                 return true;
         }
 
+        // 中文没有空格，不能依赖下方的单词计数。检测“我去哪了我去哪了……”这类
+        // 短语周期性扩写，同时要求至少约四次重复，避免误杀正常的口语强调。
+        if (symbols.Length >= 16 && HasPeriodicSymbolPattern(symbols))
+            return true;
+
         var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(word => new string(word.Where(char.IsLetterOrDigit).Select(char.ToUpperInvariant).ToArray()))
             .Where(word => word.Length > 0)
@@ -123,6 +126,24 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         if (words.Length < 6) return false;
         var dominantWords = words.GroupBy(word => word).Max(group => group.Count());
         return (double)dominantWords / words.Length >= 0.7;
+    }
+
+    private static bool HasPeriodicSymbolPattern(char[] symbols)
+    {
+        var maxPeriod = Math.Min(16, symbols.Length / 3);
+        for (var period = 2; period <= maxPeriod; period++)
+        {
+            var matches = 0;
+            for (var index = period; index < symbols.Length; index++)
+            {
+                if (symbols[index] == symbols[index % period]) matches++;
+            }
+
+            if ((double)matches / (symbols.Length - period) >= 0.88)
+                return true;
+        }
+
+        return false;
     }
 
     private static bool ContainsChinese(string text)

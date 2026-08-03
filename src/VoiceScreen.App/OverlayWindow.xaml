@@ -47,7 +47,8 @@
                 </ListBox.ItemTemplate>
             </ListBox>
             <Border x:Name="PreviewBorder" Grid.Row="2" Background="#80242B36" CornerRadius="6"
-                    Padding="8,6" Margin="0,6,0,0" Visibility="Collapsed">
+                    BorderBrush="#50616E7C" BorderThickness="0,1,0,0"
+                    Padding="8,9,8,6" Margin="0,16,0,0" Visibility="Collapsed">
                 <TextBlock x:Name="PreviewText" Foreground="#B8C4D6" FontWeight="SemiBold"
                            TextWrapping="Wrap" TextTrimming="None" Opacity="0.9">
                     <TextBlock.Effect>
