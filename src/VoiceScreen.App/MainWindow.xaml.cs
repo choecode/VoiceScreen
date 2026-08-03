@@ -18,6 +18,7 @@ public partial class MainWindow : Window
     private AppSettings _settings;
     private TranslationEngine? _engine;
     private OverlayWindow? _overlay;
+    private IntPtr _windowHandle;
 
     public MainWindow()
     {
@@ -47,6 +48,7 @@ public partial class MainWindow : Window
         try
         {
             var hwnd = new WindowInteropHelper(this).Handle;
+            _windowHandle = hwnd;
             if (hwnd != IntPtr.Zero)
             {
                 RevokeDragDrop(hwnd);
@@ -149,7 +151,7 @@ public partial class MainWindow : Window
             _engine.StatusChanged += OnStatusChanged;
             _engine.Error += OnError;
             await _engine.StartAsync(CancellationToken.None);
-            _hook.Start();
+            _hook.Start(_windowHandle);
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = true;
             TestTranslationButton.IsEnabled = !_settings.DemoMode;
