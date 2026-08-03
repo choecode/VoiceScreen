@@ -3,6 +3,7 @@
 VoiceScreen 是一个在 Windows 11 上运行的 Discord 双向语音翻译工具，运行时不依赖任何云端 API。
 
 > 新电脑安装、模型下载、VB-CABLE/Discord 设置、离线验收和故障排查，请阅读 [完整部署教程](DEPLOYMENT.md)。
+> 项目功能、界面、工作流程、日常使用与技术架构见 [项目说明](PROJECT_GUIDE.md)。
 > 模型来源与许可见 [第三方模型说明](THIRD_PARTY_MODELS.md)。
 > 一期之后的低延迟、增量字幕和实时翻译路线见 [二期实时化方案](REALTIME_ROADMAP.md)。
 
