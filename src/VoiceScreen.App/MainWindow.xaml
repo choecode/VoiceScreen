@@ -76,7 +76,9 @@
                 <WrapPanel Margin="0,16,0,0">
                     <Button x:Name="StartButton" Content="启动" Width="120" Height="40" Margin="0,0,10,0" Click="StartButton_Click" Background="#238636" Foreground="White" />
                     <Button x:Name="StopButton" Content="停止" Width="100" Height="40" Margin="0,0,10,0" Click="StopButton_Click" IsEnabled="False" />
-                    <Button Content="刷新设备" Width="110" Height="40" Click="RefreshDevicesButton_Click" />
+                    <Button Content="刷新设备" Width="110" Height="40" Margin="0,0,10,0" Click="RefreshDevicesButton_Click" />
+                    <Button x:Name="AdjustOverlayButton" Content="调整悬浮窗" Width="130" Height="40"
+                            Click="AdjustOverlayButton_Click" IsEnabled="False" />
                 </WrapPanel>
                 <DockPanel Margin="0,14,0,0" LastChildFill="True">
                     <Button x:Name="TestTranslationButton" DockPanel.Dock="Right" Content="翻译并试听（仅耳机）" Width="190" Height="38"

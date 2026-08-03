@@ -27,6 +27,8 @@ public partial class MainWindow : Window
         Closing += OnClosing;
         SourceInitialized += OnSourceInitialized;
         _hook.Pressed += (_, _) => _engine?.BeginLocalCapture();
+        _hook.PageUpPressed += (_, _) => _overlay?.ScrollPage(down: false);
+        _hook.PageDownPressed += (_, _) => _overlay?.ScrollPage(down: true);
         _hook.Released += async (_, _) =>
         {
             if (_engine is not null) await _engine.EndLocalCaptureAsync();
@@ -125,7 +127,9 @@ public partial class MainWindow : Window
             EnglishVoiceName = (EnglishVoiceCombo.SelectedItem as SpeechVoiceOption)?.Id ?? string.Empty,
             MaxSubtitleLines = _settings.MaxSubtitleLines,
             OverlayLeft = _settings.OverlayLeft,
-            OverlayTop = _settings.OverlayTop
+            OverlayTop = _settings.OverlayTop,
+            OverlayWidth = _settings.OverlayWidth,
+            OverlayHeight = _settings.OverlayHeight
         };
     }
 
@@ -135,7 +139,8 @@ public partial class MainWindow : Window
         {
             _settings = ReadSettings();
             _settingsStore.Save(_settings);
-            _overlay = new OverlayWindow(_settings.MaxSubtitleLines, _settings.OverlayLeft, _settings.OverlayTop);
+            _overlay = new OverlayWindow(_settings.MaxSubtitleLines, _settings.OverlayLeft, _settings.OverlayTop,
+                _settings.OverlayWidth, _settings.OverlayHeight);
             _overlay.Show();
             _engine = new TranslationEngine(_settings);
             _engine.SubtitleProduced += OnSubtitleProduced;
@@ -146,6 +151,7 @@ public partial class MainWindow : Window
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = true;
             TestTranslationButton.IsEnabled = !_settings.DemoMode;
+            AdjustOverlayButton.IsEnabled = true;
             _overlay.SetStatus("运行中 · 原声麦克风直通", ok: true);
         }
         catch (Exception ex)
@@ -182,6 +188,14 @@ public partial class MainWindow : Window
 
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();
 
+    private void AdjustOverlayButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_overlay is null) return;
+        _overlay.SetInteractive(!_overlay.IsInteractive);
+        AdjustOverlayButton.Content = _overlay.IsInteractive ? "锁定悬浮窗" : "调整悬浮窗";
+        if (!_overlay.IsInteractive) SaveOverlayBounds();
+    }
+
     private void OnSubtitleProduced(object? sender, (string Kind, string Text) item) => _overlay?.AddLine(item.Kind, item.Text);
     private void OnStatusChanged(object? sender, string text)
     {
@@ -198,6 +212,7 @@ public partial class MainWindow : Window
 
     private async Task StopEngineAsync()
     {
+        SaveOverlayBounds();
         _hook.Dispose();
         if (_engine is not null)
         {
@@ -209,6 +224,8 @@ public partial class MainWindow : Window
         }
         _overlay?.Close();
         _overlay = null;
+        AdjustOverlayButton.Content = "调整悬浮窗";
+        AdjustOverlayButton.IsEnabled = false;
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
         TestTranslationButton.IsEnabled = false;
@@ -217,9 +234,19 @@ public partial class MainWindow : Window
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
-        _settings.OverlayLeft = _overlay?.Left ?? _settings.OverlayLeft;
-        _settings.OverlayTop = _overlay?.Top ?? _settings.OverlayTop;
-        _settingsStore.Save(_settings);
+        SaveOverlayBounds();
         await StopEngineAsync();
+    }
+
+    private void SaveOverlayBounds()
+    {
+        if (_overlay is not null)
+        {
+            _settings.OverlayLeft = _overlay.Left;
+            _settings.OverlayTop = _overlay.Top;
+            _settings.OverlayWidth = _overlay.Width;
+            _settings.OverlayHeight = _overlay.Height;
+        }
+        _settingsStore.Save(_settings);
     }
 }

@@ -11,9 +11,13 @@ public sealed class RightAltHoldHook : IDisposable
     private const int WmSyskeydown = 0x0104;
     private const int WmSyskeyup = 0x0105;
     private const int VkRmenu = 0xA5;
+    private const int VkPrior = 0x21; // Page Up
+    private const int VkNext = 0x22; // Page Down
     private readonly LowLevelKeyboardProc _callback;
     private IntPtr _hook;
     private bool _isDown;
+    private bool _pageUpDown;
+    private bool _pageDownDown;
 
     public RightAltHoldHook()
     {
@@ -22,6 +26,8 @@ public sealed class RightAltHoldHook : IDisposable
 
     public event EventHandler? Pressed;
     public event EventHandler? Released;
+    public event EventHandler? PageUpPressed;
+    public event EventHandler? PageDownPressed;
 
     public void Start()
     {
@@ -34,18 +40,41 @@ public sealed class RightAltHoldHook : IDisposable
 
     private IntPtr HookCallback(int code, IntPtr wParam, IntPtr lParam)
     {
-        if (code >= 0 && Marshal.ReadInt32(lParam) == VkRmenu)
+        if (code >= 0)
         {
+            var virtualKey = Marshal.ReadInt32(lParam);
             var message = wParam.ToInt32();
-            if ((message == WmKeydown || message == WmSyskeydown) && !_isDown)
+            var keyDown = message == WmKeydown || message == WmSyskeydown;
+            var keyUp = message == WmKeyup || message == WmSyskeyup;
+            if (virtualKey == VkRmenu && keyDown && !_isDown)
             {
                 _isDown = true;
                 Pressed?.Invoke(this, EventArgs.Empty);
             }
-            else if ((message == WmKeyup || message == WmSyskeyup) && _isDown)
+            else if (virtualKey == VkRmenu && keyUp && _isDown)
             {
                 _isDown = false;
                 Released?.Invoke(this, EventArgs.Empty);
+            }
+            else if (virtualKey == VkPrior)
+            {
+                if (keyDown && !_pageUpDown)
+                {
+                    _pageUpDown = true;
+                    PageUpPressed?.Invoke(this, EventArgs.Empty);
+                }
+                else if (keyUp) _pageUpDown = false;
+                if (PageUpPressed is not null) return new IntPtr(1);
+            }
+            else if (virtualKey == VkNext)
+            {
+                if (keyDown && !_pageDownDown)
+                {
+                    _pageDownDown = true;
+                    PageDownPressed?.Invoke(this, EventArgs.Empty);
+                }
+                else if (keyUp) _pageDownDown = false;
+                if (PageDownPressed is not null) return new IntPtr(1);
             }
         }
         return CallNextHookEx(_hook, code, wParam, lParam);
@@ -55,6 +84,9 @@ public sealed class RightAltHoldHook : IDisposable
     {
         if (_hook != IntPtr.Zero) UnhookWindowsHookEx(_hook);
         _hook = IntPtr.Zero;
+        _isDown = false;
+        _pageUpDown = false;
+        _pageDownDown = false;
     }
 
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
