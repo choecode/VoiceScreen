@@ -2,6 +2,7 @@ using VoiceScreen.App.Audio;
 using VoiceScreen.App.Diagnostics;
 using VoiceScreen.App.Models;
 using VoiceScreen.Core;
+using System.Diagnostics;
 
 namespace VoiceScreen.App.Services;
 
@@ -77,6 +78,7 @@ public sealed class TranslationEngine : IAsyncDisposable
     public async Task EndLocalCaptureAsync()
     {
         if (!IsRunning || Interlocked.Exchange(ref _processingOutgoing, 1) != 0) return;
+        var stage = "准备";
         try
         {
             if (!_state.TryBeginTranslation()) return;
@@ -87,22 +89,26 @@ public sealed class TranslationEngine : IAsyncDisposable
                 return;
             }
 
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(10));
-            var token = timeout.Token;
             LocalOutgoingTranslation translation;
+            stage = "识别和翻译";
+            var translationTimer = Stopwatch.StartNew();
+            using var translationTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            translationTimeout.CancelAfter(TimeSpan.FromSeconds(35));
+            var translationToken = translationTimeout.Token;
             if (_settings.DemoMode)
             {
-                await Task.Delay(300, token).ConfigureAwait(false);
+                await Task.Delay(300, translationToken).ConfigureAwait(false);
                 translation = new LocalOutgoingTranslation("模拟模式：他们在二楼", "They're on the second floor.");
             }
             else
             {
                 var pcm = AudioTranscoder.ToPcm16Mono16Khz(captured);
                 var local = _localOutgoing ?? throw new InvalidOperationException("本地发送服务尚未启动。");
-                var result = await local.TranslateSpeechAsync(pcm, token).ConfigureAwait(false);
+                var result = await local.TranslateSpeechAsync(pcm, translationToken).ConfigureAwait(false);
                 translation = result;
             }
+            translationTimer.Stop();
+            VoiceScreenLog.Info($"Outgoing ASR+translation completed in {translationTimer.ElapsedMilliseconds}ms");
 
             if (string.IsNullOrWhiteSpace(translation.TranslatedText))
                 throw new InvalidOperationException("没有得到英文翻译结果。");
@@ -112,15 +118,27 @@ public sealed class TranslationEngine : IAsyncDisposable
             _echo.RememberSent(translation.TranslatedText);
             if (!_state.TryBeginTts()) throw new InvalidOperationException("发送状态异常。");
 
-            var tts = await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, token,
+            stage = "英文语音合成和播放";
+            var playbackTimer = Stopwatch.StartNew();
+            using var playbackTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            playbackTimeout.CancelAfter(TimeSpan.FromSeconds(60));
+            var playbackToken = playbackTimeout.Token;
+            var tts = await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, playbackToken,
                 _settings.EnglishVoiceName).ConfigureAwait(false);
-            await _router.PlayTtsAsync(tts, token, _settings.MonitorTranslatedSpeech).ConfigureAwait(false);
+            await _router.PlayTtsAsync(tts, playbackToken, _settings.MonitorTranslatedSpeech).ConfigureAwait(false);
             _state.TryBeginCooldown();
-            await Task.Delay(500, token).ConfigureAwait(false);
+            await Task.Delay(500, playbackToken).ConfigureAwait(false);
+            playbackTimer.Stop();
+            VoiceScreenLog.Info($"Outgoing TTS+playback completed in {playbackTimer.ElapsedMilliseconds}ms");
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
         {
-            Error?.Invoke(this, "本次翻译超过 10 秒，已取消并恢复原声麦克风。");
+            var limit = stage == "识别和翻译" ? "35 秒" : "60 秒";
+            Error?.Invoke(this, $"本次{stage}超过 {limit}，已取消并恢复原声麦克风。");
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            // 程序正常停止时不向字幕历史写入超时错误。
         }
         catch (Exception ex)
         {
