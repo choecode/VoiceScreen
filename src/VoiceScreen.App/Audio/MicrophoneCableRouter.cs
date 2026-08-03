@@ -13,8 +13,10 @@ public sealed class MicrophoneCableRouter : IDisposable
     private readonly object _recordingGate = new();
     private WasapiCapture? _capture;
     private WasapiOut? _output;
+    private WasapiOut? _monitorOutput;
     private BufferedWaveProvider? _microphoneBuffer;
     private BufferedWaveProvider? _ttsBuffer;
+    private BufferedWaveProvider? _monitorTtsBuffer;
     private VolumeSampleProvider? _microphoneVolume;
     private MemoryStream? _recording;
     private DateTimeOffset _recordingStarted;
@@ -24,12 +26,15 @@ public sealed class MicrophoneCableRouter : IDisposable
     public bool IsPassThroughEnabled => _microphoneVolume?.Volume > 0.5f;
     public string? MicrophoneFormat => _capture?.WaveFormat.ToString();
 
-    public void Start(string microphoneDeviceId, string cableRenderDeviceId)
+    public void Start(string microphoneDeviceId, string cableRenderDeviceId, string? monitorRenderDeviceId = null)
     {
         if (IsRunning) return;
         using var enumerator = new MMDeviceEnumerator();
         var microphone = enumerator.GetDevice(microphoneDeviceId);
         var cable = enumerator.GetDevice(cableRenderDeviceId);
+        var monitor = string.IsNullOrWhiteSpace(monitorRenderDeviceId)
+            ? null
+            : enumerator.GetDevice(monitorRenderDeviceId);
 
         // 安全底线：如果把输出选成实体耳机，程序会把用户麦克风实时回放给自己，产生明显回声。
         // 宁可拒绝启动，也不能把任意播放设备当成虚拟麦克风线路。
@@ -41,6 +46,8 @@ public sealed class MicrophoneCableRouter : IDisposable
         }
         if (microphone.FriendlyName.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("实体麦克风不能选择 CABLE Output，请选择 HyperX 麦克风。");
+        if (monitor is not null && monitor.FriendlyName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("英文试听设备必须是实体耳机，不能选择 CABLE Input。");
 
         _capture = new WasapiCapture(microphone, true, 40);
         _microphoneBuffer = new BufferedWaveProvider(_capture.WaveFormat)
@@ -63,6 +70,15 @@ public sealed class MicrophoneCableRouter : IDisposable
         var ttsStereo = new MonoToStereoSampleProvider(_ttsBuffer.ToSampleProvider());
         var tts48k = new WdlResamplingSampleProvider(ttsStereo, 48000);
 
+        if (monitor is not null)
+        {
+            _monitorTtsBuffer = CreateTtsBuffer();
+            var monitorStereo = new MonoToStereoSampleProvider(_monitorTtsBuffer.ToSampleProvider());
+            var monitor48k = new WdlResamplingSampleProvider(monitorStereo, 48000);
+            _monitorOutput = new WasapiOut(monitor, AudioClientShareMode.Shared, true, 80);
+            _monitorOutput.Init(monitor48k);
+        }
+
         var mixer = new MixingSampleProvider(new ISampleProvider[] { _microphoneVolume, tts48k })
         {
             ReadFully = true
@@ -74,6 +90,7 @@ public sealed class MicrophoneCableRouter : IDisposable
         _capture.DataAvailable += OnMicrophoneData;
         _capture.RecordingStopped += OnRecordingStopped;
         _output.Play();
+        _monitorOutput?.Play();
         _capture.StartRecording();
     }
 
@@ -112,26 +129,57 @@ public sealed class MicrophoneCableRouter : IDisposable
         }
     }
 
-    public async Task PlayTtsAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
+    public async Task PlayTtsAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken,
+        bool playOnMonitor = true)
+        => await PlayTtsInternalAsync(pcm16Mono16Khz, sendToCable: true,
+            playOnMonitor: playOnMonitor && _monitorTtsBuffer is not null, cancellationToken).ConfigureAwait(false);
+
+    public async Task PlayMonitorTtsAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
+    {
+        if (_monitorTtsBuffer is null) throw new InvalidOperationException("没有配置英文试听耳机。");
+        await PlayTtsInternalAsync(pcm16Mono16Khz, sendToCable: false, playOnMonitor: true, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task PlayTtsInternalAsync(byte[] pcm16Mono16Khz, bool sendToCable, bool playOnMonitor,
+        CancellationToken cancellationToken)
     {
         if (_ttsBuffer is null) throw new InvalidOperationException("音频路由尚未启动。");
-        _ttsBuffer.ClearBuffer();
-        _ttsBuffer.AddSamples(pcm16Mono16Khz, 0, pcm16Mono16Khz.Length);
+        if (sendToCable)
+        {
+            _ttsBuffer.ClearBuffer();
+            _ttsBuffer.AddSamples(pcm16Mono16Khz, 0, pcm16Mono16Khz.Length);
+        }
+        if (playOnMonitor && _monitorTtsBuffer is not null)
+        {
+            _monitorTtsBuffer.ClearBuffer();
+            _monitorTtsBuffer.AddSamples(pcm16Mono16Khz, 0, pcm16Mono16Khz.Length);
+        }
 
         // Discord 的语音活动检测和 VB-CABLE/WASAPI 都存在尾部缓冲。
         // 在句尾追加静音，确保最后一个单词完整穿过设备缓冲后再恢复原始麦克风。
         var trailingSilence = new byte[Pcm16Mono16KhzBytesPerSecond * TtsTrailingSilenceMilliseconds / 1000];
-        _ttsBuffer.AddSamples(trailingSilence, 0, trailingSilence.Length);
+        if (sendToCable) _ttsBuffer.AddSamples(trailingSilence, 0, trailingSilence.Length);
+        if (playOnMonitor) _monitorTtsBuffer?.AddSamples(trailingSilence, 0, trailingSilence.Length);
 
         var expected = TimeSpan.FromSeconds(
             (double)(pcm16Mono16Khz.Length + trailingSilence.Length) / Pcm16Mono16KhzBytesPerSecond);
         var deadline = DateTimeOffset.UtcNow + expected + TimeSpan.FromSeconds(2);
-        while (_ttsBuffer.BufferedBytes > 0 && DateTimeOffset.UtcNow < deadline)
+        while (((sendToCable && _ttsBuffer.BufferedBytes > 0)
+                || (playOnMonitor && _monitorTtsBuffer is not null && _monitorTtsBuffer.BufferedBytes > 0))
+               && DateTimeOffset.UtcNow < deadline)
             await Task.Delay(25, cancellationToken).ConfigureAwait(false);
 
         // BufferedBytes 为零表示数据已交给 WASAPI，不代表硬件/虚拟线末端已经播放完。
         await Task.Delay(WasapiDrainGuardMilliseconds, cancellationToken).ConfigureAwait(false);
     }
+
+    private static BufferedWaveProvider CreateTtsBuffer() => new(new WaveFormat(16000, 16, 1))
+    {
+        BufferDuration = TimeSpan.FromSeconds(30),
+        DiscardOnBufferOverflow = false,
+        ReadFully = true
+    };
 
     private void OnMicrophoneData(object? sender, WaveInEventArgs e)
     {
@@ -157,8 +205,11 @@ public sealed class MicrophoneCableRouter : IDisposable
         }
         try { _output?.Stop(); } catch { }
         _output?.Dispose();
+        try { _monitorOutput?.Stop(); } catch { }
+        _monitorOutput?.Dispose();
         _recording?.Dispose();
         _capture = null;
         _output = null;
+        _monitorOutput = null;
     }
 }

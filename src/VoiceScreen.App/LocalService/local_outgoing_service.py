@@ -1,8 +1,10 @@
-"""VoiceScreen local English/Chinese ASR worker. Binds to loopback only."""
+"""VoiceScreen local ASR and deterministic OPUS-MT translation service."""
 
 import argparse
 import json
 import os
+import re
+
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -10,16 +12,90 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import ctranslate2
 import numpy as np
 from faster_whisper import WhisperModel
+from transformers import MarianTokenizer
 
 
 class State:
-    model = None
+    whisper = None
+    zh_en = None
+    en_zh = None
+    zh_en_tokenizer = None
+    en_zh_tokenizer = None
+
+
+def model_root():
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        raise RuntimeError("LOCALAPPDATA is not available")
+    return os.path.join(local_app_data, "VoiceScreen", "Models")
+
+
+def require_model(name):
+    path = os.path.join(model_root(), name)
+    if not os.path.isfile(os.path.join(path, "model.bin")):
+        raise RuntimeError(
+            f"Missing local translation model: {name}. Run tools/setup_local_models.ps1 first."
+        )
+    return path
+
+
+def normalize_game_terms(text, direction):
+    if direction == "zh-en":
+        replacements = {
+            "先别冲": "暂时不要进攻",
+            "不要冲": "不要急着进攻",
+            "别冲": "不要急着进攻",
+        }
+        for source, target in replacements.items():
+            text = text.replace(source, target)
+        return text
+
+    text = re.sub(r"\bdon['’]?t\s+push\b", "don't attack", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bdo\s+not\s+push\b", "do not attack", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bpush\b", "advance", text, flags=re.IGNORECASE)
+    return text
+
+
+def split_clauses(text, direction):
+    pattern = r"[\uFF0C\u3002\uFF01\uFF1F\uFF1B,!?;]+" if direction == "zh-en" else r"(?<=[.!?;])\s+|[,;]+"
+    parts = [part.strip() for part in re.split(pattern, text) if part.strip()]
+    return parts or [text.strip()]
+
+
+def translate_text(text, direction):
+    if direction == "zh-en":
+        translator = State.zh_en
+        tokenizer = State.zh_en_tokenizer
+    elif direction == "en-zh":
+        translator = State.en_zh
+        tokenizer = State.en_zh_tokenizer
+    else:
+        raise ValueError("direction must be zh-en or en-zh")
+
+    normalized = normalize_game_terms(text.strip(), direction)
+    clauses = split_clauses(normalized, direction)
+    batches = [tokenizer.convert_ids_to_tokens(tokenizer.encode(clause)) for clause in clauses]
+    results = translator.translate_batch(batches, beam_size=4, max_decoding_length=96)
+    translated = []
+    for result in results:
+        value = tokenizer.decode(
+            tokenizer.convert_tokens_to_ids(result.hypotheses[0]), skip_special_tokens=True
+        ).strip()
+        if value:
+            translated.append(value)
+    output = " ".join(translated).strip()
+
+    # OPUS-MT translates this polite phrase too literally when it is isolated as a clause.
+    if direction == "zh-en" and "不要介意" in text:
+        output = re.sub(r"Please don['’]t bother\.?", "Please don't mind.", output, flags=re.IGNORECASE)
+    return output
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VoiceScreenLocalASR/1.0"
+    server_version = "VoiceScreenLocalModels/2.0"
 
     def log_message(self, fmt, *args):
         return
@@ -32,59 +108,85 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def read_body(self, maximum):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > maximum:
+            raise ValueError("invalid request payload")
+        return self.rfile.read(length)
+
     def do_GET(self):
         if self.path == "/health":
-            self.send_json(200, {"status": "ready", "model": "small", "device": "cpu", "compute": "int8"})
+            self.send_json(200, {
+                "status": "ready",
+                "asr": "faster-whisper-small-cpu-int8",
+                "translation": "opus-mt-zh-en+en-zh-cpu-int8",
+            })
         else:
             self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/transcribe":
-            self.send_json(404, {"error": "not found"})
-            return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 16 * 1024 * 1024:
-                self.send_json(400, {"error": "invalid PCM payload"})
-                return
-            pcm = self.rfile.read(length)
-            audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-            requested_language = parse_qs(parsed.query).get("language", ["zh"])[0]
-            if requested_language not in ("zh", "en"):
-                self.send_json(400, {"error": "language must be zh or en"})
-                return
-            segments, info = State.model.transcribe(
-                audio,
-                language=requested_language,
-                beam_size=1,
-                best_of=1,
-                temperature=0,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 250},
-                condition_on_previous_text=False,
-                without_timestamps=True,
-            )
-            text = "".join(segment.text for segment in segments).strip()
-            self.send_json(200, {"text": text, "language": info.language})
+            if parsed.path == "/transcribe":
+                self.transcribe(parsed)
+            elif parsed.path == "/translate":
+                self.translate()
+            else:
+                self.send_json(404, {"error": "not found"})
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
+
+    def transcribe(self, parsed):
+        pcm = self.read_body(16 * 1024 * 1024)
+        audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        requested = parse_qs(parsed.query).get("language", ["auto"])[0]
+        if requested not in ("zh", "en", "auto"):
+            raise ValueError("language must be zh, en, or auto")
+        options = dict(
+            beam_size=1,
+            best_of=1,
+            temperature=0,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 250},
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+        if requested != "auto":
+            options["language"] = requested
+        segments, info = State.whisper.transcribe(audio, **options)
+        text = "".join(segment.text for segment in segments).strip()
+        self.send_json(200, {"text": text, "language": info.language})
+
+    def translate(self):
+        request = json.loads(self.read_body(64 * 1024).decode("utf-8"))
+        text = str(request.get("text", "")).strip()
+        direction = str(request.get("direction", ""))
+        if not text or len(text) > 1000:
+            raise ValueError("translation text is empty or too long")
+        self.send_json(200, {"text": translate_text(text, direction)})
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18765)
     args = parser.parse_args()
-    State.model = WhisperModel(
-        "small",
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=8,
-        num_workers=1,
+
+    root = model_root()
+    zh_en_model = require_model("opus-mt-zh-en-ct2-int8")
+    en_zh_model = require_model("opus-mt-en-zh-ct2-int8")
+    State.whisper = WhisperModel(
+        "small", device="cpu", compute_type="int8", cpu_threads=8, num_workers=1,
         local_files_only=True,
     )
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    server.serve_forever()
+    State.zh_en = ctranslate2.Translator(
+        zh_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+    )
+    State.en_zh = ctranslate2.Translator(
+        en_zh_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+    )
+    State.zh_en_tokenizer = MarianTokenizer.from_pretrained(zh_en_model, local_files_only=True)
+    State.en_zh_tokenizer = MarianTokenizer.from_pretrained(en_zh_model, local_files_only=True)
+    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

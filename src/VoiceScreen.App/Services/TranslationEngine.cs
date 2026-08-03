@@ -34,7 +34,7 @@ public sealed class TranslationEngine : IAsyncDisposable
     {
         NormalizeAudioRoutingDevices();
         ValidateSettings();
-        _router.Start(_settings.MicrophoneDeviceId, _settings.CableRenderDeviceId);
+        _router.Start(_settings.MicrophoneDeviceId, _settings.CableRenderDeviceId, _settings.MonitorRenderDeviceId);
         if (_settings.DemoMode)
         {
             _demoTask = Task.Run(() => DemoIncomingLoopAsync(_lifetime.Token));
@@ -50,7 +50,7 @@ public sealed class TranslationEngine : IAsyncDisposable
             _discordCapture = CreateIncomingCapture();
         }
         IsRunning = true;
-        var mode = _settings.DemoMode ? "Demo" : "Local-Whisper-Qwen";
+        var mode = _settings.DemoMode ? "Demo" : "Local-Whisper-OPUS-MT";
         var incomingLang = _settings.DemoMode ? "n/a" : "en->cn";
         VoiceScreenLog.Info($"TranslationEngine started. mode={mode} incomingLang={incomingLang}");
         StatusChanged?.Invoke(this, _settings.DemoMode
@@ -112,8 +112,9 @@ public sealed class TranslationEngine : IAsyncDisposable
             _echo.RememberSent(translation.TranslatedText);
             if (!_state.TryBeginTts()) throw new InvalidOperationException("发送状态异常。");
 
-            var tts = await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, token).ConfigureAwait(false);
-            await _router.PlayTtsAsync(tts, token).ConfigureAwait(false);
+            var tts = await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, token,
+                _settings.EnglishVoiceName).ConfigureAwait(false);
+            await _router.PlayTtsAsync(tts, token, _settings.MonitorTranslatedSpeech).ConfigureAwait(false);
             _state.TryBeginCooldown();
             await Task.Delay(500, token).ConfigureAwait(false);
         }
@@ -134,25 +135,36 @@ public sealed class TranslationEngine : IAsyncDisposable
         }
     }
 
-    public async Task PlayTestPhraseAsync(CancellationToken cancellationToken)
+    public async Task TranslateAndPreviewAsync(string chineseText, CancellationToken cancellationToken)
     {
         if (!IsRunning) throw new InvalidOperationException("请先启动程序。");
-        if (!_state.TryBeginLocalCapture()) throw new InvalidOperationException("当前正在处理另一条语音。");
-        _router.BeginTranslationCapture();
+        if (_settings.DemoMode) throw new InvalidOperationException("请先取消模拟模式并重新启动，才能测试真实本地翻译。");
+        if (string.IsNullOrWhiteSpace(chineseText)) throw new InvalidOperationException("请输入要测试的中文。");
+        if (Interlocked.Exchange(ref _processingOutgoing, 1) != 0)
+            throw new InvalidOperationException("当前正在处理另一条语音。");
         try
         {
+            if (!_state.TryBeginLocalCapture()) throw new InvalidOperationException("当前正在处理另一条语音。");
+            _router.BeginTranslationCapture();
             _state.TryBeginTranslation();
-            const string text = "VoiceScreen audio routing test. The virtual microphone is working.";
-            SubtitleProduced?.Invoke(this, ("sent", $"测试发送：{text}"));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            var local = _localOutgoing ?? throw new InvalidOperationException("本地翻译服务尚未启动。");
+            var english = await local.TranslateChineseTextAsync(chineseText, timeout.Token).ConfigureAwait(false);
+            SubtitleProduced?.Invoke(this, ("mine", $"测试中文：{chineseText.Trim()}"));
+            SubtitleProduced?.Invoke(this, ("sent", $"试听英文：{english}"));
             _state.TryBeginTts();
-            var audio = await OfflineSpeech.SynthesizeEnglishAsync(text, cancellationToken).ConfigureAwait(false);
-            await _router.PlayTtsAsync(audio, cancellationToken).ConfigureAwait(false);
+            var audio = await OfflineSpeech.SynthesizeEnglishAsync(english, timeout.Token,
+                _settings.EnglishVoiceName).ConfigureAwait(false);
+            await _router.PlayMonitorTtsAsync(audio, timeout.Token).ConfigureAwait(false);
             _state.TryBeginCooldown();
         }
         finally
         {
             _router.RestorePassThrough();
             _state.Complete();
+            Interlocked.Exchange(ref _processingOutgoing, 0);
+            StatusChanged?.Invoke(this, "试听完成，原声麦克风已恢复");
         }
     }
 
@@ -188,9 +200,11 @@ public sealed class TranslationEngine : IAsyncDisposable
     {
         if (!_state.ShouldAcceptRemoteResult || string.IsNullOrWhiteSpace(result.TranslatedText)) return;
         if (_echo.IsLikelyEcho(result.SourceText)) return;
-        var subtitle = string.IsNullOrWhiteSpace(result.SourceText)
-            ? $"中文：{result.TranslatedText}"
-            : $"EN：{result.SourceText}\n中：{result.TranslatedText}";
+        var subtitle = result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+            ? $"中：{result.SourceText}"
+            : result.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
+                ? $"EN：{result.SourceText}\n中：{result.TranslatedText}"
+                : $"[{result.Language}]：{result.SourceText}";
         // 英文原文和中文译文作为同一个字幕项，滚动和淘汰时不会错位。
         SubtitleProduced?.Invoke(this, ("remote", subtitle));
     }
@@ -216,6 +230,8 @@ public sealed class TranslationEngine : IAsyncDisposable
     {
         if (string.IsNullOrWhiteSpace(_settings.MicrophoneDeviceId)) throw new InvalidOperationException("请选择实体麦克风。");
         if (string.IsNullOrWhiteSpace(_settings.CableRenderDeviceId)) throw new InvalidOperationException("请选择 CABLE Input 虚拟播放设备。");
+        if (string.IsNullOrWhiteSpace(_settings.MonitorRenderDeviceId))
+            throw new InvalidOperationException("请选择英文试听耳机。");
     }
 
     /// <summary>
@@ -235,13 +251,30 @@ public sealed class TranslationEngine : IAsyncDisposable
             _settings.CableRenderDeviceId = cable.Id;
             VoiceScreenLog.Info($"Audio routing corrected automatically: virtual output={cable.Name}");
         }
+        var configuredMonitor = renderDevices.FirstOrDefault(device => device.Id == _settings.MonitorRenderDeviceId);
+        if (configuredMonitor is null || AudioDeviceService.IsVirtualCableInput(configuredMonitor))
+        {
+            var monitor = AudioDeviceService.FindBest(renderDevices.Where(device => !AudioDeviceService.IsVirtualCableInput(device)),
+                string.Empty, "HyperX", "耳机", "Headphones")
+                ?? throw new InvalidOperationException("没有找到可用于英文试听的实体耳机。");
+            _settings.MonitorRenderDeviceId = monitor.Id;
+            VoiceScreenLog.Info($"Audio monitor selected automatically: output={monitor.Name}");
+        }
+        var voices = OfflineSpeech.GetInstalledEnglishVoices();
+        if (voices.Count == 0)
+            throw new InvalidOperationException("没有检测到 Windows 英文语音，请在 Windows 语音设置中安装英文男声或女声。");
+        if (!voices.Any(voice => voice.Id == _settings.EnglishVoiceName))
+        {
+            _settings.EnglishVoiceName = voices[0].Id;
+            VoiceScreenLog.Info($"English TTS voice selected automatically: voice={voices[0].Name}");
+        }
     }
 
     private static string DescribeState(DuplexState state) => state switch
     {
         DuplexState.CapturingLocalChinese => "正在听你说中文……（原声已暂停）",
         DuplexState.TranslatingLocalText => "正在翻译中文",
-        DuplexState.SendingEnglishTts => "正在向 Discord 发送英文",
+        DuplexState.SendingEnglishTts => "正在播放英文（接收识别与原声麦克风已暂停）",
         DuplexState.Cooldown => "发送完成，正在恢复原声",
         DuplexState.Faulted => "发生错误",
         _ => "原声麦克风直通中"

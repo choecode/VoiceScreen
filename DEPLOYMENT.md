@@ -9,7 +9,8 @@
 - Discord 对方说英语时，VoiceScreen 只捕获 Discord 进程声音，在悬浮窗显示英文原文与中文译文。
 - 你平时说话时，实体麦克风的中文原声会通过 VoiceScreen 转发给 Discord。
 - 按住右 Alt 说中文、松开后，VoiceScreen 在本地生成英文字幕和英文语音，并通过虚拟麦克风发给 Discord。
-- Whisper、Qwen 和英文语音合成都在本机运行。模型首次下载需要联网，之后可以断网使用。
+- 实际发送的英文可以同步在实体耳机试听；中文测试框也能只在耳机试听翻译效果，不会把测试音发给 Discord。
+- Whisper、双向 OPUS-MT 专用翻译模型和英文语音合成都在本机运行。模型首次下载需要联网，之后可以断网使用。
 
 音频路由关系如下：
 
@@ -30,7 +31,7 @@ Discord 扬声器 → HyperX 实体耳机
 - Windows 11 x64；Windows 10 22H2 或更新版本理论上也可运行，但当前项目主要在 Windows 11 验证。
 - Discord 桌面客户端。浏览器版 Discord 不在支持范围内。
 - x64 CPU，建议至少 16 GB 内存。
-- 建议预留 8 GB 以上磁盘空间，用于 Ollama、Whisper、Python 包和模型缓存。
+- 建议预留 8 GB 以上磁盘空间，用于 Whisper、OPUS-MT、一次性模型转换依赖和缓存。
 - 一副耳机和实体麦克风。使用扬声器外放会产生真实的声学回声。
 - 安装依赖和模型时需要联网；正式翻译时不需要公网。
 
@@ -92,63 +93,38 @@ where.exe python
 
 如果 `python` 打开 Microsoft Store，进入“设置 → 应用 → 高级应用设置 → 应用执行别名”，关闭冲突的 `python.exe` / `python3.exe` 商店别名，然后重新打开 PowerShell。
 
-安装 faster-whisper：
+### 3.3 一键安装本地模型
+
+在 VoiceScreen 源码根目录运行：
 
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install --index-url https://pypi.org/simple faster-whisper==1.2.1
+powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1
 ```
 
-验证包可以导入：
+如果使用发布目录，则脚本就在 EXE 旁边：
 
 ```powershell
-python -c "import faster_whisper, numpy; print('faster-whisper OK')"
+powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 ```
 
-### 3.3 下载 Whisper small 模型
+脚本会自动完成：
 
-VoiceScreen 正式运行时强制离线加载模型，因此必须提前完成一次联网下载：
+1. 安装 faster-whisper、CTranslate2、Transformers、SentencePiece 和安全版本的 CPU PyTorch。
+2. 下载 Whisper small。
+3. 从 Helsinki-NLP 官方仓库下载 `opus-mt-zh-en` 与 `opus-mt-en-zh`。
+4. 把两个翻译模型转换为 CTranslate2 CPU INT8；运行权重合计约 161MB。
 
-```powershell
-$env:HF_HUB_OFFLINE='0'
-python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8'); print('Whisper small ready')"
-Remove-Item Env:HF_HUB_OFFLINE -ErrorAction SilentlyContinue
+模型目录：
+
+```text
+%LOCALAPPDATA%\VoiceScreen\Models\
 ```
 
-首次执行会下载模型，时间取决于网络。命令出现 `Whisper small ready` 才表示准备成功。
+脚本最后出现 `All VoiceScreen local models are ready.` 才算完成。运行时只使用 CTranslate2 INT8，不使用 PyTorch 推理，也不会占用游戏显卡。
 
-模型通常位于当前用户的 Hugging Face 缓存中。不要在安装后使用“磁盘清理工具”随意删除用户模型缓存，否则正式模式会提示本地识别服务启动失败。
+OPUS-MT 是专用机器翻译模型，不是聊天模型。中译英模型采用 CC-BY-4.0，英译中模型采用 Apache-2.0；分发程序时应保留模型来源与许可说明。
 
-### 3.4 安装 Ollama 与 Qwen
-
-```powershell
-winget install --id Ollama.Ollama -e --accept-package-agreements --accept-source-agreements
-```
-
-关闭并重新打开 PowerShell，然后验证：
-
-```powershell
-ollama --version
-ollama list
-```
-
-下载翻译模型：
-
-```powershell
-ollama pull qwen2.5:1.5b
-```
-
-验证模型：
-
-```powershell
-ollama run qwen2.5:1.5b "只输出英文翻译：敌人在二楼"
-```
-
-看到英文结果后按 `Ctrl+C` 退出交互。VoiceScreen 会通过 `127.0.0.1:11434` 调用 Ollama，并在请求中强制 `num_gpu=0`，避免与游戏争抢显卡。
-
-如果系统盘空间不足，可先设置用户环境变量 `OLLAMA_MODELS` 指向其他磁盘，例如 `D:\OllamaModels`，退出托盘中的 Ollama 后重新启动，再执行模型下载。
-
-### 3.5 安装 Windows 英文语音
+### 3.4 安装 Windows 英文语音
 
 打开：
 
@@ -156,9 +132,9 @@ ollama run qwen2.5:1.5b "只输出英文翻译：敌人在二楼"
 设置 → 时间和语言 → 语音 → 管理语音 → 添加语音
 ```
 
-安装“英语（美国）”或其他英文语音。完成后重启 VoiceScreen。中文 Windows 如果没有英文语音，程序将无法生成英文 TTS。
+安装“英语（美国）”或其他英文语音。若想切换男女声，请至少安装一个男声和一个女声；VoiceScreen 会把所有可用英文音色列在“英文音色”下拉框中。完成后重启 VoiceScreen。中文 Windows 如果没有英文语音，程序将拒绝启动正式链路，而不会误用中文音色。
 
-### 3.6 安装 VB-Audio Virtual Cable
+### 3.5 安装 VB-Audio Virtual Cable
 
 1. 从 VB-Audio 官方页面下载 VB-CABLE Driver ZIP。
 2. 解压 ZIP，右键 `VBCABLE_Setup_x64.exe`，选择“以管理员身份运行”。
@@ -263,19 +239,20 @@ dist\VoiceScreen-local-offline\VoiceScreen.App.exe
 ## 6. VoiceScreen 首次启动
 
 1. 确认 Discord 桌面客户端已经启动并登录。
-2. 确认 Ollama 在系统托盘运行；如果没有，打开 Ollama，或在 PowerShell 执行 `ollama serve`。
+2. 确认 `setup_local_models.ps1` 已成功完成。
 3. 双击 `VoiceScreen.App.exe`。
 4. 在“实体麦克风”中选择 HyperX 麦克风。
 5. 确认界面显示：
    - Discord 声音捕获：自动，仅捕获 Discord 进程。
    - 发送给 Discord：`CABLE Input`。
-6. 先保留“模拟模式（不加载本地模型）”，点击“启动”。
-7. 点击“测试英文到 Discord”，在 Discord 麦克风测试中确认能收到完整英文。
+6. 在“英文试听耳机”中选择 HyperX 实体耳机；按需要勾选“复读已发送英文”，并在“英文音色”中选择男声或女声。
+7. 先保留“模拟模式（不加载本地模型）”，点击“启动”；直接说中文，在 Discord 麦克风测试中确认原声路由正常。
 8. 点击“停止”。
 9. **取消勾选“模拟模式（不加载本地模型）”**。
 10. 再次点击“启动”，进入正式纯本地模式。
+11. 在中文测试框输入一句话，点击“翻译并试听（仅耳机）”。悬浮窗会显示测试中英文，你会在耳机听到英文，但该测试音不会进入 Discord。
 
-正式模式第一次启动会加载并预热 Whisper 与 Qwen，可能需要数秒到几十秒。状态显示“纯本地模式 · 只监听 Discord · 原声麦克风已直通”后才算启动完成。
+正式模式第一次启动会加载 Whisper 与双向 OPUS-MT，可能需要数秒到几十秒。状态显示“纯本地模式 · 只监听 Discord · 原声麦克风已直通”后才算启动完成。
 
 如果 Windows Defender SmartScreen 阻止启动，确认文件来自本项目仓库后，点击“更多信息 → 仍要运行”。不要从第三方网盘或下载站获取修改版程序。
 
@@ -313,32 +290,32 @@ EN: Enemies are on the second floor.
 
 同时播放一个游戏中文视频或让游戏角色说中文，悬浮窗不应显示游戏内容，因为接收链路固定只捕获 Discord 进程树。
 
+如果 Discord 对方改说中文，Whisper 会自动检测语言，悬浮窗直接显示 `中：识别原文`，不会调用 OPUS-MT 再做一次中文到中文翻译。
+
 ### 7.4 防循环验证
 
-发送一次英文 TTS 后观察悬浮窗。程序不应把自己刚发送的英文重新识别、翻译和累加。英文播放期间接收识别会暂停，播放缓冲排空后才恢复。
+发送一次英文 TTS 后观察悬浮窗。程序不应把自己刚发送或在耳机试听的英文重新识别、翻译和累加。英文播放期间麦克风直通和接收识别都会暂停，虚拟声卡及耳机缓冲排空后才恢复。接收端还固定只捕获 Discord 进程声音，不会捕获本机耳机输出。
 
 ## 8. 断网验证
 
-只有在 Whisper 和 Qwen 模型都成功下载后再执行：
+只有在模型准备脚本成功完成后再执行：
 
 1. 退出 VoiceScreen。
 2. 暂时断开网络。
-3. 保持 Ollama 本机服务可运行。
-4. 重新启动 VoiceScreen，取消模拟模式并点击“启动”。
-5. 重复中译英和英译中测试。
+3. 重新启动 VoiceScreen，取消模拟模式并点击“启动”。
+4. 重复中译英和英译中测试。
 
 能够正常完成即证明运行链路不依赖外部 API。应用正常运行时只访问：
 
 ```text
-127.0.0.1:18765  本地 faster-whisper 服务
-127.0.0.1:11434  本地 Ollama 服务
+127.0.0.1:18765  本地 faster-whisper + OPUS-MT 服务
 ```
 
 可用以下命令检查本机监听端口：
 
 ```powershell
 Get-NetTCPConnection -State Listen |
-  Where-Object LocalPort -in 11434,18765 |
+  Where-Object LocalPort -eq 18765 |
   Select-Object LocalAddress,LocalPort,OwningProcess
 ```
 
@@ -369,18 +346,13 @@ python -c "from faster_whisper import WhisperModel; WhisperModel('small', device
 Get-NetTCPConnection -LocalPort 18765 -ErrorAction SilentlyContinue
 ```
 
-### 9.3 提示缺少 qwen2.5:1.5b
+### 9.3 提示缺少 OPUS-MT 模型
 
 ```powershell
-ollama list
-ollama pull qwen2.5:1.5b
+powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 ```
 
-若 `ollama list` 无法连接，先从开始菜单启动 Ollama，或单独打开 PowerShell 执行：
-
-```powershell
-ollama serve
-```
+确认 `%LOCALAPPDATA%\VoiceScreen\Models` 下同时存在 `opus-mt-zh-en-ct2-int8` 与 `opus-mt-en-zh-ct2-int8`，并且各自包含 `model.bin`。模型准备中途失败时，不要手动拼接文件；保留下载缓存并重新运行脚本即可续传。
 
 ### 9.4 程序检测不到 CABLE Input
 
@@ -393,13 +365,13 @@ ollama serve
 
 - Discord 麦克风必须为 `CABLE Output`。
 - VoiceScreen 必须已经点击“启动”。
-- 先使用“测试英文到 Discord”观察 Discord 输入电平。
+- 不按右 Alt 直接说中文，先确认 Discord 能收到原声输入电平；再按右 Alt 完成一次真实翻译发送。
 - 检查 Discord 是否启用了按键说话；若启用，播放 TTS 时也必须满足 Discord 的按键条件。
 - 检查 Discord 输入音量和 Windows 的 CABLE Output 录音音量是否为零。
 
 ### 9.6 对方能听见中文，但听不见英文
 
-- 点击“测试英文到 Discord”，判断问题位于翻译还是音频路由。
+- 点击“翻译并试听（仅耳机）”，先确认本地翻译和英文 TTS 正常；然后用右 Alt 完成一次真实 Discord 发送测试。
 - 安装 Windows 英文语音并重启程序。
 - 暂时关闭 Discord 的 Krisp、自动增益和噪声抑制。
 - 查看悬浮窗是否出现“已发送”英文；没有则查看日志。
@@ -435,7 +407,7 @@ ollama serve
 
 - 首次启动的模型加载不代表长期占用。
 - 关闭其他 CPU 密集程序。
-- 保持 `qwen2.5:1.5b`，不要自行换成更大模型。
+- 保持项目提供的 OPUS-MT INT8 模型，不要自行替换目录中的权重和 tokenizer。
 - 当前版本强制 CPU 推理以保护 3A 游戏显卡；低性能 CPU 上可能超过 5 秒。
 - 不要同时启动多个 VoiceScreen 实例。
 
@@ -465,7 +437,7 @@ notepad "$env:LOCALAPPDATA\VoiceScreen\voicescreen.log"
 Remove-Item "$env:LOCALAPPDATA\VoiceScreen\settings.dat" -ErrorAction SilentlyContinue
 ```
 
-这不会删除 Whisper 或 Ollama 模型。
+这不会删除 Whisper 或 OPUS-MT 模型。
 
 ## 11. 更新、迁移与卸载
 
@@ -484,11 +456,11 @@ dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
 
 ### 11.2 迁移到另一台电脑
 
-可以复制整个发布目录，但 Python 包、Whisper 缓存、Ollama、Qwen 模型、Windows 英文语音和 VB-CABLE 驱动必须在新电脑上重新安装。`settings.dat` 使用 Windows 当前用户加密，不应复制到另一台电脑或另一个账号。
+可以复制整个发布目录，但 Python 包、Whisper 缓存、OPUS-MT 模型、Windows 英文语音和 VB-CABLE 驱动必须在新电脑上重新安装。`settings.dat` 使用 Windows 当前用户加密，不应复制到另一台电脑或另一个账号。
 
 ### 11.3 卸载
 
-1. 退出 VoiceScreen 和 Ollama。
+1. 退出 VoiceScreen。
 2. 删除 VoiceScreen 发布目录。
 3. 可选删除配置与日志：
 
@@ -496,15 +468,17 @@ dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
    Remove-Item "$env:LOCALAPPDATA\VoiceScreen" -Recurse -Force
    ```
 
-4. 在“设置 → 应用 → 已安装的应用”中按需卸载 Ollama、Python、.NET Desktop Runtime 和 VB-CABLE。
-5. Ollama 模型默认位于当前用户的 `.ollama` 目录；卸载 Ollama 不一定自动删除模型。如需释放空间，请确认不再使用后再手动删除。
+4. 在“设置 → 应用 → 已安装的应用”中按需卸载 Python、.NET Desktop Runtime 和 VB-CABLE。
+5. 本地模型位于 `%LOCALAPPDATA%\VoiceScreen\Models`；如需释放空间，请确认不再使用后再删除该目录。
 
 ## 12. 官方下载与文档
 
 - [.NET Windows 安装文档](https://learn.microsoft.com/dotnet/core/install/windows)
 - [Python 3.11.9 Windows 发布页](https://www.python.org/downloads/release/python-3119/)
-- [Ollama Windows 安装文档](https://docs.ollama.com/windows)
+- [Helsinki-NLP OPUS-MT 中译英模型](https://huggingface.co/Helsinki-NLP/opus-mt-zh-en)
+- [Helsinki-NLP OPUS-MT 英译中模型](https://huggingface.co/Helsinki-NLP/opus-mt-en-zh)
+- [CTranslate2 官方项目](https://github.com/OpenNMT/CTranslate2)
 - [VB-Audio Virtual Cable 官方页面](https://vb-audio.com/Cable/)
 - [Discord 语音与视频故障排查](https://support.discord.com/hc/articles/360045138471)
 
-不要从第三方软件下载站获取 Python、Ollama 或虚拟声卡驱动。
+不要从第三方软件下载站获取 Python 或虚拟声卡驱动。

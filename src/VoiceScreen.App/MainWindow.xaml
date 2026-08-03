@@ -24,7 +24,7 @@
                         <TextBlock Text="运行模式" FontSize="18" FontWeight="SemiBold" />
                         <CheckBox x:Name="DemoModeCheckBox" Content="模拟模式（不加载本地模型）" IsChecked="True" HorizontalAlignment="Right" Foreground="#E6EDF3" />
                     </DockPanel>
-                    <TextBlock Text="正式模式完全在本机运行 Whisper、Qwen 和离线英文语音；模型安装完成后可断网使用。"
+                    <TextBlock Text="正式模式完全在本机运行 Whisper、OPUS-MT 和离线英文语音；模型安装完成后可断网使用。"
                                Foreground="#8B949E" Margin="0,8,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </Border>
@@ -34,15 +34,19 @@
                     <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <TextBlock Grid.ColumnSpan="2" Text="音频设备" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
                     <TextBlock Grid.Row="1" Text="实体麦克风" VerticalAlignment="Center" />
                     <ComboBox x:Name="MicrophoneCombo" Grid.Row="1" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" />
-                    <TextBlock Grid.Row="2" Text="Discord 声音捕获" VerticalAlignment="Center" />
-                    <ComboBox x:Name="DiscordOutputCombo" Grid.Row="2" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" IsEnabled="False" />
-                    <TextBlock Grid.Row="3" Text="发送给 Discord" VerticalAlignment="Center" />
-                    <ComboBox x:Name="CableRenderCombo" Grid.Row="3" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" IsEnabled="False" />
-                    <CheckBox x:Name="UseProcessLoopbackCheckBox" Grid.Row="4" Grid.Column="1" Content="只抓 Discord 进程音频（已固定启用，不捕获游戏/浏览器声音）" IsChecked="True" IsEnabled="False" Foreground="#E6EDF3" Margin="0,8,0,0" />
+                    <TextBlock Grid.Row="2" Text="英文试听耳机" VerticalAlignment="Center" />
+                    <ComboBox x:Name="MonitorOutputCombo" Grid.Row="2" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" />
+                    <CheckBox x:Name="MonitorTranslatedSpeechCheckBox" Grid.Row="3" Grid.Column="1" Content="复读已发送英文（在耳机播放；已隔离，不会进入识别循环）" IsChecked="True" Foreground="#E6EDF3" Margin="0,5" />
+                    <TextBlock Grid.Row="4" Text="Discord 声音捕获" VerticalAlignment="Center" />
+                    <ComboBox x:Name="DiscordOutputCombo" Grid.Row="4" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" IsEnabled="False" />
+                    <TextBlock Grid.Row="5" Text="发送给 Discord" VerticalAlignment="Center" />
+                    <ComboBox x:Name="CableRenderCombo" Grid.Row="5" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" IsEnabled="False" />
+                    <CheckBox x:Name="UseProcessLoopbackCheckBox" Grid.Row="6" Grid.Column="1" Content="只抓 Discord 进程音频（已固定启用，不捕获游戏/浏览器声音）" IsChecked="True" IsEnabled="False" Foreground="#E6EDF3" Margin="0,8,0,0" />
                 </Grid>
             </Border>
 
@@ -56,9 +60,11 @@
                     <TextBlock Grid.Row="1" Text="双向语音识别" VerticalAlignment="Center" />
                     <TextBox Grid.Row="1" Grid.Column="1" Margin="0,5" Text="faster-whisper small · CPU INT8" IsReadOnly="True" />
                     <TextBlock Grid.Row="2" Text="双向文本翻译" VerticalAlignment="Center" />
-                    <TextBox Grid.Row="2" Grid.Column="1" Margin="0,5" Text="Ollama qwen2.5:1.5b · CPU" IsReadOnly="True" />
+                    <TextBox Grid.Row="2" Grid.Column="1" Margin="0,5" Text="OPUS-MT 中英双向专用模型 · CPU INT8" IsReadOnly="True" />
                     <TextBlock Grid.Row="3" Text="英文语音输出" VerticalAlignment="Center" />
                     <TextBox Grid.Row="3" Grid.Column="1" Margin="0,5" Text="Windows Speech · 完全离线" IsReadOnly="True" />
+                    <TextBlock Grid.Row="4" Text="英文音色" VerticalAlignment="Center" />
+                    <ComboBox x:Name="EnglishVoiceCombo" Grid.Row="4" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" />
                 </Grid>
             </Border>
 
@@ -70,9 +76,14 @@
                 <WrapPanel Margin="0,16,0,0">
                     <Button x:Name="StartButton" Content="启动" Width="120" Height="40" Margin="0,0,10,0" Click="StartButton_Click" Background="#238636" Foreground="White" />
                     <Button x:Name="StopButton" Content="停止" Width="100" Height="40" Margin="0,0,10,0" Click="StopButton_Click" IsEnabled="False" />
-                    <Button x:Name="TestTtsButton" Content="测试英文到 Discord" Width="170" Height="40" Margin="0,0,10,0" Click="TestTtsButton_Click" IsEnabled="False" />
                     <Button Content="刷新设备" Width="110" Height="40" Click="RefreshDevicesButton_Click" />
                 </WrapPanel>
+                <DockPanel Margin="0,14,0,0" LastChildFill="True">
+                    <Button x:Name="TestTranslationButton" DockPanel.Dock="Right" Content="翻译并试听（仅耳机）" Width="190" Height="38"
+                            Margin="10,0,0,0" Click="TestTranslationButton_Click" IsEnabled="False" />
+                    <TextBox x:Name="TestChineseTextBox" Text="敌人在二楼，我们从左边走。" Height="38" Padding="10,7"
+                             ToolTip="输入中文，使用本地 OPUS-MT 翻译并只在所选耳机试听，不发送到 Discord" />
+                </DockPanel>
                 <TextBlock x:Name="StatusText" Text="等待启动" FontSize="15" Margin="0,16,0,0" Foreground="#8B949E" TextWrapping="Wrap" />
                 <TextBlock Text="Discord 设置：输入设备选 CABLE Output，输出设备选 HyperX 耳机。不要开启“侦听此设备”。平时原声直通；按住右 Alt 说中文，松开后发送英文。"
                            FontSize="14" Margin="0,10,0,0" Foreground="#52D3A5" TextWrapping="Wrap" />

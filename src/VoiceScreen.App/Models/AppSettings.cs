@@ -6,6 +6,9 @@ public sealed class AppSettings
     public string MicrophoneDeviceId { get; set; } = string.Empty;
     public string DiscordOutputDeviceId { get; set; } = string.Empty;
     public string CableRenderDeviceId { get; set; } = string.Empty;
+    public string MonitorRenderDeviceId { get; set; } = string.Empty;
+    public bool MonitorTranslatedSpeech { get; set; } = true;
+    public string EnglishVoiceName { get; set; } = string.Empty;
     public int MaxSubtitleLines { get; set; } = 8;
     public double OverlayLeft { get; set; } = 20;
     public double OverlayTop { get; set; } = 20;
@@ -16,6 +19,11 @@ public sealed class AppSettings
 }
 
 public sealed record AudioDeviceOption(string Id, string Name)
+{
+    public override string ToString() => Name;
+}
+
+public sealed record SpeechVoiceOption(string Id, string Name)
 {
     public override string ToString() => Name;
 }

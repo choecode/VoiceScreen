@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using VoiceScreen.App.Audio;
 using VoiceScreen.App.Diagnostics;
 using VoiceScreen.App.Input;
 using VoiceScreen.App.Models;
@@ -62,6 +63,7 @@ public partial class MainWindow : Window
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         DemoModeCheckBox.IsChecked = _settings.DemoMode;
+        MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
         UseProcessLoopbackCheckBox.IsChecked = true;
         RefreshDevices();
     }
@@ -80,6 +82,7 @@ public partial class MainWindow : Window
     {
         var captures = _devices.GetCaptureDevices();
         var renders = _devices.GetRenderDevices();
+        var voices = OfflineSpeech.GetInstalledEnglishVoices();
         var physicalMicrophones = captures
             .Where(device => !device.Name.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase))
             .ToArray();
@@ -88,15 +91,24 @@ public partial class MainWindow : Window
             new AudioDeviceOption(string.Empty, "自动：仅捕获 Discord 进程（无需选择）")
         };
         MicrophoneCombo.ItemsSource = physicalMicrophones;
+        var physicalOutputs = renders.Where(device => !AudioDeviceService.IsVirtualCableInput(device)).ToArray();
+        MonitorOutputCombo.ItemsSource = physicalOutputs;
+        EnglishVoiceCombo.ItemsSource = voices;
         DiscordOutputCombo.ItemsSource = automaticDiscordCapture;
         var cableInputs = renders.Where(AudioDeviceService.IsVirtualCableInput).ToArray();
         CableRenderCombo.ItemsSource = cableInputs;
         MicrophoneCombo.SelectedItem = AudioDeviceService.FindBest(physicalMicrophones, _settings.MicrophoneDeviceId, "HyperX", "麦克风", "Microphone");
+        MonitorOutputCombo.SelectedItem = AudioDeviceService.FindBest(physicalOutputs, _settings.MonitorRenderDeviceId,
+            "HyperX", "耳机", "Headphones");
+        EnglishVoiceCombo.SelectedItem = voices.FirstOrDefault(voice => voice.Id == _settings.EnglishVoiceName)
+            ?? voices.FirstOrDefault();
         DiscordOutputCombo.SelectedIndex = 0;
         CableRenderCombo.SelectedItem = AudioDeviceService.FindVirtualCableInput(renders);
-        StatusText.Text = cableInputs.Length > 0
-            ? "设备已自动配置：HyperX 麦克风 → CABLE Input；接收只监听 Discord。"
-            : "错误：没有检测到 CABLE Input (VB-Audio Virtual Cable)，请先安装或启用 VB-CABLE。";
+        StatusText.Text = cableInputs.Length == 0
+            ? "错误：没有检测到 CABLE Input (VB-Audio Virtual Cable)，请先安装或启用 VB-CABLE。"
+            : voices.Count == 0
+                ? "错误：没有检测到 Windows 英文语音，请先安装英文男声或女声。"
+                : "设备已自动配置：HyperX 麦克风 → CABLE Input；接收只监听 Discord。";
     }
 
     private AppSettings ReadSettings()
@@ -108,6 +120,9 @@ public partial class MainWindow : Window
             MicrophoneDeviceId = (MicrophoneCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             DiscordOutputDeviceId = (DiscordOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             CableRenderDeviceId = (CableRenderCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
+            MonitorRenderDeviceId = (MonitorOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
+            MonitorTranslatedSpeech = MonitorTranslatedSpeechCheckBox.IsChecked == true,
+            EnglishVoiceName = (EnglishVoiceCombo.SelectedItem as SpeechVoiceOption)?.Id ?? string.Empty,
             MaxSubtitleLines = _settings.MaxSubtitleLines,
             OverlayLeft = _settings.OverlayLeft,
             OverlayTop = _settings.OverlayTop
@@ -130,7 +145,7 @@ public partial class MainWindow : Window
             _hook.Start();
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = true;
-            TestTtsButton.IsEnabled = true;
+            TestTranslationButton.IsEnabled = !_settings.DemoMode;
             _overlay.SetStatus("运行中 · 原声麦克风直通", ok: true);
         }
         catch (Exception ex)
@@ -146,13 +161,13 @@ public partial class MainWindow : Window
 
     private async void StopButton_Click(object sender, RoutedEventArgs e) => await StopEngineAsync();
 
-    private async void TestTtsButton_Click(object sender, RoutedEventArgs e)
+    private async void TestTranslationButton_Click(object sender, RoutedEventArgs e)
     {
         if (_engine is null) return;
         try
         {
-            TestTtsButton.IsEnabled = false;
-            await _engine.PlayTestPhraseAsync(CancellationToken.None);
+            TestTranslationButton.IsEnabled = false;
+            await _engine.TranslateAndPreviewAsync(TestChineseTextBox.Text, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -160,7 +175,8 @@ public partial class MainWindow : Window
         }
         finally
         {
-            TestTtsButton.IsEnabled = _engine is not null;
+            TestTranslationButton.IsEnabled = _engine is not null
+                && !_settings.DemoMode;
         }
     }
 
@@ -195,7 +211,7 @@ public partial class MainWindow : Window
         _overlay = null;
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
-        TestTtsButton.IsEnabled = false;
+        TestTranslationButton.IsEnabled = false;
         StatusText.Text = "已停止";
     }
 

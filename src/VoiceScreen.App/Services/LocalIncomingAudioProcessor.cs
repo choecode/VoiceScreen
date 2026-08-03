@@ -5,7 +5,7 @@ using VoiceScreen.App.Diagnostics;
 namespace VoiceScreen.App.Services;
 
 /// <summary>
-/// 将 Discord 的 40ms PCM16 帧按语音活动切成句子，再交给本地 Whisper + Qwen。
+/// 将 Discord 的 40ms PCM16 帧按语音活动切成句子，再交给本地 Whisper + OPUS-MT。
 /// 这里使用数字音频能量检测；Discord 进程无输出时 Process Loopback 返回真正的静音帧。
 /// </summary>
 public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
