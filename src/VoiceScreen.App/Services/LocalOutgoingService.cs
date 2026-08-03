@@ -49,6 +49,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         try
         {
             var transcription = await TranscribeAsync(pcm16Mono16Khz, "auto", cancellationToken).ConfigureAwait(false);
+            VoiceScreenLog.Info($"Incoming ASR language={transcription.Language} text={LogExcerpt(transcription.Text)}");
             return await TranslateIncomingTextAsync(transcription.Text, transcription.Language, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -65,16 +66,16 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             return new LocalIncomingTranslation(string.Empty, string.Empty, detectedLanguage);
         if (detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase) || ContainsChinese(text))
             return new LocalIncomingTranslation(text.Trim(), text.Trim(), "zh");
-        if (!detectedLanguage.StartsWith("en", StringComparison.OrdinalIgnoreCase))
+        if (detectedLanguage.StartsWith("th", StringComparison.OrdinalIgnoreCase) || ContainsThai(text))
         {
-            if (!detectedLanguage.StartsWith("th", StringComparison.OrdinalIgnoreCase))
-                return new LocalIncomingTranslation(text.Trim(), text.Trim(), detectedLanguage);
             var englishBridge = await TranslateTextAsync(text.Trim(), TranslationDirection.ThaiToEnglish,
                 cancellationToken).ConfigureAwait(false);
             var thaiChinese = await TranslateTextAsync(englishBridge, TranslationDirection.EnglishToChinese,
                 cancellationToken).ConfigureAwait(false);
             return new LocalIncomingTranslation(text.Trim(), thaiChinese, "th");
         }
+        if (!detectedLanguage.StartsWith("en", StringComparison.OrdinalIgnoreCase))
+            return new LocalIncomingTranslation(text.Trim(), text.Trim(), detectedLanguage);
         var chinese = await TranslateTextAsync(text.Trim(), TranslationDirection.EnglishToChinese, cancellationToken)
             .ConfigureAwait(false);
         return new LocalIncomingTranslation(text.Trim(), chinese, "en");
@@ -82,6 +83,15 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
     private static bool ContainsChinese(string text)
         => text.Any(character => character is >= '\u3400' and <= '\u9fff');
+
+    private static bool ContainsThai(string text)
+        => text.Any(character => character is >= '\u0e00' and <= '\u0e7f');
+
+    private static string LogExcerpt(string text)
+    {
+        var normalized = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return normalized.Length <= 120 ? normalized : normalized[..120] + "…";
+    }
 
     public async Task<string> TranslateChineseTextAsync(string chineseText, CancellationToken cancellationToken)
     {

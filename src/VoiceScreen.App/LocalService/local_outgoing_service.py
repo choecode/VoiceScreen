@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import threading
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -26,6 +27,7 @@ class State:
     zh_en_tokenizer = None
     en_zh_tokenizer = None
     th_en_tokenizer = None
+    inference_lock = threading.Lock()
 
 
 def model_root():
@@ -139,8 +141,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.translate()
             else:
                 self.send_json(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            # The desktop client may abandon a timed-out segment while local inference
+            # is finishing. Do not turn that normal disconnect into another response.
+            return
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            try:
+                self.send_json(500, {"error": str(exc)})
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     def transcribe(self, parsed):
         pcm = self.read_body(16 * 1024 * 1024)
@@ -160,8 +169,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         if requested != "auto":
             options["language"] = requested
-        segments, info = State.whisper.transcribe(audio, **options)
-        text = "".join(segment.text for segment in segments).strip()
+        # CTranslate2 model objects can be called from multiple native threads, but
+        # serializing the complete local pipeline prevents an abandoned request from
+        # overlapping a new Discord segment and destabilizing latency/HTTP responses.
+        with State.inference_lock:
+            segments, info = State.whisper.transcribe(audio, **options)
+            text = "".join(segment.text for segment in segments).strip()
         self.send_json(200, {"text": text, "language": info.language})
 
     def translate(self):
@@ -170,7 +183,9 @@ class Handler(BaseHTTPRequestHandler):
         direction = str(request.get("direction", ""))
         if not text or len(text) > 1000:
             raise ValueError("translation text is empty or too long")
-        self.send_json(200, {"text": translate_text(text, direction)})
+        with State.inference_lock:
+            translated = translate_text(text, direction)
+        self.send_json(200, {"text": translated})
 
 
 def main():

@@ -43,6 +43,11 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
         || thai.TranslatedText == thai.SourceText)
         throw new InvalidOperationException("泰语没有经过 th-en → en-zh 本地桥接翻译。");
 
+    var mislabeledThai = await local.TranslateIncomingTextAsync("ไปทางซ้ายเร็ว", "ja", CancellationToken.None);
+    Console.WriteLine($"PASS：泰文字符兜底路由，错误语言标签 ja → {mislabeledThai.TranslatedText}");
+    if (mislabeledThai.Language != "th" || mislabeledThai.TranslatedText == mislabeledThai.SourceText)
+        throw new InvalidOperationException("泰文字符没有覆盖错误的 Whisper 语言标签。");
+
     await using var processor = new LocalIncomingAudioProcessor(local);
     var completed = new TaskCompletionSource<LocalIncomingTranslation>(TaskCreationOptions.RunContinuationsAsynchronously);
     processor.TranslationReady += (_, result) => completed.TrySetResult(result);
