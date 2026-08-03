@@ -1,0 +1,8 @@
+<Application x:Class="VoiceScreen.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnMainWindowClose">
+    <Application.Resources>
+        <SolidColorBrush x:Key="AccentBrush" Color="#52D3A5" />
+    </Application.Resources>
+</Application>

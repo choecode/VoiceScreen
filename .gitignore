@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+dist/
+.vs/
+*.user
+*.suo
+*.log
+dump-commands.txt
+**/__pycache__/
+*.pyc
+.venv/
