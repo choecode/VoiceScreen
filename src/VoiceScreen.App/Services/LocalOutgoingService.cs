@@ -14,7 +14,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 {
     private const int AsrPort = 18765;
     private static readonly Uri AsrBaseUri = new($"http://127.0.0.1:{AsrPort}/");
-    private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(30) };
+    private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(60) };
     private readonly SemaphoreSlim _modelGate = new(1, 1);
     private Process? _asrProcess;
     private bool _ownsAsr;

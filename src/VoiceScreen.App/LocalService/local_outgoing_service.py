@@ -146,8 +146,9 @@ class Handler(BaseHTTPRequestHandler):
             beam_size=1,
             best_of=1,
             temperature=0,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 250},
+            # The desktop app has already segmented Discord PCM. Running Whisper's
+            # VAD again can discard clauses around normal pauses in a long sentence.
+            vad_filter=False,
             condition_on_previous_text=False,
             without_timestamps=True,
         )

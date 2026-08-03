@@ -47,11 +47,32 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
         Buffer.BlockCopy(englishPcm, offset, frame, 0, Math.Min(1280, englishPcm.Length - offset));
         await processor.AddFrameAsync(frame, true, CancellationToken.None);
     }
-    for (var i = 0; i < 14; i++)
+    for (var i = 0; i < 51; i++)
         await processor.AddFrameAsync(new byte[1280], true, CancellationToken.None);
 
     var segmented = await completed.Task.WaitAsync(TimeSpan.FromSeconds(30));
     Console.WriteLine($"PASS：本地 VAD 分句英译中，{segmented.SourceText} → {segmented.TranslatedText}");
+
+    const string longEnglish = "Hey, I think there are two enemies on the right side of the third floor, so please wait for me near the stairs and don't attack until I get there.";
+    var longEnglishPcm = await OfflineSpeech.SynthesizeEnglishAsync(longEnglish, CancellationToken.None);
+    await using var longProcessor = new LocalIncomingAudioProcessor(local);
+    var longCompleted = new TaskCompletionSource<LocalIncomingTranslation>(TaskCreationOptions.RunContinuationsAsynchronously);
+    longProcessor.TranslationReady += (_, result) => longCompleted.TrySetResult(result);
+    longProcessor.Error += (_, error) => longCompleted.TrySetException(new InvalidOperationException(error));
+    for (var offset = 0; offset < longEnglishPcm.Length; offset += 1280)
+    {
+        var frame = new byte[1280];
+        Buffer.BlockCopy(longEnglishPcm, offset, frame, 0, Math.Min(1280, longEnglishPcm.Length - offset));
+        await longProcessor.AddFrameAsync(frame, true, CancellationToken.None);
+    }
+    for (var i = 0; i < 51; i++)
+        await longProcessor.AddFrameAsync(new byte[1280], true, CancellationToken.None);
+
+    var longSegmented = await longCompleted.Task.WaitAsync(TimeSpan.FromSeconds(45));
+    Console.WriteLine($"PASS：Discord 长句完整性，{longSegmented.SourceText} → {longSegmented.TranslatedText}");
+    if (!longSegmented.SourceText.Contains("attack", StringComparison.OrdinalIgnoreCase)
+        || !longSegmented.SourceText.Contains("get there", StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException($"长句尾部被截断：{longSegmented.SourceText}");
     return;
 }
 

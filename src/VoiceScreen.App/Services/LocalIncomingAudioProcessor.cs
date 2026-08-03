@@ -11,17 +11,17 @@ namespace VoiceScreen.App.Services;
 public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
 {
     private const int FrameBytes = 1280; // 16kHz * 40ms * PCM16 mono
-    private const int VoiceRmsThreshold = 180;
+    private const int VoiceRmsThreshold = 120;
     private const int StartVoiceFrames = 2;
-    private const int EndSilenceFrames = 13; // 520ms
-    private const int PreRollFrames = 5; // 200ms
+    private const int EndSilenceFrames = 50; // 2000ms，保留真实 Discord 对话里的思考停顿
+    private const int PreRollFrames = 8; // 320ms，避免吞掉句首辅音
     private const int MinimumVoicedFrames = 3;
-    private const int MaximumUtteranceFrames = 375; // 15s
+    private const int MaximumUtteranceFrames = 750; // 30s
 
     private readonly object _gate = new();
     private readonly LocalOutgoingService _localService;
     private readonly Queue<byte[]> _preRoll = new();
-    private readonly Channel<byte[]> _utterances = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(3)
+    private readonly Channel<byte[]> _utterances = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(12)
     {
         SingleReader = true,
         SingleWriter = false,
@@ -134,7 +134,9 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
                 try
                 {
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-                    timeout.CancelAfter(TimeSpan.FromSeconds(20));
+                    // CPU inference can slow down noticeably while a 3A game is running.
+                    // Do not cancel a complete long utterance before Whisper can finish it.
+                    timeout.CancelAfter(TimeSpan.FromSeconds(45));
                     var result = await _localService.TranslateIncomingSpeechAsync(audio, timeout.Token)
                         .ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(result.SourceText) && !string.IsNullOrWhiteSpace(result.TranslatedText))
