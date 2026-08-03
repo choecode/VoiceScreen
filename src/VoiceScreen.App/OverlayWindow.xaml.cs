@@ -80,7 +80,18 @@ public partial class OverlayWindow : Window
         Dispatcher.Invoke(() =>
         {
             SubtitleList.FontSize = Math.Clamp(fontSize, 14, 42);
+            PreviewText.FontSize = Math.Clamp(fontSize, 14, 42);
             if (_followLatest && Lines.Count > 0) SubtitleList.ScrollIntoView(Lines.Last());
+        });
+    }
+
+    public void SetPreview(string? text)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            PreviewText.Text = text ?? string.Empty;
+            PreviewText.FontSize = SubtitleList.FontSize;
+            PreviewBorder.Visibility = string.IsNullOrWhiteSpace(text) ? Visibility.Collapsed : Visibility.Visible;
         });
     }
 

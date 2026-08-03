@@ -67,6 +67,7 @@ public partial class MainWindow : Window
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         DemoModeCheckBox.IsChecked = _settings.DemoMode;
+        LowLatencyIncomingCheckBox.IsChecked = _settings.LowLatencyIncoming;
         MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
         SubtitleFontSizeSlider.Value = Math.Clamp(_settings.SubtitleFontSize, 14, 42);
         UseProcessLoopbackCheckBox.IsChecked = true;
@@ -121,6 +122,7 @@ public partial class MainWindow : Window
         return new AppSettings
         {
             DemoMode = DemoModeCheckBox.IsChecked == true,
+            LowLatencyIncoming = LowLatencyIncomingCheckBox.IsChecked == true,
             UseProcessLoopback = true,
             MicrophoneDeviceId = (MicrophoneCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             DiscordOutputDeviceId = (DiscordOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
@@ -148,6 +150,7 @@ public partial class MainWindow : Window
             _overlay.Show();
             _engine = new TranslationEngine(_settings);
             _engine.SubtitleProduced += OnSubtitleProduced;
+            _engine.SubtitlePreviewChanged += OnSubtitlePreviewChanged;
             _engine.StatusChanged += OnStatusChanged;
             _engine.Error += OnError;
             await _engine.StartAsync(CancellationToken.None);
@@ -209,6 +212,7 @@ public partial class MainWindow : Window
     }
 
     private void OnSubtitleProduced(object? sender, (string Kind, string Text) item) => _overlay?.AddLine(item.Kind, item.Text);
+    private void OnSubtitlePreviewChanged(object? sender, string? text) => _overlay?.SetPreview(text);
     private void OnStatusChanged(object? sender, string text)
     {
         Dispatcher.Invoke(() => StatusText.Text = text);
@@ -229,6 +233,7 @@ public partial class MainWindow : Window
         if (_engine is not null)
         {
             _engine.SubtitleProduced -= OnSubtitleProduced;
+            _engine.SubtitlePreviewChanged -= OnSubtitlePreviewChanged;
             _engine.StatusChanged -= OnStatusChanged;
             _engine.Error -= OnError;
             await _engine.DisposeAsync();

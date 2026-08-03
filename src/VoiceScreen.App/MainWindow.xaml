@@ -26,6 +26,8 @@
                     </DockPanel>
                     <TextBlock Text="正式模式完全在本机运行 Whisper、OPUS-MT 和离线英文语音；模型安装完成后可断网使用。"
                                Foreground="#8B949E" Margin="0,8,0,0" TextWrapping="Wrap" />
+                    <CheckBox x:Name="LowLatencyIncomingCheckBox" Content="游戏低延迟字幕（边说边显示；停顿约 0.6 秒后定稿）"
+                              IsChecked="True" Foreground="#52D3A5" Margin="0,10,0,0" />
                 </StackPanel>
             </Border>
 
@@ -58,7 +60,7 @@
                     </Grid.RowDefinitions>
                     <TextBlock Grid.ColumnSpan="2" Text="本地模型（无外部 API）" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
                     <TextBlock Grid.Row="1" Text="双向语音识别" VerticalAlignment="Center" />
-                    <TextBox Grid.Row="1" Grid.Column="1" Margin="0,5" Text="faster-whisper small · CPU INT8" IsReadOnly="True" />
+                    <TextBox Grid.Row="1" Grid.Column="1" Margin="0,5" Text="faster-whisper base 实时预览 + small 最终定稿 · CPU INT8" IsReadOnly="True" />
                     <TextBlock Grid.Row="2" Text="双向文本翻译" VerticalAlignment="Center" />
                     <TextBox Grid.Row="2" Grid.Column="1" Margin="0,5" Text="OPUS-MT 中英双向 + 泰英桥接 · CPU INT8" IsReadOnly="True" />
                     <TextBlock Grid.Row="3" Text="英文语音输出" VerticalAlignment="Center" />

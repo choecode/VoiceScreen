@@ -59,6 +59,49 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
         throw new InvalidOperationException("正常口语重复被错误过滤。" );
     Console.WriteLine("PASS：正常口语重复未被误杀");
 
+    await using (var realtimeProcessor = new LocalIncomingAudioProcessor(local, lowLatency: true))
+    {
+        var firstPreview = new TaskCompletionSource<LocalIncomingTranslation>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var translatedPreview = new TaskCompletionSource<LocalIncomingTranslation>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var realtimeFinal = new TaskCompletionSource<LocalIncomingTranslation>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        realtimeProcessor.PreviewChanged += (_, result) =>
+        {
+            if (result is null || string.IsNullOrWhiteSpace(result.SourceText)) return;
+            firstPreview.TrySetResult(result);
+            if (!string.IsNullOrWhiteSpace(result.TranslatedText)) translatedPreview.TrySetResult(result);
+        };
+        realtimeProcessor.TranslationReady += (_, result) => realtimeFinal.TrySetResult(result);
+        realtimeProcessor.Error += (_, error) => realtimeFinal.TrySetException(new InvalidOperationException(error));
+
+        var feedTask = Task.Run(async () =>
+        {
+            for (var offset = 0; offset < englishPcm.Length; offset += 1280)
+            {
+                var frame = new byte[1280];
+                Buffer.BlockCopy(englishPcm, offset, frame, 0, Math.Min(1280, englishPcm.Length - offset));
+                await realtimeProcessor.AddFrameAsync(frame, true, CancellationToken.None);
+                await Task.Delay(40);
+            }
+            for (var i = 0; i < 17; i++)
+            {
+                await realtimeProcessor.AddFrameAsync(new byte[1280], true, CancellationToken.None);
+                await Task.Delay(40);
+            }
+        });
+
+        var preview = await firstPreview.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        var previewChinese = await translatedPreview.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        await feedTask;
+        var final = await realtimeFinal.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        if (string.IsNullOrWhiteSpace(preview.SourceText) || string.IsNullOrWhiteSpace(previewChinese.TranslatedText)
+            || string.IsNullOrWhiteSpace(final.TranslatedText))
+            throw new InvalidOperationException("低延迟字幕没有形成临时英文、临时中文和最终定稿。" );
+        Console.WriteLine($"PASS：低延迟增量字幕，临时 EN={preview.SourceText}，临时中={previewChinese.TranslatedText}");
+    }
+
     await using var processor = new LocalIncomingAudioProcessor(local);
     var completed = new TaskCompletionSource<LocalIncomingTranslation>(TaskCreationOptions.RunContinuationsAsynchronously);
     processor.TranslationReady += (_, result) => completed.TrySetResult(result);

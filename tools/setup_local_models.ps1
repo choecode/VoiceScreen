@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 Write-Host "VoiceScreen local model setup" -ForegroundColor Cyan
-Write-Host "This downloads Whisper small and three OPUS-MT translation models once."
+Write-Host "This downloads Whisper base/small and three OPUS-MT translation models once."
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     throw "Python was not found. Install Python 3.11 x64 and reopen PowerShell."
@@ -34,13 +34,21 @@ if (-not ($zhEnReady -and $enZhReady -and $thEnReady)) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to install the safe CPU build of PyTorch." }
 }
 
-Write-Host "Downloading Whisper small..." -ForegroundColor Cyan
+Write-Host "Downloading Whisper base (realtime preview) and small (final result)..." -ForegroundColor Cyan
 $env:HF_HUB_OFFLINE = "1"
-python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', local_files_only=True); print('Whisper small already cached')"
+python -c "from faster_whisper import WhisperModel; [WhisperModel(name, device='cpu', compute_type='int8', local_files_only=True) for name in ('base','small')]; print('Whisper base/small already cached')"
 if ($LASTEXITCODE -ne 0) {
     $env:HF_HUB_OFFLINE = "0"
-    python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8'); print('Whisper small ready')"
-    if ($LASTEXITCODE -ne 0) { throw "Failed to download Whisper small. Check the network and rerun this script to resume." }
+    $whisperReady = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        python -c "from faster_whisper import WhisperModel; [WhisperModel(name, device='cpu', compute_type='int8') for name in ('base','small')]; print('Whisper base/small ready')"
+        if ($LASTEXITCODE -eq 0) {
+            $whisperReady = $true
+            break
+        }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+    }
+    if (-not $whisperReady) { throw "Failed to download Whisper base/small after 3 attempts. Check the network and rerun this script to resume." }
 }
 $env:HF_HUB_OFFLINE = "0"
 

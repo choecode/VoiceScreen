@@ -26,6 +26,7 @@ public sealed class TranslationEngine : IAsyncDisposable
     }
 
     public event EventHandler<(string Kind, string Text)>? SubtitleProduced;
+    public event EventHandler<string?>? SubtitlePreviewChanged;
     public event EventHandler<string>? StatusChanged;
     public event EventHandler<string>? Error;
     public bool IsRunning { get; private set; }
@@ -45,8 +46,9 @@ public sealed class TranslationEngine : IAsyncDisposable
             StatusChanged?.Invoke(this, "正在加载本地双向语音识别和翻译模型……");
             _localOutgoing = new LocalOutgoingService();
             await _localOutgoing.StartAsync(cancellationToken).ConfigureAwait(false);
-            _localIncoming = new LocalIncomingAudioProcessor(_localOutgoing);
+            _localIncoming = new LocalIncomingAudioProcessor(_localOutgoing, _settings.LowLatencyIncoming);
             _localIncoming.TranslationReady += OnIncomingTranslation;
+            _localIncoming.PreviewChanged += OnIncomingPreview;
             _localIncoming.Error += (_, message) => Error?.Invoke(this, message);
             _localIncoming.Status += OnIncomingStatus;
             _discordCapture = CreateIncomingCapture();
@@ -54,10 +56,12 @@ public sealed class TranslationEngine : IAsyncDisposable
         IsRunning = true;
         var mode = _settings.DemoMode ? "Demo" : "Local-Whisper-OPUS-MT";
         var incomingLang = _settings.DemoMode ? "n/a" : "en->cn";
-        VoiceScreenLog.Info($"TranslationEngine started. mode={mode} incomingLang={incomingLang}");
+        VoiceScreenLog.Info($"TranslationEngine started. mode={mode} incomingLang={incomingLang} lowLatency={_settings.LowLatencyIncoming}");
         StatusChanged?.Invoke(this, _settings.DemoMode
             ? "模拟模式运行中，原声麦克风已直通"
-            : "纯本地模式 · 只监听 Discord · 原声麦克风已直通");
+            : _settings.LowLatencyIncoming
+                ? "纯本地低延迟模式 · 只监听 Discord · 原声麦克风已直通"
+                : "纯本地稳定模式 · 只监听 Discord · 原声麦克风已直通");
     }
 
     public void BeginLocalCapture()
@@ -231,6 +235,29 @@ public sealed class TranslationEngine : IAsyncDisposable
         SubtitleProduced?.Invoke(this, ("remote", subtitle));
     }
 
+    private void OnIncomingPreview(object? sender, LocalIncomingTranslation? result)
+    {
+        if (result is null || !_state.ShouldAcceptRemoteResult)
+        {
+            SubtitlePreviewChanged?.Invoke(this, null);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(result.SourceText) || _echo.IsLikelyEcho(result.SourceText)) return;
+        if (!IsSupportedIncomingLanguage(result.Language)) return;
+        var label = result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase) ? "中"
+            : result.Language.StartsWith("th", StringComparison.OrdinalIgnoreCase) ? "TH" : "EN";
+        var preview = $"{label}（实时）：{result.SourceText}";
+        if (!result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(result.TranslatedText))
+            preview += $"\n中（实时）：{result.TranslatedText}";
+        SubtitlePreviewChanged?.Invoke(this, preview);
+    }
+
+    private static bool IsSupportedIncomingLanguage(string language)
+        => language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+           || language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
+           || language.StartsWith("th", StringComparison.OrdinalIgnoreCase);
+
     private void OnIncomingStatus(object? sender, string message) => StatusChanged?.Invoke(this, message);
 
     private async Task DemoIncomingLoopAsync(CancellationToken cancellationToken)
@@ -328,6 +355,7 @@ public sealed class TranslationEngine : IAsyncDisposable
         if (_localIncoming is not null)
         {
             _localIncoming.TranslationReady -= OnIncomingTranslation;
+            _localIncoming.PreviewChanged -= OnIncomingPreview;
             _localIncoming.Status -= OnIncomingStatus;
             try { await _localIncoming.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex) { VoiceScreenLog.Warn($"local incoming processor dispose error: {ex.Message}"); }

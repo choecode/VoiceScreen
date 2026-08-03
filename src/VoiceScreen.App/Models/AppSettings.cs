@@ -3,6 +3,7 @@ namespace VoiceScreen.App.Models;
 public sealed class AppSettings
 {
     public bool DemoMode { get; set; } = true;
+    public bool LowLatencyIncoming { get; set; } = true;
     public string MicrophoneDeviceId { get; set; } = string.Empty;
     public string DiscordOutputDeviceId { get; set; } = string.Empty;
     public string CableRenderDeviceId { get; set; } = string.Empty;

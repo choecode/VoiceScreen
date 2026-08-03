@@ -10,7 +10,7 @@
 - 你平时说话时，实体麦克风的中文原声会通过 VoiceScreen 转发给 Discord。
 - 按住右 Alt 说中文、松开后，VoiceScreen 在本地生成英文字幕和英文语音，并通过虚拟麦克风发给 Discord。
 - 实际发送的英文可以同步在实体耳机试听；中文测试框也能只在耳机试听翻译效果，不会把测试音发给 Discord。
-- Whisper、三个 OPUS-MT 专用翻译模型和英文语音合成都在本机运行。泰语通过 th-en → en-zh 桥接翻译；模型首次下载需要联网，之后可以断网使用。
+- Whisper base（实时预览）、Whisper small（最终定稿）、三个 OPUS-MT 专用翻译模型和英文语音合成都在本机运行。泰语通过 th-en → en-zh 桥接翻译；模型首次下载需要联网，之后可以断网使用。
 
 音频路由关系如下：
 
@@ -110,7 +110,7 @@ powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 脚本会自动完成：
 
 1. 安装 faster-whisper、CTranslate2、Transformers、SentencePiece 和安全版本的 CPU PyTorch。
-2. 下载 Whisper small。
+2. 下载 Whisper base 与 small；base 用于低延迟临时字幕，small 用于最终定稿。
 3. 从 Helsinki-NLP 官方仓库下载 `opus-mt-zh-en` 与 `opus-mt-en-zh`。
 4. 把中译英、英译中、泰译英三个翻译模型转换为 CTranslate2 CPU INT8。
 
@@ -252,7 +252,7 @@ dist\VoiceScreen-local-offline\VoiceScreen.App.exe
 10. 再次点击“启动”，进入正式纯本地模式。
 11. 在中文测试框输入一句话，点击“翻译并试听（仅耳机）”。悬浮窗会显示测试中英文，你会在耳机听到英文，但该测试音不会进入 Discord。
 
-正式模式第一次启动会加载 Whisper 与三个 OPUS-MT 模型，可能需要数秒到几十秒。状态显示“纯本地模式 · 只监听 Discord · 原声麦克风已直通”后才算启动完成。
+正式模式第一次启动会加载 Whisper base/small 与三个 OPUS-MT 模型，可能需要数秒到几十秒。状态显示“纯本地低延迟模式 · 只监听 Discord · 原声麦克风已直通”后才算启动完成。若更看重稳定性，可取消“游戏低延迟字幕”后重启。
 
 如果 Windows Defender SmartScreen 阻止启动，确认文件来自本项目仓库后，点击“更多信息 → 仍要运行”。不要从第三方网盘或下载站获取修改版程序。
 

@@ -2,10 +2,10 @@
 
 VoiceScreen does not commit model weights into this repository. `tools/setup_local_models.ps1` downloads the following models from their official repositories and converts the translation weights to CTranslate2 INT8 for local CPU inference.
 
-## faster-whisper small
+## faster-whisper base / small
 
 - Project: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-- Runtime model: `Systran/faster-whisper-small`
+- Runtime models: `Systran/faster-whisper-base` for provisional low-latency subtitles and `Systran/faster-whisper-small` for final transcription.
 - Purpose: local Chinese/English/Thai speech recognition and incoming-language detection.
 - License: see the upstream repository and downloaded model card.
 

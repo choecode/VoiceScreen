@@ -21,13 +21,15 @@ from transformers import MarianTokenizer
 
 class State:
     whisper = None
+    whisper_preview = None
     zh_en = None
     en_zh = None
     th_en = None
     zh_en_tokenizer = None
     en_zh_tokenizer = None
     th_en_tokenizer = None
-    inference_lock = threading.Lock()
+    asr_lock = threading.Lock()
+    translation_lock = threading.Lock()
 
 
 def model_root():
@@ -126,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {
                 "status": "ready",
-                "asr": "faster-whisper-small-cpu-int8",
+                "asr": "faster-whisper-base-preview+small-final-cpu-int8",
                 "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8",
             })
         else:
@@ -155,6 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         pcm = self.read_body(16 * 1024 * 1024)
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
         requested = parse_qs(parsed.query).get("language", ["auto"])[0]
+        preview_mode = parse_qs(parsed.query).get("mode", ["final"])[0] == "preview"
         if requested not in ("zh", "en", "auto"):
             raise ValueError("language must be zh, en, or auto")
         options = dict(
@@ -169,11 +172,11 @@ class Handler(BaseHTTPRequestHandler):
         )
         if requested != "auto":
             options["language"] = requested
-        # CTranslate2 model objects can be called from multiple native threads, but
-        # serializing the complete local pipeline prevents an abandoned request from
-        # overlapping a new Discord segment and destabilizing latency/HTTP responses.
-        with State.inference_lock:
-            segments, info = State.whisper.transcribe(audio, **options)
+        # Whisper requests stay serialized. Translation uses separate model objects
+        # and a separate lock, so incremental ASR and OPUS can run as a CPU pipeline.
+        with State.asr_lock:
+            model = State.whisper_preview if preview_mode else State.whisper
+            segments, info = model.transcribe(audio, **options)
             text = "".join(segment.text for segment in segments).strip()
         self.send_json(200, {"text": text, "language": info.language})
 
@@ -183,7 +186,7 @@ class Handler(BaseHTTPRequestHandler):
         direction = str(request.get("direction", ""))
         if not text or len(text) > 1000:
             raise ValueError("translation text is empty or too long")
-        with State.inference_lock:
+        with State.translation_lock:
             translated = translate_text(text, direction)
         self.send_json(200, {"text": translated})
 
@@ -199,6 +202,10 @@ def main():
     th_en_model = require_model("opus-mt-th-en-ct2-int8")
     State.whisper = WhisperModel(
         "small", device="cpu", compute_type="int8", cpu_threads=8, num_workers=1,
+        local_files_only=True,
+    )
+    State.whisper_preview = WhisperModel(
+        "base", device="cpu", compute_type="int8", cpu_threads=6, num_workers=1,
         local_files_only=True,
     )
     State.zh_en = ctranslate2.Translator(

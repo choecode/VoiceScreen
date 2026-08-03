@@ -12,6 +12,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <DockPanel Margin="0,0,0,8" MouseLeftButtonDown="Header_MouseLeftButtonDown">
                 <Ellipse DockPanel.Dock="Left" x:Name="StatusDot" Width="9" Height="9" Fill="#E3B341" Margin="0,0,8,0" />
@@ -45,7 +46,16 @@
                     </DataTemplate>
                 </ListBox.ItemTemplate>
             </ListBox>
-            <Grid x:Name="ResizeHandle" Grid.RowSpan="2" Width="26" Height="26"
+            <Border x:Name="PreviewBorder" Grid.Row="2" Background="#80242B36" CornerRadius="6"
+                    Padding="8,6" Margin="0,6,0,0" Visibility="Collapsed">
+                <TextBlock x:Name="PreviewText" Foreground="#B8C4D6" FontWeight="SemiBold"
+                           TextWrapping="Wrap" TextTrimming="None" Opacity="0.9">
+                    <TextBlock.Effect>
+                        <DropShadowEffect Color="Black" BlurRadius="4" ShadowDepth="1" Opacity="0.95" />
+                    </TextBlock.Effect>
+                </TextBlock>
+            </Border>
+            <Grid x:Name="ResizeHandle" Grid.RowSpan="3" Width="26" Height="26"
                   HorizontalAlignment="Right" VerticalAlignment="Bottom" Visibility="Collapsed">
                 <primitives:Thumb Cursor="SizeNWSE" DragDelta="ResizeThumb_DragDelta" Background="Transparent" />
                 <TextBlock Text="◢" Foreground="#FFD166" FontSize="20" HorizontalAlignment="Right"

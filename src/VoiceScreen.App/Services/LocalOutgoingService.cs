@@ -15,48 +15,44 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private const int AsrPort = 18765;
     private static readonly Uri AsrBaseUri = new($"http://127.0.0.1:{AsrPort}/");
     private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(120) };
-    private readonly SemaphoreSlim _modelGate = new(1, 1);
+    private readonly SemaphoreSlim _speechGate = new(1, 1);
+    private readonly SemaphoreSlim _translationGate = new(1, 1);
     private Process? _asrProcess;
     private bool _ownsAsr;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         await EnsureAsrAsync(cancellationToken).ConfigureAwait(false);
-        VoiceScreenLog.Info("Local models ready: faster-whisper small + OPUS-MT zh-en/en-zh/th-en CPU INT8");
+        VoiceScreenLog.Info("Local models ready: faster-whisper base preview + small final + OPUS-MT zh-en/en-zh/th-en CPU INT8");
     }
 
     public async Task<LocalOutgoingTranslation> TranslateSpeechAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
     {
-        await _modelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var transcription = await TranscribeAsync(pcm16Mono16Khz, "zh", cancellationToken).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(transcription.Text)) throw new InvalidOperationException("本地中文识别没有听清，请再说一次。");
-            var english = await TranslateTextAsync(transcription.Text, TranslationDirection.ChineseToEnglish, cancellationToken)
-                .ConfigureAwait(false);
-            return new LocalOutgoingTranslation(transcription.Text, english);
-        }
-        finally
-        {
-            _modelGate.Release();
-        }
+        var transcription = await TranscribeWithGateAsync(pcm16Mono16Khz, "zh", cancellationToken)
+            .ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(transcription.Text))
+            throw new InvalidOperationException("本地中文识别没有听清，请再说一次。");
+        var english = await TranslateTextWithGateAsync(transcription.Text, TranslationDirection.ChineseToEnglish,
+            cancellationToken).ConfigureAwait(false);
+        return new LocalOutgoingTranslation(transcription.Text, english);
     }
 
     public async Task<LocalIncomingTranslation> TranslateIncomingSpeechAsync(byte[] pcm16Mono16Khz,
         CancellationToken cancellationToken)
     {
-        await _modelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var transcription = await TranscribeAsync(pcm16Mono16Khz, "auto", cancellationToken).ConfigureAwait(false);
-            VoiceScreenLog.Info($"Incoming ASR language={transcription.Language} text={LogExcerpt(transcription.Text)}");
-            return await TranslateIncomingTextAsync(transcription.Text, transcription.Language, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        finally
-        {
-            _modelGate.Release();
-        }
+        var transcription = await TranscribeIncomingSpeechAsync(pcm16Mono16Khz, cancellationToken)
+            .ConfigureAwait(false);
+        return await TranslateIncomingTextAsync(transcription.Text, transcription.Language, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<LocalTranscription> TranscribeIncomingSpeechAsync(byte[] pcm16Mono16Khz,
+        CancellationToken cancellationToken, bool preview = false)
+    {
+        var transcription = await TranscribeWithGateAsync(pcm16Mono16Khz, "auto", cancellationToken, preview)
+            .ConfigureAwait(false);
+        VoiceScreenLog.Info($"Incoming ASR language={transcription.Language} text={LogExcerpt(transcription.Text)}");
+        return transcription;
     }
 
     public async Task<LocalIncomingTranslation> TranslateIncomingTextAsync(string text, string detectedLanguage,
@@ -66,16 +62,16 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             return new LocalIncomingTranslation(string.Empty, string.Empty, detectedLanguage);
         if (detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase) || ContainsChinese(text))
             return new LocalIncomingTranslation(text.Trim(), text.Trim(), "zh");
-        if (IsPathologicalRepetition(text))
+        if (IsLikelyIncomingHallucination(text, detectedLanguage))
         {
             VoiceScreenLog.Warn($"Incoming ASR repetition discarded: {LogExcerpt(text)}");
             return EmptyIncoming(detectedLanguage);
         }
         if (detectedLanguage.StartsWith("th", StringComparison.OrdinalIgnoreCase) || ContainsThai(text))
         {
-            var englishBridge = await TranslateTextAsync(text.Trim(), TranslationDirection.ThaiToEnglish,
+            var englishBridge = await TranslateTextWithGateAsync(text.Trim(), TranslationDirection.ThaiToEnglish,
                 cancellationToken).ConfigureAwait(false);
-            var thaiChinese = await TranslateTextAsync(englishBridge, TranslationDirection.EnglishToChinese,
+            var thaiChinese = await TranslateTextWithGateAsync(englishBridge, TranslationDirection.EnglishToChinese,
                 cancellationToken).ConfigureAwait(false);
             if (IsUnsafeTranslation(text, thaiChinese))
             {
@@ -86,7 +82,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         }
         if (!detectedLanguage.StartsWith("en", StringComparison.OrdinalIgnoreCase))
             return new LocalIncomingTranslation(text.Trim(), text.Trim(), detectedLanguage);
-        var chinese = await TranslateTextAsync(text.Trim(), TranslationDirection.EnglishToChinese, cancellationToken)
+        var chinese = await TranslateTextWithGateAsync(text.Trim(), TranslationDirection.EnglishToChinese, cancellationToken)
             .ConfigureAwait(false);
         if (IsUnsafeTranslation(text, chinese))
         {
@@ -98,6 +94,11 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
     private static LocalIncomingTranslation EmptyIncoming(string language)
         => new(string.Empty, string.Empty, language);
+
+    internal static bool IsLikelyIncomingHallucination(string text, string detectedLanguage)
+        => !detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+           && !ContainsChinese(text)
+           && IsPathologicalRepetition(text);
 
     private static bool IsUnsafeTranslation(string source, string translated)
         => translated.Length > Math.Max(120, source.Length * 12)
@@ -139,22 +140,43 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     public async Task<string> TranslateChineseTextAsync(string chineseText, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(chineseText)) throw new ArgumentException("请输入要测试的中文。", nameof(chineseText));
-        await _modelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return await TranslateTextWithGateAsync(chineseText.Trim(), TranslationDirection.ChineseToEnglish,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<LocalTranscription> TranscribeWithGateAsync(byte[] pcm16Mono16Khz, string language,
+        CancellationToken cancellationToken, bool preview = false)
+    {
+        await _speechGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await TranslateTextAsync(chineseText.Trim(), TranslationDirection.ChineseToEnglish, cancellationToken)
-                .ConfigureAwait(false);
+            return await TranscribeAsync(pcm16Mono16Khz, language, cancellationToken, preview).ConfigureAwait(false);
         }
         finally
         {
-            _modelGate.Release();
+            _speechGate.Release();
+        }
+    }
+
+    private async Task<string> TranslateTextWithGateAsync(string source, TranslationDirection direction,
+        CancellationToken cancellationToken)
+    {
+        await _translationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await TranslateTextAsync(source, direction, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _translationGate.Release();
         }
     }
 
     private async Task<LocalTranscription> TranscribeAsync(byte[] pcm16Mono16Khz, string language,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool preview = false)
     {
-        using var response = await PostAudioWithRetryAsync($"transcribe?language={language}", pcm16Mono16Khz,
+        var mode = preview ? "preview" : "final";
+        using var response = await PostAudioWithRetryAsync($"transcribe?language={language}&mode={mode}", pcm16Mono16Khz,
             cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
@@ -231,7 +253,9 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         if (!File.Exists(script)) throw new FileNotFoundException("缺少本地语音识别服务脚本。", script);
         _asrProcess = StartHiddenProcess("python", $"\"{script}\" --port {AsrPort}");
         _ownsAsr = true;
-        await WaitUntilHealthyAsync(_asr, "health", _asrProcess, TimeSpan.FromSeconds(30), cancellationToken,
+        // 首次启动会同时把两套 Whisper 和三套 OPUS 模型装入内存；游戏运行时磁盘/CPU
+        // 较忙，冷启动可能超过 30 秒。放宽这里只影响启动等待，不影响单次翻译超时。
+        await WaitUntilHealthyAsync(_asr, "health", _asrProcess, TimeSpan.FromMinutes(2), cancellationToken,
             "本地模型服务启动失败。请先运行 setup_local_models.ps1，并确认 Python 依赖已安装。")
             .ConfigureAwait(false);
     }
@@ -286,7 +310,8 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     public ValueTask DisposeAsync()
     {
         _asr.Dispose();
-        _modelGate.Dispose();
+        _speechGate.Dispose();
+        _translationGate.Dispose();
         StopOwnedProcess(_asrProcess, _ownsAsr);
         return ValueTask.CompletedTask;
     }
@@ -302,8 +327,6 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
     private sealed record TranscriptionResponse(string Text, string Language);
     private sealed record TranslationResponse(string Text);
-    private sealed record LocalTranscription(string Text, string Language);
-
     private enum TranslationDirection
     {
         ChineseToEnglish,
@@ -314,3 +337,4 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
 public sealed record LocalOutgoingTranslation(string SourceText, string TranslatedText);
 public sealed record LocalIncomingTranslation(string SourceText, string TranslatedText, string Language);
+public sealed record LocalTranscription(string Text, string Language);
