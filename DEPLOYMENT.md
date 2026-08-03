@@ -6,11 +6,11 @@
 
 部署完成后：
 
-- Discord 对方说英语时，VoiceScreen 只捕获 Discord 进程声音，在悬浮窗显示英文原文与中文译文。
+- Discord 对方说英语或泰语时，VoiceScreen 只捕获 Discord 进程声音，在悬浮窗显示原文与中文译文。
 - 你平时说话时，实体麦克风的中文原声会通过 VoiceScreen 转发给 Discord。
 - 按住右 Alt 说中文、松开后，VoiceScreen 在本地生成英文字幕和英文语音，并通过虚拟麦克风发给 Discord。
 - 实际发送的英文可以同步在实体耳机试听；中文测试框也能只在耳机试听翻译效果，不会把测试音发给 Discord。
-- Whisper、双向 OPUS-MT 专用翻译模型和英文语音合成都在本机运行。模型首次下载需要联网，之后可以断网使用。
+- Whisper、三个 OPUS-MT 专用翻译模型和英文语音合成都在本机运行。泰语通过 th-en → en-zh 桥接翻译；模型首次下载需要联网，之后可以断网使用。
 
 音频路由关系如下：
 
@@ -112,7 +112,7 @@ powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 1. 安装 faster-whisper、CTranslate2、Transformers、SentencePiece 和安全版本的 CPU PyTorch。
 2. 下载 Whisper small。
 3. 从 Helsinki-NLP 官方仓库下载 `opus-mt-zh-en` 与 `opus-mt-en-zh`。
-4. 把两个翻译模型转换为 CTranslate2 CPU INT8；运行权重合计约 161MB。
+4. 把中译英、英译中、泰译英三个翻译模型转换为 CTranslate2 CPU INT8。
 
 模型目录：
 
@@ -122,7 +122,7 @@ powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 
 脚本最后出现 `All VoiceScreen local models are ready.` 才算完成。运行时只使用 CTranslate2 INT8，不使用 PyTorch 推理，也不会占用游戏显卡。
 
-OPUS-MT 是专用机器翻译模型，不是聊天模型。中译英模型采用 CC-BY-4.0，英译中模型采用 Apache-2.0；分发程序时应保留模型来源与许可说明。
+OPUS-MT 是专用机器翻译模型，不是聊天模型。中译英模型采用 CC-BY-4.0，英译中和泰译英模型采用 Apache-2.0；分发程序时应保留模型来源与许可说明。
 
 ### 3.4 安装 Windows 英文语音
 
@@ -252,7 +252,7 @@ dist\VoiceScreen-local-offline\VoiceScreen.App.exe
 10. 再次点击“启动”，进入正式纯本地模式。
 11. 在中文测试框输入一句话，点击“翻译并试听（仅耳机）”。悬浮窗会显示测试中英文，你会在耳机听到英文，但该测试音不会进入 Discord。
 
-正式模式第一次启动会加载 Whisper 与双向 OPUS-MT，可能需要数秒到几十秒。状态显示“纯本地模式 · 只监听 Discord · 原声麦克风已直通”后才算启动完成。
+正式模式第一次启动会加载 Whisper 与三个 OPUS-MT 模型，可能需要数秒到几十秒。状态显示“纯本地模式 · 只监听 Discord · 原声麦克风已直通”后才算启动完成。
 
 如果 Windows Defender SmartScreen 阻止启动，确认文件来自本项目仓库后，点击“更多信息 → 仍要运行”。不要从第三方网盘或下载站获取修改版程序。
 
@@ -291,6 +291,8 @@ EN: Enemies are on the second floor.
 同时播放一个游戏中文视频或让游戏角色说中文，悬浮窗不应显示游戏内容，因为接收链路固定只捕获 Discord 进程树。
 
 如果 Discord 对方改说中文，Whisper 会自动检测语言，悬浮窗直接显示 `中：识别原文`，不会调用 OPUS-MT 再做一次中文到中文翻译。
+
+如果检测为泰语，悬浮窗显示 `TH：泰文原文` 和 `中：中文译文`。翻译在本地依次经过泰译英与英译中模型。
 
 ### 7.4 防循环验证
 
@@ -352,7 +354,7 @@ Get-NetTCPConnection -LocalPort 18765 -ErrorAction SilentlyContinue
 powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 ```
 
-确认 `%LOCALAPPDATA%\VoiceScreen\Models` 下同时存在 `opus-mt-zh-en-ct2-int8` 与 `opus-mt-en-zh-ct2-int8`，并且各自包含 `model.bin`。模型准备中途失败时，不要手动拼接文件；保留下载缓存并重新运行脚本即可续传。
+确认 `%LOCALAPPDATA%\VoiceScreen\Models` 下同时存在 `opus-mt-zh-en-ct2-int8`、`opus-mt-en-zh-ct2-int8` 与 `opus-mt-th-en-ct2-int8`，并且各自包含 `model.bin`。模型准备中途失败时，不要手动拼接文件；保留下载缓存并重新运行脚本即可续传，脚本会自动重试最多 3 次。
 
 ### 9.4 程序检测不到 CABLE Input
 
@@ -489,6 +491,7 @@ dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
 - [Python 3.11.9 Windows 发布页](https://www.python.org/downloads/release/python-3119/)
 - [Helsinki-NLP OPUS-MT 中译英模型](https://huggingface.co/Helsinki-NLP/opus-mt-zh-en)
 - [Helsinki-NLP OPUS-MT 英译中模型](https://huggingface.co/Helsinki-NLP/opus-mt-en-zh)
+- [Helsinki-NLP OPUS-MT 泰译英模型](https://huggingface.co/Helsinki-NLP/opus-mt-th-en)
 - [CTranslate2 官方项目](https://github.com/OpenNMT/CTranslate2)
 - [VB-Audio Virtual Cable 官方页面](https://vb-audio.com/Cable/)
 - [Discord 语音与视频故障排查](https://support.discord.com/hc/articles/360045138471)

@@ -7,7 +7,7 @@ VoiceScreen 是一个在 Windows 11 上运行的 Discord 双向语音翻译工�
 > 一期之后的低延迟、增量字幕和实时翻译路线见 [二期实时化方案](REALTIME_ROADMAP.md)。
 
 - 只捕获 Discord 进程的声音，不会把游戏、浏览器或系统声音送去识别。
-- 对方说英语：本地 Whisper 识别英文，本地 OPUS-MT 翻译成中文，悬浮窗同时显示原文和译文；检测为中文时直接显示，不走翻译。
+- 对方说英语：本地 Whisper 识别英文，本地 OPUS-MT 翻译成中文；对方说泰语：使用 OPUS-MT `th-en → en-zh` 两段桥接翻译成中文；悬浮窗同时显示原文和译文。检测为中文时直接显示，不走翻译。
 - 我方说中文：默认保持真实麦克风直通；按住右 Alt 录音，松开后本地生成英文字幕与英文语音，并通过 VB-CABLE 发送给 Discord。
 - 可选择 Windows 已安装的英文男声/女声音色；“复读已发送英文”决定是否在实体耳机同步播放。
 - “翻译并试听（仅耳机）”按钮可测试任意中文和当前音色，不会把测试音发进 Discord。
@@ -19,7 +19,7 @@ VoiceScreen 是一个在 Windows 11 上运行的 Discord 双向语音翻译工�
 | 功能 | 实现 |
 |---|---|
 | 中英文语音识别 | faster-whisper `small`，CPU INT8 |
-| 中英双向翻译 | Helsinki-NLP OPUS-MT 双向专用模型，CTranslate2 CPU INT8 |
+| 中英及泰中翻译 | Helsinki-NLP OPUS-MT 三个专用模型，泰语经 th-en → en-zh 桥接，CTranslate2 CPU INT8 |
 | 英文语音合成 | Windows Speech 离线语音 |
 | Discord 单独捕获 | Windows Process Loopback |
 | 发送音频路由 | VB-Audio Virtual Cable |
@@ -37,7 +37,7 @@ VoiceScreen 是一个在 Windows 11 上运行的 Discord 双向语音翻译工�
    powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1
    ```
 
-   脚本会下载 Whisper small、OPUS-MT 中译英和英译中官方模型，并转换为约 161MB 的 CPU INT8 运行格式。
+   脚本会下载 Whisper small，以及 OPUS-MT 中译英、英译中、泰译英三个官方模型，并转换为 CPU INT8 运行格式。
 
 4. 安装 VB-Audio Virtual Cable。
 

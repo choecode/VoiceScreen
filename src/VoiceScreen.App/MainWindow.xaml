@@ -15,7 +15,7 @@
 
             <StackPanel>
                 <TextBlock Text="VoiceScreen" FontSize="34" FontWeight="Bold" />
-                <TextBlock Text="Discord 英语 → 中文字幕 · 按住右 Alt：中文 → 英语语音" Foreground="#8B949E" FontSize="15" Margin="0,6,0,0" />
+                <TextBlock Text="Discord 英语/泰语 → 中文字幕 · 按住右 Alt：中文 → 英语语音" Foreground="#8B949E" FontSize="15" Margin="0,6,0,0" />
             </StackPanel>
 
             <Border Grid.Row="1" Background="#161B22" BorderBrush="#30363D" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,22,0,0">
@@ -60,7 +60,7 @@
                     <TextBlock Grid.Row="1" Text="双向语音识别" VerticalAlignment="Center" />
                     <TextBox Grid.Row="1" Grid.Column="1" Margin="0,5" Text="faster-whisper small · CPU INT8" IsReadOnly="True" />
                     <TextBlock Grid.Row="2" Text="双向文本翻译" VerticalAlignment="Center" />
-                    <TextBox Grid.Row="2" Grid.Column="1" Margin="0,5" Text="OPUS-MT 中英双向专用模型 · CPU INT8" IsReadOnly="True" />
+                    <TextBox Grid.Row="2" Grid.Column="1" Margin="0,5" Text="OPUS-MT 中英双向 + 泰英桥接 · CPU INT8" IsReadOnly="True" />
                     <TextBlock Grid.Row="3" Text="英文语音输出" VerticalAlignment="Center" />
                     <TextBox Grid.Row="3" Grid.Column="1" Margin="0,5" Text="Windows Speech · 完全离线" IsReadOnly="True" />
                     <TextBlock Grid.Row="4" Text="英文音色" VerticalAlignment="Center" />

@@ -14,7 +14,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 {
     private const int AsrPort = 18765;
     private static readonly Uri AsrBaseUri = new($"http://127.0.0.1:{AsrPort}/");
-    private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(60) };
+    private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(120) };
     private readonly SemaphoreSlim _modelGate = new(1, 1);
     private Process? _asrProcess;
     private bool _ownsAsr;
@@ -22,7 +22,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         await EnsureAsrAsync(cancellationToken).ConfigureAwait(false);
-        VoiceScreenLog.Info("Local models ready: faster-whisper small + OPUS-MT zh-en/en-zh CPU INT8");
+        VoiceScreenLog.Info("Local models ready: faster-whisper small + OPUS-MT zh-en/en-zh/th-en CPU INT8");
     }
 
     public async Task<LocalOutgoingTranslation> TranslateSpeechAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
@@ -66,7 +66,15 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         if (detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase) || ContainsChinese(text))
             return new LocalIncomingTranslation(text.Trim(), text.Trim(), "zh");
         if (!detectedLanguage.StartsWith("en", StringComparison.OrdinalIgnoreCase))
-            return new LocalIncomingTranslation(text.Trim(), text.Trim(), detectedLanguage);
+        {
+            if (!detectedLanguage.StartsWith("th", StringComparison.OrdinalIgnoreCase))
+                return new LocalIncomingTranslation(text.Trim(), text.Trim(), detectedLanguage);
+            var englishBridge = await TranslateTextAsync(text.Trim(), TranslationDirection.ThaiToEnglish,
+                cancellationToken).ConfigureAwait(false);
+            var thaiChinese = await TranslateTextAsync(englishBridge, TranslationDirection.EnglishToChinese,
+                cancellationToken).ConfigureAwait(false);
+            return new LocalIncomingTranslation(text.Trim(), thaiChinese, "th");
+        }
         var chinese = await TranslateTextAsync(text.Trim(), TranslationDirection.EnglishToChinese, cancellationToken)
             .ConfigureAwait(false);
         return new LocalIncomingTranslation(text.Trim(), chinese, "en");
@@ -93,10 +101,8 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private async Task<LocalTranscription> TranscribeAsync(byte[] pcm16Mono16Khz, string language,
         CancellationToken cancellationToken)
     {
-        using var audioContent = new ByteArrayContent(pcm16Mono16Khz);
-        audioContent.Headers.ContentType = new("application/octet-stream");
-        using var response = await _asr.PostAsync($"transcribe?language={language}", audioContent, cancellationToken)
-            .ConfigureAwait(false);
+        using var response = await PostAudioWithRetryAsync($"transcribe?language={language}", pcm16Mono16Khz,
+            cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException($"本地语音识别失败：{ReadError(body)}");
@@ -110,11 +116,15 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         var request = new
         {
             text = source,
-            direction = direction == TranslationDirection.ChineseToEnglish ? "zh-en" : "en-zh"
+            direction = direction switch
+            {
+                TranslationDirection.ChineseToEnglish => "zh-en",
+                TranslationDirection.ThaiToEnglish => "th-en",
+                _ => "en-zh"
+            }
         };
         var requestJson = JsonSerializer.Serialize(request, JsonOptions);
-        using var requestContent = new StringContent(requestJson, Encoding.UTF8, "application/json");
-        using var translationResponse = await _asr.PostAsync("translate", requestContent, cancellationToken)
+        using var translationResponse = await PostJsonWithRetryAsync("translate", requestJson, cancellationToken)
             .ConfigureAwait(false);
         var translationBody = await translationResponse.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!translationResponse.IsSuccessStatusCode)
@@ -122,6 +132,43 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         var translated = JsonSerializer.Deserialize<TranslationResponse>(translationBody, JsonOptions)?.Text?.Trim();
         if (string.IsNullOrWhiteSpace(translated)) throw new InvalidOperationException("本地翻译没有返回结果。");
         return translated;
+    }
+
+    private async Task<HttpResponseMessage> PostAudioWithRetryAsync(string path, byte[] audio,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var content = new ByteArrayContent(audio);
+                content.Headers.ContentType = new("application/octet-stream");
+                return await _asr.PostAsync(path, content, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException) when (attempt == 0 && !cancellationToken.IsCancellationRequested)
+            {
+                VoiceScreenLog.Warn("Local model audio request disconnected; retrying once");
+                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<HttpResponseMessage> PostJsonWithRetryAsync(string path, string json,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                return await _asr.PostAsync(path, content, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException) when (attempt == 0 && !cancellationToken.IsCancellationRequested)
+            {
+                VoiceScreenLog.Warn("Local model translation request disconnected; retrying once");
+                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private async Task EnsureAsrAsync(CancellationToken cancellationToken)
@@ -207,7 +254,8 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private enum TranslationDirection
     {
         ChineseToEnglish,
-        EnglishToChinese
+        EnglishToChinese,
+        ThaiToEnglish
     }
 }
 

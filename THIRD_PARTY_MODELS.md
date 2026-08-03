@@ -6,7 +6,7 @@ VoiceScreen does not commit model weights into this repository. `tools/setup_loc
 
 - Project: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 - Runtime model: `Systran/faster-whisper-small`
-- Purpose: local Chinese/English speech recognition and incoming-language detection.
+- Purpose: local Chinese/English/Thai speech recognition and incoming-language detection.
 - License: see the upstream repository and downloaded model card.
 
 ## Helsinki-NLP OPUS-MT Chinese → English
@@ -19,6 +19,12 @@ VoiceScreen does not commit model weights into this repository. `tools/setup_loc
 
 - Model: [Helsinki-NLP/opus-mt-en-zh](https://huggingface.co/Helsinki-NLP/opus-mt-en-zh)
 - Purpose: deterministic English-to-Chinese machine translation.
+- Model card license: Apache-2.0.
+
+## Helsinki-NLP OPUS-MT Thai → English
+
+- Model: [Helsinki-NLP/opus-mt-th-en](https://huggingface.co/Helsinki-NLP/opus-mt-th-en)
+- Purpose: first stage of the fully local Thai → English → Chinese bridge translation.
 - Model card license: Apache-2.0.
 
 ## CTranslate2

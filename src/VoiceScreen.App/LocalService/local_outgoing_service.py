@@ -22,8 +22,10 @@ class State:
     whisper = None
     zh_en = None
     en_zh = None
+    th_en = None
     zh_en_tokenizer = None
     en_zh_tokenizer = None
+    th_en_tokenizer = None
 
 
 def model_root():
@@ -53,9 +55,10 @@ def normalize_game_terms(text, direction):
             text = text.replace(source, target)
         return text
 
-    text = re.sub(r"\bdon['’]?t\s+push\b", "don't attack", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bdo\s+not\s+push\b", "do not attack", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bpush\b", "advance", text, flags=re.IGNORECASE)
+    if direction == "en-zh":
+        text = re.sub(r"\bdon['’]?t\s+push\b", "don't attack", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bdo\s+not\s+push\b", "do not attack", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bpush\b", "advance", text, flags=re.IGNORECASE)
     return text
 
 
@@ -72,8 +75,11 @@ def translate_text(text, direction):
     elif direction == "en-zh":
         translator = State.en_zh
         tokenizer = State.en_zh_tokenizer
+    elif direction == "th-en":
+        translator = State.th_en
+        tokenizer = State.th_en_tokenizer
     else:
-        raise ValueError("direction must be zh-en or en-zh")
+        raise ValueError("direction must be zh-en, en-zh, or th-en")
 
     normalized = normalize_game_terms(text.strip(), direction)
     clauses = split_clauses(normalized, direction)
@@ -119,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "ready",
                 "asr": "faster-whisper-small-cpu-int8",
-                "translation": "opus-mt-zh-en+en-zh-cpu-int8",
+                "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8",
             })
         else:
             self.send_json(404, {"error": "not found"})
@@ -175,6 +181,7 @@ def main():
     root = model_root()
     zh_en_model = require_model("opus-mt-zh-en-ct2-int8")
     en_zh_model = require_model("opus-mt-en-zh-ct2-int8")
+    th_en_model = require_model("opus-mt-th-en-ct2-int8")
     State.whisper = WhisperModel(
         "small", device="cpu", compute_type="int8", cpu_threads=8, num_workers=1,
         local_files_only=True,
@@ -185,8 +192,12 @@ def main():
     State.en_zh = ctranslate2.Translator(
         en_zh_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
     )
+    State.th_en = ctranslate2.Translator(
+        th_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+    )
     State.zh_en_tokenizer = MarianTokenizer.from_pretrained(zh_en_model, local_files_only=True)
     State.en_zh_tokenizer = MarianTokenizer.from_pretrained(en_zh_model, local_files_only=True)
+    State.th_en_tokenizer = MarianTokenizer.from_pretrained(th_en_model, local_files_only=True)
     ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 

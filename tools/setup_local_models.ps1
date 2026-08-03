@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 Write-Host "VoiceScreen local model setup" -ForegroundColor Cyan
-Write-Host "This downloads Whisper small and two OPUS-MT translation models once."
+Write-Host "This downloads Whisper small and three OPUS-MT translation models once."
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     throw "Python was not found. Install Python 3.11 x64 and reopen PowerShell."
@@ -26,10 +26,11 @@ New-Item -ItemType Directory -Force -Path $modelRoot | Out-Null
 
 $zhEnReady = Test-Path (Join-Path $modelRoot "opus-mt-zh-en-ct2-int8\model.bin")
 $enZhReady = Test-Path (Join-Path $modelRoot "opus-mt-en-zh-ct2-int8\model.bin")
-if (-not ($zhEnReady -and $enZhReady)) {
+$thEnReady = Test-Path (Join-Path $modelRoot "opus-mt-th-en-ct2-int8\model.bin")
+if (-not ($zhEnReady -and $enZhReady -and $thEnReady)) {
     # Torch is only used by the one-time official Transformers -> CTranslate2 conversion.
     # 2.6+ is required because older torch.load versions have a known security issue.
-    python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.6,<3"
+    python -m pip install --index-url https://pypi.org/simple "torch==2.6.0"
     if ($LASTEXITCODE -ne 0) { throw "Failed to install the safe CPU build of PyTorch." }
 }
 
@@ -58,9 +59,20 @@ function Install-OpusModel {
 
     New-Item -ItemType Directory -Force -Path $source | Out-Null
     Write-Host "Downloading $Repository..." -ForegroundColor Cyan
-    hf download $Repository --local-dir $source --include `
-        config.json generation_config.json pytorch_model.bin source.spm target.spm vocab.json tokenizer_config.json
-    if ($LASTEXITCODE -ne 0) { throw "Failed to download $Repository." }
+    $downloaded = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        hf download $Repository --local-dir $source --include `
+            config.json generation_config.json pytorch_model.bin source.spm target.spm vocab.json tokenizer_config.json
+        if ($LASTEXITCODE -eq 0) {
+            $downloaded = $true
+            break
+        }
+        if ($attempt -lt 3) {
+            Write-Host "Download interrupted; retrying $Repository ($attempt/3)..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 2
+        }
+    }
+    if (-not $downloaded) { throw "Failed to download $Repository after 3 attempts." }
 
     if (Test-Path $target) {
         throw "Incomplete target already exists: $target. Rename it and rerun this script."
@@ -74,6 +86,7 @@ function Install-OpusModel {
 
 Install-OpusModel -Repository "Helsinki-NLP/opus-mt-zh-en" -Name "opus-mt-zh-en"
 Install-OpusModel -Repository "Helsinki-NLP/opus-mt-en-zh" -Name "opus-mt-en-zh"
+Install-OpusModel -Repository "Helsinki-NLP/opus-mt-th-en" -Name "opus-mt-th-en"
 
 $env:HF_HUB_OFFLINE = "1"
 Write-Host "All VoiceScreen local models are ready." -ForegroundColor Green

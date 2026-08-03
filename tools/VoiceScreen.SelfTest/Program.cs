@@ -37,6 +37,12 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
     if (chineseBypass.Language != "zh" || chineseBypass.SourceText != chineseBypass.TranslatedText)
         throw new InvalidOperationException("检测到中文后仍进入了翻译流程。");
 
+    var thai = await local.TranslateIncomingTextAsync("ไปทางซ้ายเร็ว", "th", CancellationToken.None);
+    Console.WriteLine($"PASS：Discord 泰语桥接翻译，{thai.SourceText} → {thai.TranslatedText}");
+    if (thai.Language != "th" || string.IsNullOrWhiteSpace(thai.TranslatedText)
+        || thai.TranslatedText == thai.SourceText)
+        throw new InvalidOperationException("泰语没有经过 th-en → en-zh 本地桥接翻译。");
+
     await using var processor = new LocalIncomingAudioProcessor(local);
     var completed = new TaskCompletionSource<LocalIncomingTranslation>(TaskCreationOptions.RunContinuationsAsynchronously);
     processor.TranslationReady += (_, result) => completed.TrySetResult(result);

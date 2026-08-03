@@ -48,6 +48,7 @@ public sealed class TranslationEngine : IAsyncDisposable
             _localIncoming = new LocalIncomingAudioProcessor(_localOutgoing);
             _localIncoming.TranslationReady += OnIncomingTranslation;
             _localIncoming.Error += (_, message) => Error?.Invoke(this, message);
+            _localIncoming.Status += OnIncomingStatus;
             _discordCapture = CreateIncomingCapture();
         }
         IsRunning = true;
@@ -218,14 +219,19 @@ public sealed class TranslationEngine : IAsyncDisposable
     {
         if (!_state.ShouldAcceptRemoteResult || string.IsNullOrWhiteSpace(result.TranslatedText)) return;
         if (_echo.IsLikelyEcho(result.SourceText)) return;
+        if (!result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+            && !result.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
+            && !result.Language.StartsWith("th", StringComparison.OrdinalIgnoreCase)) return;
         var subtitle = result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
             ? $"中：{result.SourceText}"
             : result.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
                 ? $"EN：{result.SourceText}\n中：{result.TranslatedText}"
-                : $"[{result.Language}]：{result.SourceText}";
+                : $"TH：{result.SourceText}\n中：{result.TranslatedText}";
         // 英文原文和中文译文作为同一个字幕项，滚动和淘汰时不会错位。
         SubtitleProduced?.Invoke(this, ("remote", subtitle));
     }
+
+    private void OnIncomingStatus(object? sender, string message) => StatusChanged?.Invoke(this, message);
 
     private async Task DemoIncomingLoopAsync(CancellationToken cancellationToken)
     {
@@ -322,6 +328,7 @@ public sealed class TranslationEngine : IAsyncDisposable
         if (_localIncoming is not null)
         {
             _localIncoming.TranslationReady -= OnIncomingTranslation;
+            _localIncoming.Status -= OnIncomingStatus;
             try { await _localIncoming.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex) { VoiceScreenLog.Warn($"local incoming processor dispose error: {ex.Message}"); }
             _localIncoming = null;

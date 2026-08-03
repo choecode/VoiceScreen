@@ -1,4 +1,5 @@
 using System.IO;
+using System.Net.Http;
 using System.Threading.Channels;
 using VoiceScreen.App.Diagnostics;
 
@@ -16,7 +17,7 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
     private const int EndSilenceFrames = 50; // 2000ms，保留真实 Discord 对话里的思考停顿
     private const int PreRollFrames = 8; // 320ms，避免吞掉句首辅音
     private const int MinimumVoicedFrames = 3;
-    private const int MaximumUtteranceFrames = 750; // 30s
+    private const int MaximumUtteranceFrames = 500; // 20s，限制单次请求规模，降低长请求断连和后续字幕积压
 
     private readonly object _gate = new();
     private readonly LocalOutgoingService _localService;
@@ -43,6 +44,7 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
 
     public event EventHandler<LocalIncomingTranslation>? TranslationReady;
     public event EventHandler<string>? Error;
+    public event EventHandler<string>? Status;
 
     public ValueTask AddFrameAsync(byte[] frame, bool acceptIncoming, CancellationToken cancellationToken)
     {
@@ -134,9 +136,9 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
                 try
                 {
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-                    // CPU inference can slow down noticeably while a 3A game is running.
-                    // Do not cancel a complete long utterance before Whisper can finish it.
-                    timeout.CancelAfter(TimeSpan.FromSeconds(45));
+                    // Total CPU usage can remain low while an individual inference request is still delayed.
+                    // Leave enough time for Whisper and bridged translation without keeping a stalled request forever.
+                    timeout.CancelAfter(TimeSpan.FromSeconds(90));
                     var result = await _localService.TranslateIncomingSpeechAsync(audio, timeout.Token)
                         .ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(result.SourceText) && !string.IsNullOrWhiteSpace(result.TranslatedText))
@@ -144,7 +146,8 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
                 }
                 catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
                 {
-                    Error?.Invoke(this, "本地英文识别或翻译超时。");
+                    VoiceScreenLog.Warn("Local incoming translation exceeded 90 seconds; segment skipped");
+                    Status?.Invoke(this, "本地模型繁忙，本段已跳过，后续 Discord 字幕会自动继续");
                 }
                 catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
                 {
@@ -153,7 +156,10 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
                 catch (Exception ex)
                 {
                     VoiceScreenLog.Error("Local incoming translation failed", ex);
-                    Error?.Invoke(this, ex.Message);
+                    if (ex is HttpRequestException)
+                        Status?.Invoke(this, "本地模型连接短暂中断，本段已跳过，后续字幕会自动继续");
+                    else
+                        Error?.Invoke(this, ex.Message);
                 }
             }
         }
