@@ -64,7 +64,6 @@ public sealed class TranslationEngine : IAsyncDisposable
         try
         {
             _router.BeginTranslationCapture();
-            SubtitleProduced?.Invoke(this, ("status", "正在听你说中文……"));
         }
         catch (Exception ex)
         {
@@ -240,7 +239,7 @@ public sealed class TranslationEngine : IAsyncDisposable
 
     private static string DescribeState(DuplexState state) => state switch
     {
-        DuplexState.CapturingLocalChinese => "正在听中文（原声已暂停）",
+        DuplexState.CapturingLocalChinese => "正在听你说中文……（原声已暂停）",
         DuplexState.TranslatingLocalText => "正在翻译中文",
         DuplexState.SendingEnglishTts => "正在向 Discord 发送英文",
         DuplexState.Cooldown => "发送完成，正在恢复原声",

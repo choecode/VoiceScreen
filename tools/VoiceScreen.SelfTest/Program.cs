@@ -91,6 +91,8 @@ await using (var engine = new TranslationEngine(settings))
     await engine.EndLocalCaptureAsync();
     if (!engine.PassThroughEnabled) throw new InvalidOperationException("翻译结束后原声麦克风没有恢复。");
 }
+if (lines.Any(line => line.Contains("正在听你说中文", StringComparison.Ordinal)))
+    throw new InvalidOperationException("录音状态不应写入永久字幕历史。");
 if (!lines.Any(line => line.StartsWith("已发送：", StringComparison.Ordinal)))
     throw new InvalidOperationException("端到端模拟没有产生已发送英文字幕。");
 Console.WriteLine("PASS：按键捕获 → 模拟翻译 → 英文 TTS → 恢复原声的完整状态链正常。");
