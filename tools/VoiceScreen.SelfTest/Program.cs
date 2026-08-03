@@ -48,6 +48,17 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
     if (mislabeledThai.Language != "th" || mislabeledThai.TranslatedText == mislabeledThai.SourceText)
         throw new InvalidOperationException("泰文字符没有覆盖错误的 Whisper 语言标签。");
 
+    var repeatedNoise = await local.TranslateIncomingTextAsync("GG", "en", CancellationToken.None);
+    Console.WriteLine("PASS：低信息重复 ASR 幻觉 GG 已丢弃");
+    if (!string.IsNullOrEmpty(repeatedNoise.SourceText) || !string.IsNullOrEmpty(repeatedNoise.TranslatedText))
+        throw new InvalidOperationException("GG 重复幻觉仍然进入了翻译或字幕流程。");
+
+    var legitimateRepetition = await local.TranslateIncomingTextAsync("No, it's okay. It's okay. We can hear you.",
+        "en", CancellationToken.None);
+    if (string.IsNullOrWhiteSpace(legitimateRepetition.TranslatedText))
+        throw new InvalidOperationException("正常口语重复被错误过滤。" );
+    Console.WriteLine("PASS：正常口语重复未被误杀");
+
     await using var processor = new LocalIncomingAudioProcessor(local);
     var completed = new TaskCompletionSource<LocalIncomingTranslation>(TaskCreationOptions.RunContinuationsAsynchronously);
     processor.TranslationReady += (_, result) => completed.TrySetResult(result);

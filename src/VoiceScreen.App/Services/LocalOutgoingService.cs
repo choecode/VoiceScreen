@@ -66,19 +66,62 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             return new LocalIncomingTranslation(string.Empty, string.Empty, detectedLanguage);
         if (detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase) || ContainsChinese(text))
             return new LocalIncomingTranslation(text.Trim(), text.Trim(), "zh");
+        if (IsPathologicalRepetition(text))
+        {
+            VoiceScreenLog.Warn($"Incoming ASR repetition discarded: {LogExcerpt(text)}");
+            return EmptyIncoming(detectedLanguage);
+        }
         if (detectedLanguage.StartsWith("th", StringComparison.OrdinalIgnoreCase) || ContainsThai(text))
         {
             var englishBridge = await TranslateTextAsync(text.Trim(), TranslationDirection.ThaiToEnglish,
                 cancellationToken).ConfigureAwait(false);
             var thaiChinese = await TranslateTextAsync(englishBridge, TranslationDirection.EnglishToChinese,
                 cancellationToken).ConfigureAwait(false);
+            if (IsUnsafeTranslation(text, thaiChinese))
+            {
+                VoiceScreenLog.Warn($"Pathological Thai translation discarded: {LogExcerpt(thaiChinese)}");
+                return EmptyIncoming("th");
+            }
             return new LocalIncomingTranslation(text.Trim(), thaiChinese, "th");
         }
         if (!detectedLanguage.StartsWith("en", StringComparison.OrdinalIgnoreCase))
             return new LocalIncomingTranslation(text.Trim(), text.Trim(), detectedLanguage);
         var chinese = await TranslateTextAsync(text.Trim(), TranslationDirection.EnglishToChinese, cancellationToken)
             .ConfigureAwait(false);
+        if (IsUnsafeTranslation(text, chinese))
+        {
+            VoiceScreenLog.Warn($"Pathological English translation discarded: {LogExcerpt(chinese)}");
+            return EmptyIncoming("en");
+        }
         return new LocalIncomingTranslation(text.Trim(), chinese, "en");
+    }
+
+    private static LocalIncomingTranslation EmptyIncoming(string language)
+        => new(string.Empty, string.Empty, language);
+
+    private static bool IsUnsafeTranslation(string source, string translated)
+        => translated.Length > Math.Max(120, source.Length * 12)
+           || IsPathologicalRepetition(translated);
+
+    private static bool IsPathologicalRepetition(string text)
+    {
+        var symbols = text.Where(char.IsLetterOrDigit)
+            .Select(char.ToUpperInvariant)
+            .ToArray();
+        if (symbols.Length >= 2)
+        {
+            var dominantSymbols = symbols.GroupBy(character => character).Max(group => group.Count());
+            if ((double)dominantSymbols / symbols.Length >= 0.85)
+                return true;
+        }
+
+        var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(word => new string(word.Where(char.IsLetterOrDigit).Select(char.ToUpperInvariant).ToArray()))
+            .Where(word => word.Length > 0)
+            .ToArray();
+        if (words.Length < 6) return false;
+        var dominantWords = words.GroupBy(word => word).Max(group => group.Count());
+        return (double)dominantWords / words.Length >= 0.7;
     }
 
     private static bool ContainsChinese(string text)
