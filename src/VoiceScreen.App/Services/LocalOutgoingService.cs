@@ -1,110 +1,270 @@
 using System.Diagnostics;
 using System.Net.Http;
-using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using VoiceScreen.App.Diagnostics;
 
 namespace VoiceScreen.App.Services;
 
 /// <summary>
-/// 双向本地语音翻译：faster-whisper CPU INT8 识别 + Ollama qwen2.5:1.5b CPU 翻译。
+/// 双向本地语音翻译：faster-whisper CPU INT8 识别 + OPUS-MT CPU INT8 专用翻译模型。
 /// 所有网络请求仅发往 127.0.0.1，不依赖任何云端 API。
 /// </summary>
-public sealed partial class LocalOutgoingService : IAsyncDisposable
+public sealed class LocalOutgoingService : IAsyncDisposable
 {
     private const int AsrPort = 18765;
     private static readonly Uri AsrBaseUri = new($"http://127.0.0.1:{AsrPort}/");
-    private static readonly Uri OllamaBaseUri = new("http://127.0.0.1:11434/");
-    private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(30) };
-    private readonly HttpClient _ollama = new() { BaseAddress = OllamaBaseUri, Timeout = TimeSpan.FromSeconds(30) };
-    private readonly SemaphoreSlim _modelGate = new(1, 1);
+    private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(120) };
+    private readonly SemaphoreSlim _speechGate = new(1, 1);
+    private readonly SemaphoreSlim _translationGate = new(1, 1);
     private Process? _asrProcess;
-    private Process? _ollamaProcess;
     private bool _ownsAsr;
-    private bool _ownsOllama;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        await EnsureOllamaAsync(cancellationToken).ConfigureAwait(false);
         await EnsureAsrAsync(cancellationToken).ConfigureAwait(false);
-        VoiceScreenLog.Info("Local bidirectional service ready: faster-whisper small CPU INT8 + qwen2.5:1.5b CPU");
+        VoiceScreenLog.Info("Local models ready: faster-whisper base preview + small final + OPUS-MT zh-en/en-zh/th-en CPU INT8");
     }
 
     public async Task<LocalOutgoingTranslation> TranslateSpeechAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
     {
-        await _modelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var chinese = await TranscribeAsync(pcm16Mono16Khz, "zh", cancellationToken).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(chinese)) throw new InvalidOperationException("本地中文识别没有听清，请再说一次。");
-            var english = await TranslateTextAsync(chinese, TranslationDirection.ChineseToEnglish, cancellationToken)
-                .ConfigureAwait(false);
-            return new LocalOutgoingTranslation(chinese, english);
-        }
-        finally
-        {
-            _modelGate.Release();
-        }
+        var transcription = await TranscribeWithGateAsync(pcm16Mono16Khz, "zh", cancellationToken)
+            .ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(transcription.Text))
+            throw new InvalidOperationException("本地中文识别没有听清，请再说一次。");
+        var english = await TranslateTextWithGateAsync(transcription.Text, TranslationDirection.ChineseToEnglish,
+            cancellationToken).ConfigureAwait(false);
+        return new LocalOutgoingTranslation(transcription.Text, english);
     }
 
     public async Task<LocalIncomingTranslation> TranslateIncomingSpeechAsync(byte[] pcm16Mono16Khz,
         CancellationToken cancellationToken)
     {
-        await _modelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var transcription = await TranscribeIncomingSpeechAsync(pcm16Mono16Khz, cancellationToken)
+            .ConfigureAwait(false);
+        return await TranslateIncomingTextAsync(transcription.Text, transcription.Language, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<LocalTranscription> TranscribeIncomingSpeechAsync(byte[] pcm16Mono16Khz,
+        CancellationToken cancellationToken, bool preview = false)
+    {
+        var transcription = await TranscribeWithGateAsync(pcm16Mono16Khz, "auto", cancellationToken, preview)
+            .ConfigureAwait(false);
+        VoiceScreenLog.Info($"Incoming ASR language={transcription.Language} text={LogExcerpt(transcription.Text)}");
+        return transcription;
+    }
+
+    public async Task<LocalIncomingTranslation> TranslateIncomingTextAsync(string text, string detectedLanguage,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return new LocalIncomingTranslation(string.Empty, string.Empty, detectedLanguage);
+        if (IsLikelyIncomingHallucination(text, detectedLanguage))
+        {
+            VoiceScreenLog.Warn($"Incoming ASR repetition discarded: {LogExcerpt(text)}");
+            return EmptyIncoming(detectedLanguage);
+        }
+        if (detectedLanguage.StartsWith("zh", StringComparison.OrdinalIgnoreCase) || ContainsChinese(text))
+            return new LocalIncomingTranslation(text.Trim(), text.Trim(), "zh");
+        if (detectedLanguage.StartsWith("th", StringComparison.OrdinalIgnoreCase) || ContainsThai(text))
+        {
+            var englishBridge = await TranslateTextWithGateAsync(text.Trim(), TranslationDirection.ThaiToEnglish,
+                cancellationToken).ConfigureAwait(false);
+            var thaiChinese = await TranslateTextWithGateAsync(englishBridge, TranslationDirection.EnglishToChinese,
+                cancellationToken).ConfigureAwait(false);
+            if (IsUnsafeTranslation(text, thaiChinese))
+            {
+                VoiceScreenLog.Warn($"Pathological Thai translation discarded: {LogExcerpt(thaiChinese)}");
+                return EmptyIncoming("th");
+            }
+            return new LocalIncomingTranslation(text.Trim(), thaiChinese, "th");
+        }
+        if (!detectedLanguage.StartsWith("en", StringComparison.OrdinalIgnoreCase))
+            return new LocalIncomingTranslation(text.Trim(), text.Trim(), detectedLanguage);
+        var chinese = await TranslateTextWithGateAsync(text.Trim(), TranslationDirection.EnglishToChinese, cancellationToken)
+            .ConfigureAwait(false);
+        if (IsUnsafeTranslation(text, chinese))
+        {
+            VoiceScreenLog.Warn($"Pathological English translation discarded: {LogExcerpt(chinese)}");
+            return EmptyIncoming("en");
+        }
+        return new LocalIncomingTranslation(text.Trim(), chinese, "en");
+    }
+
+    private static LocalIncomingTranslation EmptyIncoming(string language)
+        => new(string.Empty, string.Empty, language);
+
+    internal static bool IsLikelyIncomingHallucination(string text, string detectedLanguage)
+        => IsPathologicalRepetition(text);
+
+    private static bool IsUnsafeTranslation(string source, string translated)
+        => translated.Length > Math.Max(120, source.Length * 12)
+           || IsPathologicalRepetition(translated);
+
+    private static bool IsPathologicalRepetition(string text)
+    {
+        var symbols = text.Where(char.IsLetterOrDigit)
+            .Select(char.ToUpperInvariant)
+            .ToArray();
+        if (symbols.Length >= 2)
+        {
+            var dominantSymbols = symbols.GroupBy(character => character).Max(group => group.Count());
+            if ((double)dominantSymbols / symbols.Length >= 0.85)
+                return true;
+        }
+
+        // 中文没有空格，不能依赖下方的单词计数。检测“我去哪了我去哪了……”这类
+        // 短语周期性扩写，同时要求至少约四次重复，避免误杀正常的口语强调。
+        if (symbols.Length >= 16 && HasPeriodicSymbolPattern(symbols))
+            return true;
+
+        var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(word => new string(word.Where(char.IsLetterOrDigit).Select(char.ToUpperInvariant).ToArray()))
+            .Where(word => word.Length > 0)
+            .ToArray();
+        if (words.Length < 6) return false;
+        var dominantWords = words.GroupBy(word => word).Max(group => group.Count());
+        return (double)dominantWords / words.Length >= 0.7;
+    }
+
+    private static bool HasPeriodicSymbolPattern(char[] symbols)
+    {
+        var maxPeriod = Math.Min(16, symbols.Length / 3);
+        for (var period = 2; period <= maxPeriod; period++)
+        {
+            var matches = 0;
+            for (var index = period; index < symbols.Length; index++)
+            {
+                if (symbols[index] == symbols[index % period]) matches++;
+            }
+
+            if ((double)matches / (symbols.Length - period) >= 0.88)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool ContainsChinese(string text)
+        => text.Any(character => character is >= '\u3400' and <= '\u9fff');
+
+    private static bool ContainsThai(string text)
+        => text.Any(character => character is >= '\u0e00' and <= '\u0e7f');
+
+    private static string LogExcerpt(string text)
+    {
+        var normalized = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return normalized.Length <= 120 ? normalized : normalized[..120] + "…";
+    }
+
+    public async Task<string> TranslateChineseTextAsync(string chineseText, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(chineseText)) throw new ArgumentException("请输入要测试的中文。", nameof(chineseText));
+        return await TranslateTextWithGateAsync(chineseText.Trim(), TranslationDirection.ChineseToEnglish,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<LocalTranscription> TranscribeWithGateAsync(byte[] pcm16Mono16Khz, string language,
+        CancellationToken cancellationToken, bool preview = false)
+    {
+        await _speechGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var english = await TranscribeAsync(pcm16Mono16Khz, "en", cancellationToken).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(english)) return new LocalIncomingTranslation(string.Empty, string.Empty);
-            var chinese = await TranslateTextAsync(english, TranslationDirection.EnglishToChinese, cancellationToken)
-                .ConfigureAwait(false);
-            return new LocalIncomingTranslation(english, chinese);
+            return await TranscribeAsync(pcm16Mono16Khz, language, cancellationToken, preview).ConfigureAwait(false);
         }
         finally
         {
-            _modelGate.Release();
+            _speechGate.Release();
         }
     }
 
-    private async Task<string> TranscribeAsync(byte[] pcm16Mono16Khz, string language,
+    private async Task<string> TranslateTextWithGateAsync(string source, TranslationDirection direction,
         CancellationToken cancellationToken)
     {
-        using var audioContent = new ByteArrayContent(pcm16Mono16Khz);
-        audioContent.Headers.ContentType = new("application/octet-stream");
-        using var response = await _asr.PostAsync($"transcribe?language={language}", audioContent, cancellationToken)
-            .ConfigureAwait(false);
+        await _translationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await TranslateTextAsync(source, direction, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _translationGate.Release();
+        }
+    }
+
+    private async Task<LocalTranscription> TranscribeAsync(byte[] pcm16Mono16Khz, string language,
+        CancellationToken cancellationToken, bool preview = false)
+    {
+        var mode = preview ? "preview" : "final";
+        using var response = await PostAudioWithRetryAsync($"transcribe?language={language}&mode={mode}", pcm16Mono16Khz,
+            cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException($"本地语音识别失败：{ReadError(body)}");
-        return JsonSerializer.Deserialize<TranscriptionResponse>(body, JsonOptions)?.Text?.Trim() ?? string.Empty;
+        var result = JsonSerializer.Deserialize<TranscriptionResponse>(body, JsonOptions);
+        return new LocalTranscription(result?.Text?.Trim() ?? string.Empty, result?.Language?.Trim() ?? string.Empty);
     }
 
     private async Task<string> TranslateTextAsync(string source, TranslationDirection direction,
         CancellationToken cancellationToken)
     {
-        var systemPrompt = direction == TranslationDirection.ChineseToEnglish
-            ? "You are a game voice translator. Translate Chinese faithfully into concise natural spoken English. Preserve tactical details, numbers, floor numbers, directions, and locations exactly. Output only the English translation, with no explanation, labels, quotes, or alternatives."
-            : "你是游戏语音翻译。把英文忠实翻译成简洁自然的简体中文，准确保留战术细节、数字、楼层、方向和位置。只输出中文译文，不要解释、标签、引号或备选译法。";
         var request = new
         {
-            model = "qwen2.5:1.5b",
-            stream = false,
-            keep_alive = "30m",
-            messages = new object[]
+            text = source,
+            direction = direction switch
             {
-                new { role = "system", content = systemPrompt },
-                new { role = "user", content = source }
-            },
-            options = new { temperature = 0, num_gpu = 0, num_predict = 128 }
+                TranslationDirection.ChineseToEnglish => "zh-en",
+                TranslationDirection.ThaiToEnglish => "th-en",
+                _ => "en-zh"
+            }
         };
-        using var translationResponse = await _ollama.PostAsJsonAsync("api/chat", request, JsonOptions, cancellationToken).ConfigureAwait(false);
+        var requestJson = JsonSerializer.Serialize(request, JsonOptions);
+        using var translationResponse = await PostJsonWithRetryAsync("translate", requestJson, cancellationToken)
+            .ConfigureAwait(false);
         var translationBody = await translationResponse.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!translationResponse.IsSuccessStatusCode)
-            throw new InvalidOperationException($"本地中译英失败：{ReadError(translationBody)}");
-        var ollama = JsonSerializer.Deserialize<OllamaResponse>(translationBody, JsonOptions);
-        var translated = CleanTranslation(ollama?.Message?.Content);
+            throw new InvalidOperationException($"本地 OPUS-MT 翻译失败：{ReadError(translationBody)}");
+        var translated = JsonSerializer.Deserialize<TranslationResponse>(translationBody, JsonOptions)?.Text?.Trim();
         if (string.IsNullOrWhiteSpace(translated)) throw new InvalidOperationException("本地翻译没有返回结果。");
         return translated;
+    }
+
+    private async Task<HttpResponseMessage> PostAudioWithRetryAsync(string path, byte[] audio,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var content = new ByteArrayContent(audio);
+                content.Headers.ContentType = new("application/octet-stream");
+                return await _asr.PostAsync(path, content, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException) when (attempt == 0 && !cancellationToken.IsCancellationRequested)
+            {
+                VoiceScreenLog.Warn("Local model audio request disconnected; retrying once");
+                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<HttpResponseMessage> PostJsonWithRetryAsync(string path, string json,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                return await _asr.PostAsync(path, content, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException) when (attempt == 0 && !cancellationToken.IsCancellationRequested)
+            {
+                VoiceScreenLog.Warn("Local model translation request disconnected; retrying once");
+                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private async Task EnsureAsrAsync(CancellationToken cancellationToken)
@@ -114,38 +274,11 @@ public sealed partial class LocalOutgoingService : IAsyncDisposable
         if (!File.Exists(script)) throw new FileNotFoundException("缺少本地语音识别服务脚本。", script);
         _asrProcess = StartHiddenProcess("python", $"\"{script}\" --port {AsrPort}");
         _ownsAsr = true;
-        await WaitUntilHealthyAsync(_asr, "health", _asrProcess, TimeSpan.FromSeconds(30), cancellationToken,
-            "本地语音识别服务启动失败。请确认 Python 3.11 和 faster-whisper 已安装。").ConfigureAwait(false);
-    }
-
-    private async Task EnsureOllamaAsync(CancellationToken cancellationToken)
-    {
-        if (!await IsHealthyAsync(_ollama, "api/tags", cancellationToken).ConfigureAwait(false))
-        {
-            _ollamaProcess = StartHiddenProcess("ollama", "serve");
-            _ownsOllama = true;
-            await WaitUntilHealthyAsync(_ollama, "api/tags", _ollamaProcess, TimeSpan.FromSeconds(15), cancellationToken,
-                "Ollama 本地服务启动失败。").ConfigureAwait(false);
-        }
-
-        using var tagsResponse = await _ollama.GetAsync("api/tags", cancellationToken).ConfigureAwait(false);
-        var tags = await tagsResponse.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-        if (!tags.Contains("qwen2.5:1.5b", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("本机缺少 Ollama 模型 qwen2.5:1.5b，请先执行：ollama pull qwen2.5:1.5b");
-
-        // 启动阶段预热模型，避免用户第一次松开右 Alt 时才等待模型载入内存。
-        var warmup = new
-        {
-            model = "qwen2.5:1.5b",
-            stream = false,
-            keep_alive = "30m",
-            prompt = "Translate to English, output only the translation: 你好",
-            options = new { temperature = 0, num_gpu = 0, num_predict = 16 }
-        };
-        using var warmupResponse = await _ollama.PostAsJsonAsync("api/generate", warmup, JsonOptions, cancellationToken)
+        // 首次启动会同时把两套 Whisper 和三套 OPUS 模型装入内存；游戏运行时磁盘/CPU
+        // 较忙，冷启动可能超过 30 秒。放宽这里只影响启动等待，不影响单次翻译超时。
+        await WaitUntilHealthyAsync(_asr, "health", _asrProcess, TimeSpan.FromMinutes(2), cancellationToken,
+            "本地模型服务启动失败。请先运行 setup_local_models.ps1，并确认 Python 依赖已安装。")
             .ConfigureAwait(false);
-        if (!warmupResponse.IsSuccessStatusCode)
-            throw new InvalidOperationException("Ollama qwen2.5:1.5b 本地模型预热失败。");
     }
 
     private static Process StartHiddenProcess(string fileName, string arguments)
@@ -195,23 +328,12 @@ public sealed partial class LocalOutgoingService : IAsyncDisposable
         catch { return json; }
     }
 
-    private static string CleanTranslation(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
-        var cleaned = ThinkBlockRegex().Replace(text, string.Empty).Trim();
-        cleaned = cleaned.Trim('"', '\'', '“', '”');
-        foreach (var prefix in new[] { "Translation:", "English:", "英文：", "翻译：" })
-            if (cleaned.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) cleaned = cleaned[prefix.Length..].Trim();
-        return cleaned;
-    }
-
     public ValueTask DisposeAsync()
     {
         _asr.Dispose();
-        _ollama.Dispose();
-        _modelGate.Dispose();
+        _speechGate.Dispose();
+        _translationGate.Dispose();
         StopOwnedProcess(_asrProcess, _ownsAsr);
-        StopOwnedProcess(_ollamaProcess, _ownsOllama);
         return ValueTask.CompletedTask;
     }
 
@@ -224,19 +346,16 @@ public sealed partial class LocalOutgoingService : IAsyncDisposable
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    [GeneratedRegex("<think>[\\s\\S]*?</think>", RegexOptions.IgnoreCase)]
-    private static partial Regex ThinkBlockRegex();
-
     private sealed record TranscriptionResponse(string Text, string Language);
-    private sealed record OllamaResponse(OllamaMessage? Message);
-    private sealed record OllamaMessage(string? Content);
-
+    private sealed record TranslationResponse(string Text);
     private enum TranslationDirection
     {
         ChineseToEnglish,
-        EnglishToChinese
+        EnglishToChinese,
+        ThaiToEnglish
     }
 }
 
 public sealed record LocalOutgoingTranslation(string SourceText, string TranslatedText);
-public sealed record LocalIncomingTranslation(string SourceText, string TranslatedText);
+public sealed record LocalIncomingTranslation(string SourceText, string TranslatedText, string Language);
+public sealed record LocalTranscription(string Text, string Language);

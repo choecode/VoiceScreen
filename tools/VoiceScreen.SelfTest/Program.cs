@@ -16,6 +16,99 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
     if (string.IsNullOrWhiteSpace(direct.SourceText) || string.IsNullOrWhiteSpace(direct.TranslatedText))
         throw new InvalidOperationException("本地英译中没有返回完整结果。");
 
+    var previewEnglish = await local.TranslateChineseTextAsync("敌人在二楼，我们从左边走。", CancellationToken.None);
+    Console.WriteLine($"PASS：测试按钮本地中译英，敌人在二楼，我们从左边走。 → {previewEnglish}");
+    if (string.IsNullOrWhiteSpace(previewEnglish))
+        throw new InvalidOperationException("测试按钮的本地中译英没有返回结果。");
+
+    var apology = await local.TranslateChineseTextAsync("我的英语很差啊，请不要介意啊。", CancellationToken.None);
+    Console.WriteLine($"PASS：截图问题句回归，我的英语很差啊，请不要介意啊。 → {apology}");
+    if (!apology.Contains("My English", StringComparison.OrdinalIgnoreCase)
+        || apology.Contains("not offended", StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException($"专业翻译模型错误地替说话者回答：{apology}");
+
+    var tactical = await local.TranslateChineseTextAsync("敌人可能在三楼右边，先别冲。", CancellationToken.None);
+    Console.WriteLine($"PASS：游戏术语回归，敌人可能在三楼右边，先别冲。 → {tactical}");
+    if (!tactical.Contains("attack", StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException($"游戏术语“别冲”没有被保留：{tactical}");
+
+    var chineseBypass = await local.TranslateIncomingTextAsync("我是中国人，不需要翻译。", "zh", CancellationToken.None);
+    Console.WriteLine($"PASS：Discord 中文绕过翻译 → {chineseBypass.TranslatedText}");
+    if (chineseBypass.Language != "zh" || chineseBypass.SourceText != chineseBypass.TranslatedText)
+        throw new InvalidOperationException("检测到中文后仍进入了翻译流程。");
+
+    var thai = await local.TranslateIncomingTextAsync("ไปทางซ้ายเร็ว", "th", CancellationToken.None);
+    Console.WriteLine($"PASS：Discord 泰语桥接翻译，{thai.SourceText} → {thai.TranslatedText}");
+    if (thai.Language != "th" || string.IsNullOrWhiteSpace(thai.TranslatedText)
+        || thai.TranslatedText == thai.SourceText)
+        throw new InvalidOperationException("泰语没有经过 th-en → en-zh 本地桥接翻译。");
+
+    var mislabeledThai = await local.TranslateIncomingTextAsync("ไปทางซ้ายเร็ว", "ja", CancellationToken.None);
+    Console.WriteLine($"PASS：泰文字符兜底路由，错误语言标签 ja → {mislabeledThai.TranslatedText}");
+    if (mislabeledThai.Language != "th" || mislabeledThai.TranslatedText == mislabeledThai.SourceText)
+        throw new InvalidOperationException("泰文字符没有覆盖错误的 Whisper 语言标签。");
+
+    var repeatedNoise = await local.TranslateIncomingTextAsync("GG", "en", CancellationToken.None);
+    Console.WriteLine("PASS：低信息重复 ASR 幻觉 GG 已丢弃");
+    if (!string.IsNullOrEmpty(repeatedNoise.SourceText) || !string.IsNullOrEmpty(repeatedNoise.TranslatedText))
+        throw new InvalidOperationException("GG 重复幻觉仍然进入了翻译或字幕流程。");
+
+    var repeatedChineseNoise = await local.TranslateIncomingTextAsync(
+        string.Concat(Enumerable.Repeat("我去哪了", 20)), "zh", CancellationToken.None);
+    Console.WriteLine("PASS：中文短语循环 ASR 幻觉已丢弃");
+    if (!string.IsNullOrEmpty(repeatedChineseNoise.SourceText)
+        || !string.IsNullOrEmpty(repeatedChineseNoise.TranslatedText))
+        throw new InvalidOperationException("中文短语循环幻觉仍然进入了字幕流程。");
+
+    var legitimateRepetition = await local.TranslateIncomingTextAsync("No, it's okay. It's okay. We can hear you.",
+        "en", CancellationToken.None);
+    if (string.IsNullOrWhiteSpace(legitimateRepetition.TranslatedText))
+        throw new InvalidOperationException("正常口语重复被错误过滤。" );
+    Console.WriteLine("PASS：正常口语重复未被误杀");
+
+    await using (var realtimeProcessor = new LocalIncomingAudioProcessor(local, lowLatency: true))
+    {
+        var firstPreview = new TaskCompletionSource<LocalIncomingTranslation>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var translatedPreview = new TaskCompletionSource<LocalIncomingTranslation>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var realtimeFinal = new TaskCompletionSource<LocalIncomingTranslation>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        realtimeProcessor.PreviewChanged += (_, result) =>
+        {
+            if (result is null || string.IsNullOrWhiteSpace(result.SourceText)) return;
+            firstPreview.TrySetResult(result);
+            if (!string.IsNullOrWhiteSpace(result.TranslatedText)) translatedPreview.TrySetResult(result);
+        };
+        realtimeProcessor.TranslationReady += (_, result) => realtimeFinal.TrySetResult(result);
+        realtimeProcessor.Error += (_, error) => realtimeFinal.TrySetException(new InvalidOperationException(error));
+
+        var feedTask = Task.Run(async () =>
+        {
+            for (var offset = 0; offset < englishPcm.Length; offset += 1280)
+            {
+                var frame = new byte[1280];
+                Buffer.BlockCopy(englishPcm, offset, frame, 0, Math.Min(1280, englishPcm.Length - offset));
+                await realtimeProcessor.AddFrameAsync(frame, true, CancellationToken.None);
+                await Task.Delay(40);
+            }
+            for (var i = 0; i < 17; i++)
+            {
+                await realtimeProcessor.AddFrameAsync(new byte[1280], true, CancellationToken.None);
+                await Task.Delay(40);
+            }
+        });
+
+        var preview = await firstPreview.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        var previewChinese = await translatedPreview.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        await feedTask;
+        var final = await realtimeFinal.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        if (string.IsNullOrWhiteSpace(preview.SourceText) || string.IsNullOrWhiteSpace(previewChinese.TranslatedText)
+            || string.IsNullOrWhiteSpace(final.TranslatedText))
+            throw new InvalidOperationException("低延迟字幕没有形成临时英文、临时中文和最终定稿。" );
+        Console.WriteLine($"PASS：低延迟增量字幕，临时 EN={preview.SourceText}，临时中={previewChinese.TranslatedText}");
+    }
+
     await using var processor = new LocalIncomingAudioProcessor(local);
     var completed = new TaskCompletionSource<LocalIncomingTranslation>(TaskCreationOptions.RunContinuationsAsynchronously);
     processor.TranslationReady += (_, result) => completed.TrySetResult(result);
@@ -26,16 +119,46 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
         Buffer.BlockCopy(englishPcm, offset, frame, 0, Math.Min(1280, englishPcm.Length - offset));
         await processor.AddFrameAsync(frame, true, CancellationToken.None);
     }
-    for (var i = 0; i < 14; i++)
+    for (var i = 0; i < 51; i++)
         await processor.AddFrameAsync(new byte[1280], true, CancellationToken.None);
 
     var segmented = await completed.Task.WaitAsync(TimeSpan.FromSeconds(30));
     Console.WriteLine($"PASS：本地 VAD 分句英译中，{segmented.SourceText} → {segmented.TranslatedText}");
+
+    const string longEnglish = "Hey, I think there are two enemies on the right side of the third floor, so please wait for me near the stairs and don't attack until I get there.";
+    var longEnglishPcm = await OfflineSpeech.SynthesizeEnglishAsync(longEnglish, CancellationToken.None);
+    await using var longProcessor = new LocalIncomingAudioProcessor(local);
+    var longCompleted = new TaskCompletionSource<LocalIncomingTranslation>(TaskCreationOptions.RunContinuationsAsynchronously);
+    longProcessor.TranslationReady += (_, result) => longCompleted.TrySetResult(result);
+    longProcessor.Error += (_, error) => longCompleted.TrySetException(new InvalidOperationException(error));
+    for (var offset = 0; offset < longEnglishPcm.Length; offset += 1280)
+    {
+        var frame = new byte[1280];
+        Buffer.BlockCopy(longEnglishPcm, offset, frame, 0, Math.Min(1280, longEnglishPcm.Length - offset));
+        await longProcessor.AddFrameAsync(frame, true, CancellationToken.None);
+    }
+    for (var i = 0; i < 51; i++)
+        await longProcessor.AddFrameAsync(new byte[1280], true, CancellationToken.None);
+
+    var longSegmented = await longCompleted.Task.WaitAsync(TimeSpan.FromSeconds(45));
+    Console.WriteLine($"PASS：Discord 长句完整性，{longSegmented.SourceText} → {longSegmented.TranslatedText}");
+    if (!longSegmented.SourceText.Contains("attack", StringComparison.OrdinalIgnoreCase)
+        || !longSegmented.SourceText.Contains("get there", StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException($"长句尾部被截断：{longSegmented.SourceText}");
     return;
 }
 
 Console.WriteLine("VoiceScreen 本机音频自检");
 var devices = new AudioDeviceService();
+var voices = OfflineSpeech.GetInstalledEnglishVoices();
+foreach (var voice in voices) Console.WriteLine($"[英文音色] {voice.Name}");
+if (voices.Count == 0) throw new InvalidOperationException("没有找到 Windows 英文语音。");
+foreach (var voice in voices)
+{
+    var voicePcm = await OfflineSpeech.SynthesizeEnglishAsync("Voice selection test.", CancellationToken.None, voice.Id);
+    if (voicePcm.Length == 0) throw new InvalidOperationException($"英文音色无法合成：{voice.Name}");
+}
+Console.WriteLine($"PASS：{voices.Count} 个英文男/女音色均可生成语音。");
 var captures = devices.GetCaptureDevices();
 var renders = devices.GetRenderDevices();
 foreach (var device in captures) Console.WriteLine($"[录音] {device.Name}");
@@ -45,13 +168,17 @@ var microphone = AudioDeviceService.FindBest(captures, string.Empty, "HyperX", "
     ?? throw new InvalidOperationException("没有找到实体麦克风。");
 var cable = AudioDeviceService.FindBest(renders, string.Empty, "CABLE Input")
     ?? throw new InvalidOperationException("没有找到 CABLE Input。");
+var monitor = AudioDeviceService.FindBest(renders.Where(device => !AudioDeviceService.IsVirtualCableInput(device)),
+    string.Empty, "HyperX", "耳机", "Headphones")
+    ?? throw new InvalidOperationException("没有找到实体试听耳机。");
 
 Console.WriteLine($"选择麦克风：{microphone.Name}");
 Console.WriteLine($"选择虚拟播放端：{cable.Name}");
+Console.WriteLine($"选择英文试听耳机：{monitor.Name}");
 
 using (var router = new MicrophoneCableRouter())
 {
-    router.Start(microphone.Id, cable.Id);
+    router.Start(microphone.Id, cable.Id, monitor.Id);
     Console.WriteLine($"路由已启动，麦克风格式：{router.MicrophoneFormat}");
     await Task.Delay(600);
 
@@ -68,13 +195,15 @@ using (var router = new MicrophoneCableRouter())
     await router.PlayTtsAsync(pcm, CancellationToken.None);
     router.RestorePassThrough();
 }
-Console.WriteLine("PASS：HyperX → 程序 → VB-CABLE 路由、录音切换、离线 TTS 均正常。");
+Console.WriteLine("PASS：HyperX → 程序 → VB-CABLE 路由、耳机同步试听、录音切换、离线 TTS 均正常。");
 
 var settings = new AppSettings
 {
     DemoMode = true,
     MicrophoneDeviceId = microphone.Id,
-    CableRenderDeviceId = cable.Id
+    CableRenderDeviceId = cable.Id,
+    MonitorRenderDeviceId = monitor.Id,
+    MonitorTranslatedSpeech = true
 };
 var lines = new List<string>();
 await using (var engine = new TranslationEngine(settings))
@@ -91,6 +220,8 @@ await using (var engine = new TranslationEngine(settings))
     await engine.EndLocalCaptureAsync();
     if (!engine.PassThroughEnabled) throw new InvalidOperationException("翻译结束后原声麦克风没有恢复。");
 }
+if (lines.Any(line => line.Contains("正在听你说中文", StringComparison.Ordinal)))
+    throw new InvalidOperationException("录音状态不应写入永久字幕历史。");
 if (!lines.Any(line => line.StartsWith("已发送：", StringComparison.Ordinal)))
     throw new InvalidOperationException("端到端模拟没有产生已发送英文字幕。");
 Console.WriteLine("PASS：按键捕获 → 模拟翻译 → 英文 TTS → 恢复原声的完整状态链正常。");

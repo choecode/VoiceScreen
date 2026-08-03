@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using VoiceScreen.App.Audio;
 using VoiceScreen.App.Diagnostics;
 using VoiceScreen.App.Input;
 using VoiceScreen.App.Models;
@@ -17,6 +18,7 @@ public partial class MainWindow : Window
     private AppSettings _settings;
     private TranslationEngine? _engine;
     private OverlayWindow? _overlay;
+    private IntPtr _windowHandle;
 
     public MainWindow()
     {
@@ -26,6 +28,8 @@ public partial class MainWindow : Window
         Closing += OnClosing;
         SourceInitialized += OnSourceInitialized;
         _hook.Pressed += (_, _) => _engine?.BeginLocalCapture();
+        _hook.PageUpPressed += (_, _) => _overlay?.ScrollPage(down: false);
+        _hook.PageDownPressed += (_, _) => _overlay?.ScrollPage(down: true);
         _hook.Released += async (_, _) =>
         {
             if (_engine is not null) await _engine.EndLocalCaptureAsync();
@@ -44,6 +48,7 @@ public partial class MainWindow : Window
         try
         {
             var hwnd = new WindowInteropHelper(this).Handle;
+            _windowHandle = hwnd;
             if (hwnd != IntPtr.Zero)
             {
                 RevokeDragDrop(hwnd);
@@ -62,6 +67,9 @@ public partial class MainWindow : Window
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         DemoModeCheckBox.IsChecked = _settings.DemoMode;
+        LowLatencyIncomingCheckBox.IsChecked = _settings.LowLatencyIncoming;
+        MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
+        SubtitleFontSizeSlider.Value = Math.Clamp(_settings.SubtitleFontSize, 14, 42);
         UseProcessLoopbackCheckBox.IsChecked = true;
         RefreshDevices();
     }
@@ -80,6 +88,7 @@ public partial class MainWindow : Window
     {
         var captures = _devices.GetCaptureDevices();
         var renders = _devices.GetRenderDevices();
+        var voices = OfflineSpeech.GetInstalledEnglishVoices();
         var physicalMicrophones = captures
             .Where(device => !device.Name.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase))
             .ToArray();
@@ -88,15 +97,24 @@ public partial class MainWindow : Window
             new AudioDeviceOption(string.Empty, "自动：仅捕获 Discord 进程（无需选择）")
         };
         MicrophoneCombo.ItemsSource = physicalMicrophones;
+        var physicalOutputs = renders.Where(device => !AudioDeviceService.IsVirtualCableInput(device)).ToArray();
+        MonitorOutputCombo.ItemsSource = physicalOutputs;
+        EnglishVoiceCombo.ItemsSource = voices;
         DiscordOutputCombo.ItemsSource = automaticDiscordCapture;
         var cableInputs = renders.Where(AudioDeviceService.IsVirtualCableInput).ToArray();
         CableRenderCombo.ItemsSource = cableInputs;
         MicrophoneCombo.SelectedItem = AudioDeviceService.FindBest(physicalMicrophones, _settings.MicrophoneDeviceId, "HyperX", "麦克风", "Microphone");
+        MonitorOutputCombo.SelectedItem = AudioDeviceService.FindBest(physicalOutputs, _settings.MonitorRenderDeviceId,
+            "HyperX", "耳机", "Headphones");
+        EnglishVoiceCombo.SelectedItem = voices.FirstOrDefault(voice => voice.Id == _settings.EnglishVoiceName)
+            ?? voices.FirstOrDefault();
         DiscordOutputCombo.SelectedIndex = 0;
         CableRenderCombo.SelectedItem = AudioDeviceService.FindVirtualCableInput(renders);
-        StatusText.Text = cableInputs.Length > 0
-            ? "设备已自动配置：HyperX 麦克风 → CABLE Input；接收只监听 Discord。"
-            : "错误：没有检测到 CABLE Input (VB-Audio Virtual Cable)，请先安装或启用 VB-CABLE。";
+        StatusText.Text = cableInputs.Length == 0
+            ? "错误：没有检测到 CABLE Input (VB-Audio Virtual Cable)，请先安装或启用 VB-CABLE。"
+            : voices.Count == 0
+                ? "错误：没有检测到 Windows 英文语音，请先安装英文男声或女声。"
+                : "设备已自动配置：HyperX 麦克风 → CABLE Input；接收只监听 Discord。";
     }
 
     private AppSettings ReadSettings()
@@ -104,13 +122,20 @@ public partial class MainWindow : Window
         return new AppSettings
         {
             DemoMode = DemoModeCheckBox.IsChecked == true,
+            LowLatencyIncoming = LowLatencyIncomingCheckBox.IsChecked == true,
             UseProcessLoopback = true,
             MicrophoneDeviceId = (MicrophoneCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             DiscordOutputDeviceId = (DiscordOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             CableRenderDeviceId = (CableRenderCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
+            MonitorRenderDeviceId = (MonitorOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
+            MonitorTranslatedSpeech = MonitorTranslatedSpeechCheckBox.IsChecked == true,
+            EnglishVoiceName = (EnglishVoiceCombo.SelectedItem as SpeechVoiceOption)?.Id ?? string.Empty,
             MaxSubtitleLines = _settings.MaxSubtitleLines,
             OverlayLeft = _settings.OverlayLeft,
-            OverlayTop = _settings.OverlayTop
+            OverlayTop = _settings.OverlayTop,
+            OverlayWidth = _settings.OverlayWidth,
+            OverlayHeight = _settings.OverlayHeight,
+            SubtitleFontSize = SubtitleFontSizeSlider.Value
         };
     }
 
@@ -120,17 +145,20 @@ public partial class MainWindow : Window
         {
             _settings = ReadSettings();
             _settingsStore.Save(_settings);
-            _overlay = new OverlayWindow(_settings.MaxSubtitleLines, _settings.OverlayLeft, _settings.OverlayTop);
+            _overlay = new OverlayWindow(_settings.MaxSubtitleLines, _settings.OverlayLeft, _settings.OverlayTop,
+                _settings.OverlayWidth, _settings.OverlayHeight, _settings.SubtitleFontSize);
             _overlay.Show();
             _engine = new TranslationEngine(_settings);
             _engine.SubtitleProduced += OnSubtitleProduced;
+            _engine.SubtitlePreviewChanged += OnSubtitlePreviewChanged;
             _engine.StatusChanged += OnStatusChanged;
             _engine.Error += OnError;
             await _engine.StartAsync(CancellationToken.None);
-            _hook.Start();
+            _hook.Start(_windowHandle);
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = true;
-            TestTtsButton.IsEnabled = true;
+            TestTranslationButton.IsEnabled = !_settings.DemoMode;
+            AdjustOverlayButton.IsEnabled = true;
             _overlay.SetStatus("运行中 · 原声麦克风直通", ok: true);
         }
         catch (Exception ex)
@@ -146,13 +174,13 @@ public partial class MainWindow : Window
 
     private async void StopButton_Click(object sender, RoutedEventArgs e) => await StopEngineAsync();
 
-    private async void TestTtsButton_Click(object sender, RoutedEventArgs e)
+    private async void TestTranslationButton_Click(object sender, RoutedEventArgs e)
     {
         if (_engine is null) return;
         try
         {
-            TestTtsButton.IsEnabled = false;
-            await _engine.PlayTestPhraseAsync(CancellationToken.None);
+            TestTranslationButton.IsEnabled = false;
+            await _engine.TranslateAndPreviewAsync(TestChineseTextBox.Text, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -160,13 +188,31 @@ public partial class MainWindow : Window
         }
         finally
         {
-            TestTtsButton.IsEnabled = _engine is not null;
+            TestTranslationButton.IsEnabled = _engine is not null
+                && !_settings.DemoMode;
         }
     }
 
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();
 
+    private void SubtitleFontSizeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_settings is null) return;
+        _settings.SubtitleFontSize = e.NewValue;
+        _overlay?.SetFontSize(e.NewValue);
+        if (IsLoaded) _settingsStore.Save(_settings);
+    }
+
+    private void AdjustOverlayButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_overlay is null) return;
+        _overlay.SetInteractive(!_overlay.IsInteractive);
+        AdjustOverlayButton.Content = _overlay.IsInteractive ? "② 完成并锁定" : "① 解锁移动/缩放";
+        if (!_overlay.IsInteractive) SaveOverlayBounds();
+    }
+
     private void OnSubtitleProduced(object? sender, (string Kind, string Text) item) => _overlay?.AddLine(item.Kind, item.Text);
+    private void OnSubtitlePreviewChanged(object? sender, string? text) => _overlay?.SetPreview(text);
     private void OnStatusChanged(object? sender, string text)
     {
         Dispatcher.Invoke(() => StatusText.Text = text);
@@ -182,10 +228,12 @@ public partial class MainWindow : Window
 
     private async Task StopEngineAsync()
     {
+        SaveOverlayBounds();
         _hook.Dispose();
         if (_engine is not null)
         {
             _engine.SubtitleProduced -= OnSubtitleProduced;
+            _engine.SubtitlePreviewChanged -= OnSubtitlePreviewChanged;
             _engine.StatusChanged -= OnStatusChanged;
             _engine.Error -= OnError;
             await _engine.DisposeAsync();
@@ -193,17 +241,29 @@ public partial class MainWindow : Window
         }
         _overlay?.Close();
         _overlay = null;
+        AdjustOverlayButton.Content = "① 解锁移动/缩放";
+        AdjustOverlayButton.IsEnabled = false;
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
-        TestTtsButton.IsEnabled = false;
+        TestTranslationButton.IsEnabled = false;
         StatusText.Text = "已停止";
     }
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
-        _settings.OverlayLeft = _overlay?.Left ?? _settings.OverlayLeft;
-        _settings.OverlayTop = _overlay?.Top ?? _settings.OverlayTop;
-        _settingsStore.Save(_settings);
+        SaveOverlayBounds();
         await StopEngineAsync();
+    }
+
+    private void SaveOverlayBounds()
+    {
+        if (_overlay is not null)
+        {
+            _settings.OverlayLeft = _overlay.Left;
+            _settings.OverlayTop = _overlay.Top;
+            _settings.OverlayWidth = _overlay.Width;
+            _settings.OverlayHeight = _overlay.Height;
+        }
+        _settingsStore.Save(_settings);
     }
 }
