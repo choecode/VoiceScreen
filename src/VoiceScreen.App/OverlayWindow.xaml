@@ -14,10 +14,13 @@
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
             <DockPanel Margin="0,0,0,8" MouseLeftButtonDown="Header_MouseLeftButtonDown">
-                <Ellipse x:Name="StatusDot" Width="9" Height="9" Fill="#E3B341" Margin="0,0,8,0" />
+                <Ellipse DockPanel.Dock="Left" x:Name="StatusDot" Width="9" Height="9" Fill="#E3B341" Margin="0,0,8,0" />
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <TextBlock x:Name="HistoryIndicator" Text="最新 · 0 条" Foreground="#8B949E" FontSize="12" Margin="12,0,0,0" />
+                    <TextBlock x:Name="EditHint" Text="调整模式：拖顶部移动 · 拖右下角缩放" Foreground="#FFD166"
+                               FontSize="12" Margin="12,0,0,0" Visibility="Collapsed" />
+                </StackPanel>
                 <TextBlock x:Name="StatusText" Text="尚未启动" Foreground="#C9D1D9" FontSize="13" />
-                <TextBlock x:Name="EditHint" Text="调整模式：拖动顶部移动，拖右下角缩放" Foreground="#FFD166"
-                           FontSize="12" HorizontalAlignment="Right" Visibility="Collapsed" />
             </DockPanel>
             <ListBox x:Name="SubtitleList" Grid.Row="1" ItemsSource="{Binding Lines}" Background="Transparent" BorderThickness="0"
                      IsHitTestVisible="False" HorizontalContentAlignment="Stretch"
@@ -31,7 +34,9 @@
                 </ListBox.ItemContainerStyle>
                 <ListBox.ItemTemplate>
                     <DataTemplate>
-                        <TextBlock Text="{Binding Text}" Foreground="{Binding Foreground}" FontSize="24" FontWeight="SemiBold"
+                        <TextBlock Text="{Binding Text}" Foreground="{Binding Foreground}"
+                                   FontSize="{Binding RelativeSource={RelativeSource AncestorType=ListBox}, Path=FontSize}"
+                                   FontWeight="SemiBold"
                                    TextWrapping="Wrap" TextTrimming="None" Margin="0,4,0,4">
                             <TextBlock.Effect>
                                 <DropShadowEffect Color="Black" BlurRadius="4" ShadowDepth="1" Opacity="0.95" />

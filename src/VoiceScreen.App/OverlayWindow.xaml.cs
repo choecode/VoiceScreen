@@ -3,10 +3,8 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
-using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
-using System.Windows.Threading;
 using VoiceScreen.App.Models;
 
 namespace VoiceScreen.App;
@@ -19,12 +17,13 @@ public partial class OverlayWindow : Window
     private const int WsExToolwindow = 0x00000080;
     private readonly int _historyCapacity;
     private bool _followLatest = true;
+    private int _historyCursor = -1;
 
     public bool IsInteractive { get; private set; }
 
     public ObservableCollection<SubtitleLine> Lines { get; } = new();
 
-    public OverlayWindow(int maxLines, double left, double top, double width, double height)
+    public OverlayWindow(int maxLines, double left, double top, double width, double height, double fontSize)
     {
         InitializeComponent();
         _historyCapacity = Math.Max(200, maxLines * 20);
@@ -32,6 +31,7 @@ public partial class OverlayWindow : Window
         Top = top;
         Width = Math.Max(MinWidth, width);
         Height = Math.Max(MinHeight, height);
+        SubtitleList.FontSize = Math.Clamp(fontSize, 14, 42);
         DataContext = this;
         SourceInitialized += (_, _) => EnableClickThrough();
     }
@@ -41,8 +41,17 @@ public partial class OverlayWindow : Window
         Dispatcher.Invoke(() =>
         {
             Lines.Add(new SubtitleLine { Kind = kind, Text = text });
-            while (Lines.Count > _historyCapacity) Lines.RemoveAt(0);
-            if (_followLatest) SubtitleList.ScrollIntoView(Lines.Last());
+            while (Lines.Count > _historyCapacity)
+            {
+                Lines.RemoveAt(0);
+                if (_historyCursor > 0) _historyCursor--;
+            }
+            if (_followLatest)
+            {
+                _historyCursor = Lines.Count - 1;
+                SubtitleList.ScrollIntoView(Lines.Last());
+            }
+            UpdateHistoryIndicator();
         });
     }
 
@@ -50,21 +59,39 @@ public partial class OverlayWindow : Window
     {
         Dispatcher.Invoke(() =>
         {
-            var viewer = FindVisualChild<ScrollViewer>(SubtitleList);
-            if (viewer is null) return;
-            if (down)
+            if (Lines.Count == 0)
             {
-                viewer.PageDown();
-                Dispatcher.BeginInvoke(() =>
-                    _followLatest = viewer.VerticalOffset >= viewer.ScrollableHeight - 1,
-                    DispatcherPriority.Background);
+                UpdateHistoryIndicator();
+                return;
             }
-            else
-            {
-                _followLatest = false;
-                viewer.PageUp();
-            }
+            var pageSize = Math.Max(1, (int)Math.Floor(SubtitleList.ActualHeight / (SubtitleList.FontSize * 3)));
+            var current = _followLatest || _historyCursor < 0 ? Lines.Count - 1 : _historyCursor;
+            _historyCursor = down
+                ? Math.Min(Lines.Count - 1, current + pageSize)
+                : Math.Max(0, current - pageSize);
+            _followLatest = _historyCursor >= Lines.Count - 1;
+            SubtitleList.ScrollIntoView(Lines[_historyCursor]);
+            UpdateHistoryIndicator();
         });
+    }
+
+    public void SetFontSize(double fontSize)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            SubtitleList.FontSize = Math.Clamp(fontSize, 14, 42);
+            if (_followLatest && Lines.Count > 0) SubtitleList.ScrollIntoView(Lines.Last());
+        });
+    }
+
+    private void UpdateHistoryIndicator()
+    {
+        if (Lines.Count == 0)
+            HistoryIndicator.Text = "最新 · 0 条";
+        else if (_followLatest)
+            HistoryIndicator.Text = $"最新 · {Lines.Count} 条";
+        else
+            HistoryIndicator.Text = $"历史 {_historyCursor + 1}/{Lines.Count} · PgUp/PgDn";
     }
 
     public void SetInteractive(bool interactive)
@@ -114,21 +141,10 @@ public partial class OverlayWindow : Window
         Height = Math.Max(MinHeight, Height + e.VerticalChange);
     }
 
-    private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
-    {
-        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
-        {
-            var child = VisualTreeHelper.GetChild(parent, index);
-            if (child is T result) return result;
-            var nested = FindVisualChild<T>(child);
-            if (nested is not null) return nested;
-        }
-        return null;
-    }
-
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
 
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
     private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
 }

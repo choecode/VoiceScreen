@@ -66,6 +66,7 @@ public partial class MainWindow : Window
     {
         DemoModeCheckBox.IsChecked = _settings.DemoMode;
         MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
+        SubtitleFontSizeSlider.Value = Math.Clamp(_settings.SubtitleFontSize, 14, 42);
         UseProcessLoopbackCheckBox.IsChecked = true;
         RefreshDevices();
     }
@@ -129,7 +130,8 @@ public partial class MainWindow : Window
             OverlayLeft = _settings.OverlayLeft,
             OverlayTop = _settings.OverlayTop,
             OverlayWidth = _settings.OverlayWidth,
-            OverlayHeight = _settings.OverlayHeight
+            OverlayHeight = _settings.OverlayHeight,
+            SubtitleFontSize = SubtitleFontSizeSlider.Value
         };
     }
 
@@ -140,7 +142,7 @@ public partial class MainWindow : Window
             _settings = ReadSettings();
             _settingsStore.Save(_settings);
             _overlay = new OverlayWindow(_settings.MaxSubtitleLines, _settings.OverlayLeft, _settings.OverlayTop,
-                _settings.OverlayWidth, _settings.OverlayHeight);
+                _settings.OverlayWidth, _settings.OverlayHeight, _settings.SubtitleFontSize);
             _overlay.Show();
             _engine = new TranslationEngine(_settings);
             _engine.SubtitleProduced += OnSubtitleProduced;
@@ -188,11 +190,19 @@ public partial class MainWindow : Window
 
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();
 
+    private void SubtitleFontSizeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_settings is null) return;
+        _settings.SubtitleFontSize = e.NewValue;
+        _overlay?.SetFontSize(e.NewValue);
+        if (IsLoaded) _settingsStore.Save(_settings);
+    }
+
     private void AdjustOverlayButton_Click(object sender, RoutedEventArgs e)
     {
         if (_overlay is null) return;
         _overlay.SetInteractive(!_overlay.IsInteractive);
-        AdjustOverlayButton.Content = _overlay.IsInteractive ? "锁定悬浮窗" : "调整悬浮窗";
+        AdjustOverlayButton.Content = _overlay.IsInteractive ? "② 完成并锁定" : "① 解锁移动/缩放";
         if (!_overlay.IsInteractive) SaveOverlayBounds();
     }
 
@@ -224,7 +234,7 @@ public partial class MainWindow : Window
         }
         _overlay?.Close();
         _overlay = null;
-        AdjustOverlayButton.Content = "调整悬浮窗";
+        AdjustOverlayButton.Content = "① 解锁移动/缩放";
         AdjustOverlayButton.IsEnabled = false;
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;

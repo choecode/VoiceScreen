@@ -14,6 +14,7 @@ public sealed class AppSettings
     public double OverlayTop { get; set; } = 20;
     public double OverlayWidth { get; set; } = 680;
     public double OverlayHeight { get; set; } = 300;
+    public double SubtitleFontSize { get; set; } = 24;
     /// <summary>
     /// 保留此字段仅用于兼容旧设置文件；当前版本接收方向始终只抓 Discord 进程树。
     /// </summary>
