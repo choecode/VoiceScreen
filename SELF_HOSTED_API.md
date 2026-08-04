@@ -4,6 +4,8 @@ VoiceScreen 客户端默认连接内网 `http://192.168.0.119:18765/` 上的自�
 
 当前服务的 `/health` 返回 `asr: disabled`，因此现阶段的链路是：
 
+自建模式使用的本机仅 ASR 服务固定监听 `127.0.0.1:18766`；完整纯本地模式监听 `127.0.0.1:18765`。两者分离，避免切换模式后把未加载 tokenizer 的仅 ASR 进程误当成完整 OPUS-MT 服务。
+
 ```text
 Discord/麦克风音频 → 本机 faster-whisper 识别
 识别文本 → 192.168.0.119:18765/evaluate → OPUS-MT 翻译

@@ -128,8 +128,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {
                 "status": "ready",
-                "asr": "faster-whisper-base-preview+small-final-cpu-int8",
-                "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8",
+                "asr": "faster-whisper-base-preview+small-final-cpu-int8"
+                       if State.whisper is not None else "disabled",
+                "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8"
+                               if State.zh_en_tokenizer is not None else "disabled",
             })
         else:
             self.send_json(404, {"error": "not found"})
