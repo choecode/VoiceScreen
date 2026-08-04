@@ -3,6 +3,23 @@ using VoiceScreen.App.Models;
 using VoiceScreen.App.Services;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
+if (args.Any(arg => arg.Equals("--remote-asr", StringComparison.OrdinalIgnoreCase)))
+{
+    const string sentence = "Enemies are on the second floor. Let's move to the left.";
+    var pcm = await OfflineSpeech.SynthesizeEnglishAsync(sentence, CancellationToken.None);
+    using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
+    using var content = new ByteArrayContent(pcm);
+    content.Headers.ContentType = new("application/octet-stream");
+    var timer = System.Diagnostics.Stopwatch.StartNew();
+    using var response = await client.PostAsync(
+        "http://192.168.0.119:18766/transcribe?language=en&mode=final", content);
+    var body = await response.Content.ReadAsStringAsync();
+    timer.Stop();
+    Console.WriteLine($"服务器 ASR {timer.ElapsedMilliseconds} ms：{body}");
+    response.EnsureSuccessStatusCode();
+    return;
+}
+
 if (args.Any(arg => arg.Equals("--remote-api", StringComparison.OrdinalIgnoreCase)))
 {
     Console.WriteLine("VoiceScreen 免费自建服务自检");
