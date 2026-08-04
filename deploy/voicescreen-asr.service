@@ -1,0 +1,27 @@
+[Unit]
+Description=VoiceScreen LAN ASR service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=choe
+Group=choe
+WorkingDirectory=/home/choe/VoiceScreen
+Environment=VOICESCREEN_MODEL_ROOT=/home/choe/VoiceScreen/models
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_XET=1
+ExecStart=/home/choe/VoiceScreen/.venv-translation-lab/bin/python /home/choe/VoiceScreen/src/VoiceScreen.App/LocalService/local_outgoing_service.py --asr-only --host 0.0.0.0 --port 18766
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+MemoryMax=2G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
