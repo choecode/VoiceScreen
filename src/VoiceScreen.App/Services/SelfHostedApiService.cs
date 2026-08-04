@@ -10,13 +10,26 @@ namespace VoiceScreen.App.Services;
 /// <summary>调用用户自建的 VoiceScreen OPUS-MT + Piper 服务，不使用任何收费 API。</summary>
 public sealed class SelfHostedApiService : IDisposable
 {
-    private readonly HttpClient _http;
+    public const string DefaultEnglishVoice = "en_US-lessac-medium";
+    public static IReadOnlyList<PiperVoiceOption> EnglishVoices { get; } = new[]
+    {
+        new PiperVoiceOption(DefaultEnglishVoice, "Lessac · 美式英文（默认）", "Blizzard 2013 Lessac dataset license"),
+        new PiperVoiceOption("en_US-joe-medium", "Joe · 美式英文男声", "CC0"),
+        new PiperVoiceOption("en_US-mike-medium", "Mike · 美式英文男声", "CC0"),
+        new PiperVoiceOption("en_US-john-medium", "John · 美式英文男声", "Public Domain")
+    };
 
-    public SelfHostedApiService(string baseUrl)
+    private readonly HttpClient _http;
+    private readonly string _englishVoice;
+
+    public SelfHostedApiService(string baseUrl, string? englishVoice = null)
     {
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
             || uri.Scheme is not ("http" or "https"))
             throw new InvalidOperationException("自建服务地址无效，请填写完整的 http:// 或 https:// 地址。");
+        _englishVoice = string.IsNullOrWhiteSpace(englishVoice) ? DefaultEnglishVoice : englishVoice.Trim();
+        if (!EnglishVoices.Any(voice => voice.Id.Equals(_englishVoice, StringComparison.Ordinal)))
+            throw new InvalidOperationException($"不支持的自建 Piper 英文音色：{_englishVoice}");
         _http = new HttpClient { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(60) };
     }
 
@@ -28,7 +41,8 @@ public sealed class SelfHostedApiService : IDisposable
             cancellationToken).ConfigureAwait(false);
         timer.Stop();
         return $"自建翻译与 Piper 可用 · 完整链路 {timer.ElapsedMilliseconds} ms · " +
-               $"{translated.EnglishText} · PCM {translated.Pcm16Mono16Khz.Length} bytes · health={healthBody}";
+               $"voice={_englishVoice} · {translated.EnglishText} · " +
+               $"PCM {translated.Pcm16Mono16Khz.Length} bytes · health={healthBody}";
     }
 
     public async Task<string> CheckHealthAsync(CancellationToken cancellationToken)
@@ -93,7 +107,7 @@ public sealed class SelfHostedApiService : IDisposable
             beamSize = 4,
             maxDecodingLength = 128,
             includeTts,
-            voice = includeTts ? "en_US-lessac-medium" : null
+            voice = includeTts ? _englishVoice : null
         };
         using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
         using var response = await _http.PostAsync("evaluate", content, cancellationToken).ConfigureAwait(false);

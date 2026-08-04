@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>VoiceScreen 翻译评测台</title>
+  <link rel="stylesheet" href="/assets/eval.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">VOICE SCREEN · LOCAL EVALUATION LAB</p>
+        <h1>翻译质量评测台</h1>
+        <p class="subtitle">直接评测自托管 OPUS-MT，不经过 Discord、WPF 或麦克风。</p>
+      </div>
+      <div class="status" id="service-status" data-state="checking">
+        <span class="status-dot"></span>
+        <span>检查本地模型服务…</span>
+      </div>
+    </header>
+
+    <section class="privacy-banner" id="privacy-banner">
+      <strong>自托管隐私边界</strong>
+      <span id="privacy-text">原文只发送到 VoiceScreen 自托管模型，不转发第三方；当前 HTTP 88 传输未加密，请勿输入敏感信息。评分数据仅保存在浏览器。</span>
+    </section>
+
+    <section class="workspace">
+      <article class="panel input-panel">
+        <div class="panel-head">
+          <div>
+            <p class="kicker">01 · 输入</p>
+            <h2>测试语句</h2>
+          </div>
+          <button class="ghost" id="sample-button" type="button">换一个游戏语料</button>
+        </div>
+
+        <label for="provider">模型服务</label>
+        <select id="provider">
+          <option value="local-opus">本地 OPUS-MT INT8</option>
+        </select>
+
+        <label for="direction">翻译方向</label>
+        <select id="direction">
+          <option value="zh-en">中文 → 英文</option>
+          <option value="en-zh">英文 → 中文</option>
+          <option value="th-zh">泰语 → 英文 → 中文</option>
+        </select>
+
+        <label for="source-text">原文</label>
+        <textarea id="source-text" maxlength="1000" rows="7" placeholder="例如：敌人可能在三楼右边，先别冲。"></textarea>
+        <div class="textarea-meta"><span id="source-count">0 / 1000</span><span>Ctrl / ⌘ + Enter 运行</span></div>
+
+        <div class="options-grid">
+          <label class="field" for="beam-size">
+            <span>Beam size</span>
+            <input id="beam-size" type="number" min="1" max="8" value="4">
+          </label>
+          <label class="field" for="max-length">
+            <span>最大解码长度</span>
+            <input id="max-length" type="number" min="32" max="256" value="96">
+          </label>
+        </div>
+
+        <label class="check-row">
+          <input id="compare-glossary" type="checkbox" checked>
+          <span>同时比较原始模型与游戏术语规则增强</span>
+        </label>
+
+        <label class="check-row">
+          <input id="include-tts" type="checkbox" checked disabled>
+          <span>为译文生成 TTS，并测量音频指标</span>
+        </label>
+        <label class="hidden" id="voice-row" for="voice">TTS 音色</label>
+        <select class="hidden" id="voice"></select>
+
+        <button class="primary" id="run-button" type="button">
+          <span>运行翻译评测</span>
+          <span class="shortcut">⌘↵</span>
+        </button>
+        <p class="error hidden" id="request-error" role="alert"></p>
+      </article>
+
+      <article class="panel results-panel">
+        <div class="panel-head">
+          <div>
+            <p class="kicker">02 · 对比</p>
+            <h2>模型输出</h2>
+          </div>
+          <div class="latency" id="latency">等待测试</div>
+        </div>
+
+        <div class="metric-strip hidden" id="metric-strip">
+          <div><span>翻译耗时</span><strong id="metric-translation">—</strong></div>
+          <div><span>TTS 耗时</span><strong id="metric-tts">未启用</strong></div>
+          <div><span>音频时长</span><strong id="metric-audio">—</strong></div>
+          <div><span>实时率 RTF</span><strong id="metric-rtf">—</strong></div>
+        </div>
+        <div class="metric-strip secondary-metrics hidden" id="secondary-metrics">
+          <div><span>TTS 首包</span><strong id="metric-first-byte">—</strong></div>
+          <div><span>流水线总耗时</span><strong id="metric-pipeline">—</strong></div>
+          <div><span>翻译吞吐</span><strong id="metric-throughput">—</strong></div>
+          <div><span>译文/原文长度比</span><strong id="metric-length-ratio">—</strong></div>
+        </div>
+        <audio class="hidden" id="tts-player" controls preload="metadata"></audio>
+
+        <div class="empty-state" id="empty-state">
+          <div class="waveform"><i></i><i></i><i></i><i></i><i></i></div>
+          <p>输入一句真实游戏语音，开始建立你的质量基线。</p>
+        </div>
+
+        <div class="hidden" id="result-content">
+          <section class="result-card raw">
+            <div class="result-title">
+              <span>原始模型</span>
+              <button class="copy" data-copy="raw-output" type="button">复制</button>
+            </div>
+            <p id="raw-output"></p>
+            <dl class="trace">
+              <div><dt>模型</dt><dd id="raw-model"></dd></div>
+              <div><dt>耗时</dt><dd id="raw-latency"></dd></div>
+              <div class="hidden" id="raw-bridge-row"><dt>桥接英文</dt><dd id="raw-bridge"></dd></div>
+            </dl>
+          </section>
+
+          <section class="result-card enhanced" id="enhanced-card">
+            <div class="result-title">
+              <span>术语增强</span>
+              <button class="copy" data-copy="enhanced-output" type="button">复制</button>
+            </div>
+            <p id="enhanced-output"></p>
+            <dl class="trace">
+              <div><dt>归一化输入</dt><dd id="normalized-input"></dd></div>
+              <div><dt>耗时</dt><dd id="enhanced-latency"></dd></div>
+              <div class="hidden" id="enhanced-bridge-row"><dt>桥接英文</dt><dd id="enhanced-bridge"></dd></div>
+            </dl>
+          </section>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel evaluation-panel">
+      <div class="panel-head">
+        <div>
+          <p class="kicker">03 · 标注</p>
+          <h2>把主观感受变成可复用数据</h2>
+        </div>
+        <span class="dataset-count"><strong id="dataset-count">0</strong> 条样本</span>
+      </div>
+
+      <div class="score-block">
+        <span>整体质量</span>
+        <div class="rating" id="rating" role="radiogroup" aria-label="翻译质量评分">
+          <button type="button" data-score="1">1</button>
+          <button type="button" data-score="2">2</button>
+          <button type="button" data-score="3">3</button>
+          <button type="button" data-score="4">4</button>
+          <button type="button" data-score="5">5</button>
+        </div>
+        <span class="score-label" id="score-label">未评分</span>
+      </div>
+
+      <div class="tag-list" id="issue-tags">
+        <button type="button" data-tag="wrong_meaning">语义错误</button>
+        <button type="button" data-tag="term">术语不准</button>
+        <button type="button" data-tag="omission">漏译</button>
+        <button type="button" data-tag="hallucination">多译/幻觉</button>
+        <button type="button" data-tag="awkward">表达生硬</button>
+        <button type="button" data-tag="latency">速度慢</button>
+      </div>
+
+      <div class="annotation-grid">
+        <label for="expected-text">你期望的正确译文
+          <textarea id="expected-text" rows="3" placeholder="这是未来做回归、术语表或微调最有价值的字段。"></textarea>
+        </label>
+        <label for="notes">备注 / 场景
+          <textarea id="notes" rows="3" placeholder="例如：FPS 报点；push 在这里应该译为推进，而不是进攻。"></textarea>
+        </label>
+      </div>
+
+      <div class="actions">
+        <button class="primary compact" id="save-sample" type="button" disabled>加入评测集</button>
+        <button class="secondary" id="export-jsonl" type="button">导出 JSONL</button>
+        <button class="secondary" id="export-csv" type="button">导出 CSV</button>
+        <button class="danger" id="clear-dataset" type="button">清空本地样本</button>
+      </div>
+      <p class="save-message hidden" id="save-message"></p>
+
+      <div class="history-wrap">
+        <table>
+          <thead><tr><th>方向</th><th>原文</th><th>模型译文</th><th>期望译文</th><th>评分</th><th></th></tr></thead>
+          <tbody id="history-body"></tbody>
+        </table>
+        <p class="history-empty" id="history-empty">还没有保存样本。</p>
+      </div>
+    </section>
+  </main>
+  <script src="/assets/eval.js" defer></script>
+</body>
+</html>

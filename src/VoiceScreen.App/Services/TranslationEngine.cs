@@ -45,7 +45,7 @@ public sealed class TranslationEngine : IAsyncDisposable
         else if (_settings.CloudMode)
         {
             StatusChanged?.Invoke(this, "正在启动本机 Whisper，并连接免费自建翻译/TTS 服务……");
-            _remote = new SelfHostedApiService(_settings.RemoteApiBaseUrl);
+            _remote = new SelfHostedApiService(_settings.RemoteApiBaseUrl, _settings.SelfHostedEnglishVoiceName);
             await _remote.CheckHealthAsync(cancellationToken).ConfigureAwait(false);
             _localOutgoing = new LocalOutgoingService(asrOnly: true);
             await _localOutgoing.StartAsync(cancellationToken).ConfigureAwait(false);

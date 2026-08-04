@@ -31,6 +31,37 @@ VoiceScreen 是一个在 Windows 11 上运行的 Discord 双向语音翻译工�
 
 模型下载完成后，运行期间只访问 `127.0.0.1` 上的本地服务，不上传语音、字幕或密钥。
 
+## 浏览器翻译质量评测台
+
+本地模型服务启动后，浏览器打开：
+
+```text
+http://127.0.0.1:18765/
+```
+
+评测台不依赖 Discord、WPF、麦克风或 VB-CABLE，可以直接测试：
+
+- 中文 → 英文、英文 → 中文、泰语 → 英文 → 中文；
+- 原始 OPUS-MT 与游戏术语规则增强的并排结果；
+- beam size、最大解码长度、单次推理耗时与泰语桥接英文；
+- 1–5 分质量评分、期望译文、错误标签和场景备注；
+- 浏览器本地评测集，以及 JSONL / CSV 导出。
+
+评测台还提供两条 TTS 对照链路：服务器可选本地 Piper（当前运行时 GPL-3.0；各音色的数据集许可证不同，并由 `/providers` 的 `voiceLicenses` 分项披露；该 provider 不进入 Windows 默认依赖）以及 MyMemory 公共翻译接口 + Microsoft Edge 在线 TTS。选择在线 provider 时，页面会明确提示数据将发送给第三方；可以分别查看翻译耗时、TTS 首包/总耗时、音频时长、实时率 RTF、整条流水线耗时、字符吞吐与译文长度比，并直接播放合成音频。免费公共接口没有 SLA，存在额度、限流和策略变更风险，只用于质量对照，不应作为生产依赖。
+
+Windows 客户端的“纯本地模型”模式仍使用系统安装的 Windows Speech voice；“免费自建服务”模式才使用服务器 Piper voice，并单独保存 Piper voice ID。两类音色配置互不混用。Edge TTS 目前仅属于 Web 在线评测 provider，不是 Windows 客户端的本地音色。
+
+评分数据默认只保存在当前浏览器的 `localStorage`，不会写入服务端或上传。导出的 JSONL 可以继续作为固定回归语料、术语表输入或后续微调数据源。
+
+只测试翻译模型、不加载 Whisper 时，可跨平台直接启动：
+
+```bash
+VOICESCREEN_MODEL_ROOT=/path/to/VoiceScreen/Models \
+python src/VoiceScreen.App/LocalService/local_outgoing_service.py --translation-only
+```
+
+模型目录需要包含 setup 脚本生成的三个 `opus-mt-*-ct2-int8` 目录。Windows 下也可使用 `--model-root` 显式指定模型目录。
+
 ## 首次安装
 
 1. 安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)。

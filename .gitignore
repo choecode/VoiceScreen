@@ -9,3 +9,7 @@ dump-commands.txt
 **/__pycache__/
 *.pyc
 .venv/
+.venv-translation-lab/
+models/
+output/
+social/

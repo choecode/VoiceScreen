@@ -7,7 +7,8 @@ if (args.Any(arg => arg.Equals("--remote-api", StringComparison.OrdinalIgnoreCas
 {
     Console.WriteLine("VoiceScreen 免费自建服务自检");
     var remoteSettings = new SettingsStore().Load();
-    using var remote = new SelfHostedApiService(remoteSettings.RemoteApiBaseUrl);
+    using var remote = new SelfHostedApiService(remoteSettings.RemoteApiBaseUrl,
+        remoteSettings.SelfHostedEnglishVoiceName);
     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
     Console.WriteLine(await remote.TestAsync(timeout.Token));
     return;

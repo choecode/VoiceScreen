@@ -16,6 +16,8 @@ python -m pip install --index-url https://pypi.org/simple `
     "transformers==4.46.3" `
     "sentencepiece==0.2.1" `
     "sacremoses==0.1.1" `
+    "edge-tts==7.2.7" `
+    "mutagen==1.47.0" `
     "huggingface-hub>=0.34,<1"
 if ($LASTEXITCODE -ne 0) { throw "Failed to install runtime packages." }
 

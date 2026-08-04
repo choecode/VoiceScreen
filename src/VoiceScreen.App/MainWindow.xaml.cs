@@ -77,6 +77,10 @@ public partial class MainWindow : Window
         RemoteApiBaseUrlTextBox.Text = string.IsNullOrWhiteSpace(_settings.RemoteApiBaseUrl)
             ? "http://voice.choenas.top:88/"
             : _settings.RemoteApiBaseUrl;
+        SelfHostedEnglishVoiceCombo.ItemsSource = SelfHostedApiService.EnglishVoices;
+        SelfHostedEnglishVoiceCombo.SelectedItem = SelfHostedApiService.EnglishVoices
+            .FirstOrDefault(voice => voice.Id == _settings.SelfHostedEnglishVoiceName)
+            ?? SelfHostedApiService.EnglishVoices[0];
         var elevated = IsElevated();
         RestartElevatedButton.IsEnabled = !elevated;
         RestartElevatedButton.Content = elevated ? "已是管理员模式" : "以管理员重启（战地）";
@@ -142,6 +146,8 @@ public partial class MainWindow : Window
             MonitorTranslatedSpeech = MonitorTranslatedSpeechCheckBox.IsChecked == true,
             EnglishVoiceName = (EnglishVoiceCombo.SelectedItem as SpeechVoiceOption)?.Id ?? string.Empty,
             RemoteApiBaseUrl = RemoteApiBaseUrlTextBox.Text.Trim(),
+            SelfHostedEnglishVoiceName = (SelfHostedEnglishVoiceCombo.SelectedItem as PiperVoiceOption)?.Id
+                ?? SelfHostedApiService.DefaultEnglishVoice,
             MaxSubtitleLines = _settings.MaxSubtitleLines,
             OverlayLeft = _settings.OverlayLeft,
             OverlayTop = _settings.OverlayTop,
@@ -214,7 +220,7 @@ public partial class MainWindow : Window
             var settings = ReadSettings();
             _settingsStore.Save(settings);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
-            using var cloud = new SelfHostedApiService(settings.RemoteApiBaseUrl);
+            using var cloud = new SelfHostedApiService(settings.RemoteApiBaseUrl, settings.SelfHostedEnglishVoiceName);
             StatusText.Text = "正在测试自建 OPUS-MT + Piper 服务……";
             var result = await cloud.TestAsync(timeout.Token);
             StatusText.Text = result;

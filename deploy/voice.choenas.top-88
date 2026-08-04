@@ -1,0 +1,65 @@
+server {
+    listen 88;
+    listen [::]:88;
+    server_name voice.choenas.top;
+
+    access_log /var/log/nginx/voice_access.log;
+    error_log  /var/log/nginx/voice_error.log;
+    client_max_body_size 64k;
+
+    location = /transcribe {
+        return 404;
+    }
+
+    location = /evaluate {
+        limit_req zone=voicescreen_eval burst=10 nodelay;
+        limit_conn voicescreen_conn 2;
+        proxy_pass http://127.0.0.1:18765;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
+
+    location = /translate {
+        limit_req zone=voicescreen_eval burst=10 nodelay;
+        limit_conn voicescreen_conn 2;
+        proxy_pass http://127.0.0.1:18765;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
+
+    location ~ '^/audio/[A-Za-z0-9_-]{32}\.(mp3|wav)$' {
+        limit_req zone=voicescreen_audio burst=20 nodelay;
+        limit_conn voicescreen_conn 2;
+        proxy_pass http://127.0.0.1:18765;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:18765;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+    }
+}
