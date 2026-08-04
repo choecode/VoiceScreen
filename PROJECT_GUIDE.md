@@ -1,10 +1,10 @@
 # VoiceScreen 项目说明
 
-> 除下文的纯本地模式外，客户端现已增加免费自建服务模式：本机 Whisper 负责 ASR，内网 `192.168.0.119:18765` 的 OPUS-MT + Piper 负责翻译和语音合成，并可动态选择服务器音色。详见 [免费自建服务指南](SELF_HOSTED_API.md)。
+> 当前客户端不依赖任何局域网服务器。ASR 始终使用本机 Whisper；翻译与英文 TTS 可分别在本地实现和免费 API 之间切换。
 
 VoiceScreen 是一款面向 Windows 11 和 Discord 桌面客户端的本地双向语音翻译工具。它解决的核心问题是：玩游戏并加入 Discord 语音频道时，让中文用户看懂外国玩家的发言，同时把自己说的中文转换成英文语音发送给对方。
 
-项目运行时不依赖讯飞或其他云端 API。语音识别、文本翻译和英文语音合成都在本机完成，默认使用 CPU INT8 推理，避免与 3A 游戏争抢显卡资源。
+项目不依赖讯飞或付费 API。默认可使用纯本地 CPU INT8 推理；也可按需启用 MyMemory 翻译或 Edge TTS，且语音识别仍留在本机。
 
 ![VoiceScreen 实机运行界面](docs/images/voicescreen-running.png)
 
@@ -76,10 +76,12 @@ VoiceScreen 需要 [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) 为翻�
 
 ## 4. 界面说明
 
-### 4.1 运行模式
+### 4.1 处理引擎
 
-- **模拟模式**：不加载本地模型，用于先检查麦克风、耳机和 VB-CABLE 路由。
-- **正式模式**：加载 Whisper、OPUS-MT 和 Windows Speech，执行真实离线翻译。
+- **语音识别**：固定使用本机 Whisper，不上传 Discord 或麦克风音频。
+- **文本翻译**：可选本地 OPUS-MT 或 MyMemory API。
+- **英文 TTS**：可选本地 Windows Speech 或 Edge TTS API。
+- 翻译和 TTS 可独立组合；运行中切换会从下一句话开始生效。
 - **游戏低延迟字幕**：启用临时识别和增量翻译；停顿约 0.6 秒后开始最终定稿。
 
 ### 4.2 音频设备

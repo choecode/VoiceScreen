@@ -8,22 +8,23 @@ using VoiceScreen.App.Models;
 
 namespace VoiceScreen.App.Services;
 
-/// <summary>调用用户自建的 VoiceScreen OPUS-MT + Piper 服务，不使用任何收费 API。</summary>
-public sealed class SelfHostedApiService : IDisposable
+/// <summary>本机助手进程代理无密钥 MyMemory 翻译与 Edge TTS；语音识别仍在本机完成。</summary>
+public sealed class OnlineApiService : IDisposable
 {
     private readonly HttpClient _http;
     private readonly string _englishVoice;
 
-    public SelfHostedApiService(string baseUrl, string? englishVoice = null)
+    public OnlineApiService(string? englishVoice = null)
     {
-        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
-            || uri.Scheme is not ("http" or "https"))
-            throw new InvalidOperationException("自建服务地址无效，请填写完整的 http:// 或 https:// 地址。");
-        _http = new HttpClient { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(60) };
-        _englishVoice = string.IsNullOrWhiteSpace(englishVoice) ? "en_US-lessac-medium" : englishVoice.Trim();
+        _http = new HttpClient
+        {
+            BaseAddress = new Uri("http://127.0.0.1:18765/"),
+            Timeout = TimeSpan.FromSeconds(60)
+        };
+        _englishVoice = string.IsNullOrWhiteSpace(englishVoice) ? "en-US-JennyNeural" : englishVoice.Trim();
     }
 
-    public async Task<IReadOnlyList<PiperVoiceOption>> GetEnglishVoicesAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ApiVoiceOption>> GetEnglishVoicesAsync(CancellationToken cancellationToken)
     {
         using var response = await _http.GetAsync("providers", cancellationToken).ConfigureAwait(false);
         var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
@@ -32,23 +33,18 @@ public sealed class SelfHostedApiService : IDisposable
         if (!document.RootElement.TryGetProperty("providers", out var providers)) return [];
         foreach (var provider in providers.EnumerateArray())
         {
-            if (!provider.TryGetProperty("id", out var id) || id.GetString() != "local-opus") continue;
+            if (!provider.TryGetProperty("id", out var id) || id.GetString() != "mymemory-edge") continue;
             if (!provider.TryGetProperty("voices", out var voices)
                 || !voices.TryGetProperty("zh-en", out var english)) return [];
-            provider.TryGetProperty("voiceLabels", out var labels);
-            provider.TryGetProperty("voiceLicenses", out var licenses);
-            provider.TryGetProperty("voiceAvailability", out var availability);
-            var result = new List<PiperVoiceOption>();
+            var result = new List<ApiVoiceOption>();
             foreach (var item in english.EnumerateArray())
             {
                 var voice = item.GetString();
                 if (string.IsNullOrWhiteSpace(voice)) continue;
-                if (availability.ValueKind == JsonValueKind.Object
-                    && availability.TryGetProperty(voice, out var installed)
-                    && installed.ValueKind == JsonValueKind.False) continue;
-                var label = ReadStringMap(labels, voice, voice);
-                var license = ReadStringMap(licenses, voice, "许可证未声明");
-                result.Add(new PiperVoiceOption(voice, label, license));
+                var label = voice.Contains("Guy", StringComparison.OrdinalIgnoreCase)
+                    ? "Guy · 美式英文男声"
+                    : "Jenny · 美式英文女声";
+                result.Add(new ApiVoiceOption(voice, label));
             }
             return result;
         }
@@ -59,12 +55,13 @@ public sealed class SelfHostedApiService : IDisposable
     {
         var timer = Stopwatch.StartNew();
         var healthBody = await CheckHealthAsync(cancellationToken).ConfigureAwait(false);
-        var translated = await TranslateChineseWithSpeechAsync("敌人在二楼，我们从左边走。",
+        var english = await TranslateChineseAsync("敌人在二楼，我们从左边走。",
             cancellationToken).ConfigureAwait(false);
+        var pcm = await SynthesizeEnglishAsync(english, cancellationToken).ConfigureAwait(false);
         timer.Stop();
-        return $"自建翻译与 Piper 可用 · 完整链路 {timer.ElapsedMilliseconds} ms · " +
-               $"voice={_englishVoice} · {translated.EnglishText} · " +
-               $"PCM {translated.Pcm16Mono16Khz.Length} bytes · health={healthBody}";
+        return $"纯 API 翻译与 Edge TTS 可用 · 完整链路 {timer.ElapsedMilliseconds} ms · " +
+               $"voice={_englishVoice} · {english} · " +
+               $"PCM {pcm.Length} bytes · health={healthBody}";
     }
 
     public async Task<string> CheckHealthAsync(CancellationToken cancellationToken)
@@ -78,14 +75,28 @@ public sealed class SelfHostedApiService : IDisposable
     public async Task<string> TranslateChineseAsync(string text, CancellationToken cancellationToken)
         => (await TranslateAsync(text, "zh-en", false, cancellationToken).ConfigureAwait(false)).Text;
 
-    public async Task<SelfHostedSpeechResult> TranslateChineseWithSpeechAsync(string chineseText,
+    public async Task<OnlineSpeechResult> TranslateChineseWithSpeechAsync(string chineseText,
         CancellationToken cancellationToken)
     {
         var result = await TranslateAsync(chineseText, "zh-en", true, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(result.AudioUrl))
-            throw new InvalidOperationException("自建服务没有返回 Piper 音频地址。");
+            throw new InvalidOperationException("Edge TTS 没有返回音频地址。");
         var pcm = await DownloadPcmAsync(result.AudioUrl, cancellationToken).ConfigureAwait(false);
-        return new SelfHostedSpeechResult(result.Text, pcm);
+        return new OnlineSpeechResult(result.Text, pcm);
+    }
+
+    public async Task<byte[]> SynthesizeEnglishAsync(string englishText, CancellationToken cancellationToken)
+    {
+        var payload = new { text = englishText, voice = _englishVoice };
+        using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var response = await _http.PostAsync("online-tts", content, cancellationToken).ConfigureAwait(false);
+        var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Edge TTS 失败（HTTP {(int)response.StatusCode}）：{ReadError(json)}");
+        using var document = JsonDocument.Parse(json);
+        var audioUrl = document.RootElement.GetProperty("audioUrl").GetString();
+        if (string.IsNullOrWhiteSpace(audioUrl)) throw new InvalidOperationException("Edge TTS 没有返回音频地址。");
+        return await DownloadPcmAsync(audioUrl, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<LocalIncomingTranslation> TranslateIncomingAsync(string text, string language,
@@ -108,7 +119,9 @@ public sealed class SelfHostedApiService : IDisposable
         response.EnsureSuccessStatusCode();
         var waveBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         using var stream = new MemoryStream(waveBytes, writable: false);
-        using var reader = new WaveFileReader(stream);
+        using WaveStream reader = response.Content.Headers.ContentType?.MediaType == "audio/mpeg"
+            ? new Mp3FileReader(stream)
+            : new WaveFileReader(stream);
         using var resampler = new MediaFoundationResampler(reader, new WaveFormat(16000, 16, 1)) { ResamplerQuality = 60 };
         using var pcm = new MemoryStream();
         var buffer = new byte[8192];
@@ -122,7 +135,7 @@ public sealed class SelfHostedApiService : IDisposable
     {
         var payload = new
         {
-            provider = "local-opus",
+            provider = "mymemory-edge",
             text,
             direction,
             useGlossary = true,
@@ -135,17 +148,17 @@ public sealed class SelfHostedApiService : IDisposable
         using var response = await _http.PostAsync("evaluate", content, cancellationToken).ConfigureAwait(false);
         var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"自建翻译服务失败（HTTP {(int)response.StatusCode}）：{ReadError(json)}");
+            throw new InvalidOperationException($"在线 API 失败（HTTP {(int)response.StatusCode}）：{ReadError(json)}");
         using var document = JsonDocument.Parse(json);
         var root = document.RootElement;
         var translated = root.TryGetProperty("translatedText", out var translatedElement)
             ? translatedElement.GetString()?.Trim() : null;
-        if (string.IsNullOrWhiteSpace(translated)) throw new InvalidOperationException("自建服务返回了空译文。");
+        if (string.IsNullOrWhiteSpace(translated)) throw new InvalidOperationException("在线翻译 API 返回了空译文。");
         var audioUrl = root.TryGetProperty("tts", out var tts) && tts.ValueKind == JsonValueKind.Object
                        && tts.TryGetProperty("audioUrl", out var audio)
             ? audio.GetString()
             : null;
-        VoiceScreenLog.Info($"Self-hosted evaluate direction={direction} tts={includeTts}");
+        VoiceScreenLog.Info($"Online API evaluate direction={direction} tts={includeTts}");
         return new EvaluationResult(translated, audioUrl);
     }
 
@@ -155,13 +168,8 @@ public sealed class SelfHostedApiService : IDisposable
         catch { return json; }
     }
 
-    private static string ReadStringMap(JsonElement map, string key, string fallback)
-        => map.ValueKind == JsonValueKind.Object && map.TryGetProperty(key, out var value)
-            ? value.GetString() ?? fallback
-            : fallback;
-
     public void Dispose() => _http.Dispose();
     private sealed record EvaluationResult(string Text, string? AudioUrl);
 }
 
-public sealed record SelfHostedSpeechResult(string EnglishText, byte[] Pcm16Mono16Khz);
+public sealed record OnlineSpeechResult(string EnglishText, byte[] Pcm16Mono16Khz);

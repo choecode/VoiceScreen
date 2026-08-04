@@ -400,6 +400,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.translate()
             elif parsed.path == "/evaluate":
                 self.evaluate()
+            elif parsed.path == "/online-tts":
+                self.online_tts()
             else:
                 self.send_json(404, {"error": "not found"})
         except (BrokenPipeError, ConnectionResetError):
@@ -458,6 +460,22 @@ class Handler(BaseHTTPRequestHandler):
         with State.translation_lock:
             translated = translate_text(text, direction)
         self.send_json(200, {"text": translated})
+
+    def online_tts(self):
+        request = json.loads(self.read_body(64 * 1024).decode("utf-8"))
+        text = request.get("text")
+        voice = request.get("voice")
+        if not isinstance(text, str) or not text.strip() or len(text.strip()) > 1000:
+            raise ValueError("TTS text is empty or too long")
+        if voice is not None and not isinstance(voice, str):
+            raise ValueError("voice must be a string")
+        selected_voice = target_voice("zh-en", voice)
+        audio, metadata = asyncio.run(synthesize_edge(text.strip(), selected_voice))
+        audio_token = cache_audio(audio, metadata)
+        self.send_json(200, {
+            "audioUrl": f"/audio/{audio_token}.mp3",
+            "voice": selected_voice,
+        })
 
     def evaluate(self):
         request = json.loads(self.read_body(64 * 1024).decode("utf-8"))

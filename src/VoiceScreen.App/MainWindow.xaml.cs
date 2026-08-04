@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Interop;
 using VoiceScreen.App.Audio;
 using VoiceScreen.App.Diagnostics;
@@ -67,31 +68,34 @@ public partial class MainWindow : Window
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        DemoModeRadioButton.IsChecked = _settings.DemoMode;
-        CloudModeRadioButton.IsChecked = !_settings.DemoMode && _settings.CloudMode;
-        LocalModeRadioButton.IsChecked = !_settings.DemoMode && !_settings.CloudMode;
+        // Migrate the old all-or-nothing cloud switch once; new releases persist both choices separately.
+        if (_settings.CloudMode && !_settings.UseApiTranslation && !_settings.UseApiTts)
+        {
+            _settings.UseApiTranslation = true;
+            _settings.UseApiTts = true;
+        }
+        AsrProviderCombo.SelectedIndex = 0;
+        TranslationProviderCombo.SelectedIndex = _settings.UseApiTranslation ? 1 : 0;
+        TtsProviderCombo.SelectedIndex = _settings.UseApiTts ? 1 : 0;
         LowLatencyIncomingCheckBox.IsChecked = _settings.LowLatencyIncoming;
         MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
         SubtitleFontSizeSlider.Value = Math.Clamp(_settings.SubtitleFontSize, 14, 42);
         UseProcessLoopbackCheckBox.IsChecked = true;
-        RemoteApiBaseUrlTextBox.Text = string.IsNullOrWhiteSpace(_settings.RemoteApiBaseUrl)
-                                       || _settings.RemoteApiBaseUrl.Contains("voice.choenas.top", StringComparison.OrdinalIgnoreCase)
-            ? "http://192.168.0.119:18765/"
-            : _settings.RemoteApiBaseUrl;
-        var savedRemoteVoice = string.IsNullOrWhiteSpace(_settings.RemoteEnglishVoice)
-            ? "en_US-lessac-medium"
-            : _settings.RemoteEnglishVoice;
-        RemoteEnglishVoiceCombo.ItemsSource = new[]
+        var savedApiVoice = string.IsNullOrWhiteSpace(_settings.ApiEnglishVoice)
+            ? "en-US-JennyNeural"
+            : _settings.ApiEnglishVoice;
+        ApiEnglishVoiceCombo.ItemsSource = new[]
         {
-            new PiperVoiceOption(savedRemoteVoice, savedRemoteVoice, string.Empty)
+            new ApiVoiceOption("en-US-JennyNeural", "Jenny · 美式英文女声"),
+            new ApiVoiceOption("en-US-GuyNeural", "Guy · 美式英文男声")
         };
-        RemoteEnglishVoiceCombo.SelectedIndex = 0;
+        ApiEnglishVoiceCombo.SelectedItem = ApiEnglishVoiceCombo.Items.Cast<ApiVoiceOption>()
+            .FirstOrDefault(voice => voice.Id == savedApiVoice) ?? ApiEnglishVoiceCombo.Items[0];
         var elevated = IsElevated();
         RestartElevatedButton.IsEnabled = !elevated;
         RestartElevatedButton.Content = elevated ? "已是管理员模式" : "以管理员重启（战地）";
         VoiceScreenLog.Info($"Process integrity: elevated={elevated}");
         RefreshDevices();
-        _ = RefreshRemoteVoicesAsync(showErrors: false);
     }
 
     /// <summary>
@@ -141,8 +145,10 @@ public partial class MainWindow : Window
     {
         return new AppSettings
         {
-            DemoMode = DemoModeRadioButton.IsChecked == true,
-            CloudMode = CloudModeRadioButton.IsChecked == true,
+            DemoMode = false,
+            CloudMode = false,
+            UseApiTranslation = TranslationProviderCombo.SelectedIndex == 1,
+            UseApiTts = TtsProviderCombo.SelectedIndex == 1,
             LowLatencyIncoming = LowLatencyIncomingCheckBox.IsChecked == true,
             UseProcessLoopback = true,
             MicrophoneDeviceId = (MicrophoneCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
@@ -151,9 +157,8 @@ public partial class MainWindow : Window
             MonitorRenderDeviceId = (MonitorOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             MonitorTranslatedSpeech = MonitorTranslatedSpeechCheckBox.IsChecked == true,
             EnglishVoiceName = (EnglishVoiceCombo.SelectedItem as SpeechVoiceOption)?.Id ?? string.Empty,
-            RemoteApiBaseUrl = RemoteApiBaseUrlTextBox.Text.Trim(),
-            RemoteEnglishVoice = (RemoteEnglishVoiceCombo.SelectedItem as PiperVoiceOption)?.Id
-                                 ?? _settings.RemoteEnglishVoice,
+            ApiEnglishVoice = (ApiEnglishVoiceCombo.SelectedItem as ApiVoiceOption)?.Id
+                              ?? "en-US-JennyNeural",
             MaxSubtitleLines = _settings.MaxSubtitleLines,
             OverlayLeft = _settings.OverlayLeft,
             OverlayTop = _settings.OverlayTop,
@@ -223,15 +228,16 @@ public partial class MainWindow : Window
         try
         {
             TestCloudApiButton.IsEnabled = false;
-            await RefreshRemoteVoicesAsync(showErrors: true);
             var settings = ReadSettings();
             _settingsStore.Save(settings);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
-            using var cloud = new SelfHostedApiService(settings.RemoteApiBaseUrl, settings.RemoteEnglishVoice);
-            StatusText.Text = "正在测试自建 OPUS-MT + Piper 服务……";
+            await using var localAsr = new LocalOutgoingService();
+            await localAsr.StartAsync(timeout.Token);
+            using var cloud = new OnlineApiService(settings.ApiEnglishVoice);
+            StatusText.Text = "正在测试 MyMemory 翻译与 Edge TTS……";
             var result = await cloud.TestAsync(timeout.Token);
             StatusText.Text = result;
-            MessageBox.Show(this, result, "免费自建服务测试", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show(this, result, "纯 API 模式测试", MessageBoxButton.OK, MessageBoxImage.Information);
         }
         catch (Exception ex)
         {
@@ -243,26 +249,17 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RefreshRemoteVoicesAsync(bool showErrors)
+    private void ProviderCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        try
-        {
-            var endpoint = RemoteApiBaseUrlTextBox.Text.Trim();
-            var previous = (RemoteEnglishVoiceCombo.SelectedItem as PiperVoiceOption)?.Id
-                           ?? _settings.RemoteEnglishVoice;
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            using var remote = new SelfHostedApiService(endpoint, previous);
-            var voices = await remote.GetEnglishVoicesAsync(timeout.Token);
-            if (voices.Count == 0) throw new InvalidOperationException("自建服务没有公布可用的英文 Piper 音色。");
-            RemoteEnglishVoiceCombo.ItemsSource = voices;
-            RemoteEnglishVoiceCombo.SelectedItem = voices.FirstOrDefault(voice => voice.Id == previous) ?? voices[0];
-            VoiceScreenLog.Info($"Self-hosted Piper voices refreshed: count={voices.Count}");
-        }
-        catch (Exception ex)
-        {
-            VoiceScreenLog.Warn($"Self-hosted voice refresh failed: {ex.Message}");
-            if (showErrors) throw;
-        }
+        if (!IsLoaded || AsrProviderCombo.SelectedIndex < 0
+            || TranslationProviderCombo.SelectedIndex < 0 || TtsProviderCombo.SelectedIndex < 0) return;
+        _settings.UseApiTranslation = TranslationProviderCombo.SelectedIndex == 1;
+        _settings.UseApiTts = TtsProviderCombo.SelectedIndex == 1;
+        _settings.CloudMode = false;
+        _settingsStore.Save(_settings);
+        _engine?.UpdateProviders(_settings.UseApiTranslation, _settings.UseApiTts);
+        if (_engine is not null)
+            StatusText.Text = $"已切换：翻译={(_settings.UseApiTranslation ? "API" : "本地")}，TTS={(_settings.UseApiTts ? "API" : "本地")}；下一句话生效。";
     }
 
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();

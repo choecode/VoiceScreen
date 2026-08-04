@@ -21,13 +21,26 @@
 
             <Border Grid.Row="1" Background="#161B22" BorderBrush="#30363D" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,22,0,0">
                 <StackPanel>
-                    <TextBlock Text="运行模式" FontSize="18" FontWeight="SemiBold" />
-                    <WrapPanel Margin="0,10,0,0">
-                        <RadioButton x:Name="LocalModeRadioButton" GroupName="RuntimeMode" Content="纯本地模型" Foreground="#E6EDF3" Margin="0,0,24,0" />
-                        <RadioButton x:Name="CloudModeRadioButton" GroupName="RuntimeMode" Content="免费自建服务" Foreground="#58A6FF" Margin="0,0,24,0" />
-                        <RadioButton x:Name="DemoModeRadioButton" GroupName="RuntimeMode" Content="模拟模式" IsChecked="True" Foreground="#E6EDF3" />
-                    </WrapPanel>
-                    <TextBlock Text="本地模式完全离线；自建模式用本机 Whisper 识别，翻译与 Piper 语音走你的免费服务器。"
+                    <TextBlock Text="处理引擎（三个节点可独立切换）" FontSize="18" FontWeight="SemiBold" />
+                    <Grid Margin="0,10,0,0">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                        <TextBlock Text="语音识别 ASR" VerticalAlignment="Center" />
+                        <ComboBox x:Name="AsrProviderCombo" Grid.Column="1" Margin="0,4" SelectionChanged="ProviderCombo_SelectionChanged">
+                            <ComboBoxItem Content="本地 Whisper（推荐）" Tag="local" />
+                        </ComboBox>
+                        <TextBlock Grid.Row="1" Text="文本翻译" VerticalAlignment="Center" />
+                        <ComboBox x:Name="TranslationProviderCombo" Grid.Row="1" Grid.Column="1" Margin="0,4" SelectionChanged="ProviderCombo_SelectionChanged">
+                            <ComboBoxItem Content="本地 OPUS-MT（离线）" Tag="local" />
+                            <ComboBoxItem Content="API · MyMemory（联网）" Tag="api" />
+                        </ComboBox>
+                        <TextBlock Grid.Row="2" Text="英文 TTS" VerticalAlignment="Center" />
+                        <ComboBox x:Name="TtsProviderCombo" Grid.Row="2" Grid.Column="1" Margin="0,4" SelectionChanged="ProviderCombo_SelectionChanged">
+                            <ComboBoxItem Content="本地 Windows Speech（离线）" Tag="local" />
+                            <ComboBoxItem Content="API · Edge TTS（联网）" Tag="api" />
+                        </ComboBox>
+                    </Grid>
+                    <TextBlock Text="三个节点独立配置；ASR 当前仅有本地 Whisper，翻译和 TTS 可任意组合并在运行中切换。"
                                Foreground="#8B949E" Margin="0,8,0,0" TextWrapping="Wrap" />
                     <CheckBox x:Name="LowLatencyIncomingCheckBox" Content="游戏低延迟字幕（边说边显示；停顿约 0.6 秒后定稿）"
                               IsChecked="True" Foreground="#52D3A5" Margin="0,10,0,0" />
@@ -76,16 +89,13 @@
             <Border Grid.Row="4" Background="#161B22" BorderBrush="#1F6FEB" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,14,0,0">
                 <Grid>
                     <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                    <TextBlock Grid.ColumnSpan="2" Text="免费自建服务（OPUS-MT + Piper，无 API 密钥）" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
-                    <TextBlock Grid.Row="1" Text="服务地址" VerticalAlignment="Center" />
-                    <TextBox x:Name="RemoteApiBaseUrlTextBox" Grid.Row="1" Grid.Column="1" Margin="0,5" Text="http://192.168.0.119:18765/" />
-                    <TextBlock Grid.Row="2" Text="Piper 英文音色" VerticalAlignment="Center" />
-                    <ComboBox x:Name="RemoteEnglishVoiceCombo" Grid.Row="2" Grid.Column="1" Margin="0,5" IsEditable="False"
-                              ToolTip="从自建服务 /providers 动态读取；服务器新增音色后点击测试即可刷新" />
-                    <DockPanel Grid.Row="3" Grid.Column="1" Margin="0,8,0,0">
-                        <Button x:Name="TestCloudApiButton" Content="测试自建服务与延迟" Width="180" Height="34" Click="TestCloudApiButton_Click" />
-                        <TextBlock Text="当前服务器 ASR 未启用：语音识别仍在本机，文本翻译和英语语音由服务器完成。" Foreground="#E3B341" Margin="12,7,0,0" TextWrapping="Wrap" />
+                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                    <TextBlock Grid.ColumnSpan="2" Text="在线组件配置（可选）" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
+                    <TextBlock Grid.Row="1" Text="Edge 英文音色" VerticalAlignment="Center" />
+                    <ComboBox x:Name="ApiEnglishVoiceCombo" Grid.Row="1" Grid.Column="1" Margin="0,5" IsEditable="False" />
+                    <DockPanel Grid.Row="2" Grid.Column="1" Margin="0,8,0,0">
+                        <Button x:Name="TestCloudApiButton" Content="测试纯 API 与延迟" Width="180" Height="34" Click="TestCloudApiButton_Click" />
+                        <TextBlock Text="ASR 始终留在本机；MyMemory 仅接收文字，Edge TTS 仅接收英文。" Foreground="#E3B341" Margin="12,7,0,0" TextWrapping="Wrap" />
                     </DockPanel>
                 </Grid>
             </Border>
