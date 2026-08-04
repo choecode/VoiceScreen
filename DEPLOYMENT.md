@@ -1,5 +1,7 @@
 # VoiceScreen 完整部署教程（Windows 11）
 
+> 可选的免费自建服务模式见 [免费自建服务指南](SELF_HOSTED_API.md)。该模式仍需本机 Whisper，但不需要本机 OPUS-MT 和 Windows 英文语音，也不使用收费 API。
+
 本文从一台尚未安装任何依赖的 Windows 11 x64 电脑开始，完成 VoiceScreen 的安装、模型准备、Discord 音频配置、首次验证、离线使用和故障排查。
 
 ## 1. 部署结果与工作方式

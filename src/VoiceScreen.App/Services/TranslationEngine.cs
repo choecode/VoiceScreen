@@ -15,7 +15,8 @@ public sealed class TranslationEngine : IAsyncDisposable
     private readonly CancellationTokenSource _lifetime = new();
     private IDisposable? _discordCapture;
     private LocalOutgoingService? _localOutgoing;
-    private LocalIncomingAudioProcessor? _localIncoming;
+    private SelfHostedApiService? _remote;
+    private IIncomingAudioProcessor? _incoming;
     private Task? _demoTask;
     private int _processingOutgoing;
 
@@ -41,24 +42,37 @@ public sealed class TranslationEngine : IAsyncDisposable
         {
             _demoTask = Task.Run(() => DemoIncomingLoopAsync(_lifetime.Token));
         }
+        else if (_settings.CloudMode)
+        {
+            StatusChanged?.Invoke(this, "正在启动本机 Whisper，并连接免费自建翻译/TTS 服务……");
+            _remote = new SelfHostedApiService(_settings.RemoteApiBaseUrl);
+            await _remote.CheckHealthAsync(cancellationToken).ConfigureAwait(false);
+            _localOutgoing = new LocalOutgoingService(asrOnly: true);
+            await _localOutgoing.StartAsync(cancellationToken).ConfigureAwait(false);
+            _incoming = new LocalIncomingAudioProcessor(_localOutgoing, _settings.LowLatencyIncoming,
+                _remote.TranslateIncomingAsync);
+            SubscribeIncoming(_incoming);
+            await _incoming.StartAsync(cancellationToken).ConfigureAwait(false);
+            _discordCapture = CreateIncomingCapture();
+        }
         else
         {
             StatusChanged?.Invoke(this, "正在加载本地双向语音识别和翻译模型……");
             _localOutgoing = new LocalOutgoingService();
             await _localOutgoing.StartAsync(cancellationToken).ConfigureAwait(false);
-            _localIncoming = new LocalIncomingAudioProcessor(_localOutgoing, _settings.LowLatencyIncoming);
-            _localIncoming.TranslationReady += OnIncomingTranslation;
-            _localIncoming.PreviewChanged += OnIncomingPreview;
-            _localIncoming.Error += (_, message) => Error?.Invoke(this, message);
-            _localIncoming.Status += OnIncomingStatus;
+            _incoming = new LocalIncomingAudioProcessor(_localOutgoing, _settings.LowLatencyIncoming);
+            SubscribeIncoming(_incoming);
+            await _incoming.StartAsync(cancellationToken).ConfigureAwait(false);
             _discordCapture = CreateIncomingCapture();
         }
         IsRunning = true;
-        var mode = _settings.DemoMode ? "Demo" : "Local-Whisper-OPUS-MT";
-        var incomingLang = _settings.DemoMode ? "n/a" : "en->cn";
+        var mode = _settings.DemoMode ? "Demo" : _settings.CloudMode ? "SelfHosted-OPUS-Piper" : "Local-Whisper-OPUS-MT";
+        var incomingLang = _settings.DemoMode ? "n/a" : "auto->cn";
         VoiceScreenLog.Info($"TranslationEngine started. mode={mode} incomingLang={incomingLang} lowLatency={_settings.LowLatencyIncoming}");
         StatusChanged?.Invoke(this, _settings.DemoMode
             ? "模拟模式运行中，原声麦克风已直通"
+            : _settings.CloudMode
+                ? "免费自建服务模式 · 本机识别 · 只监听 Discord · 原声麦克风已直通"
             : _settings.LowLatencyIncoming
                 ? "纯本地低延迟模式 · 只监听 Discord · 原声麦克风已直通"
                 : "纯本地稳定模式 · 只监听 Discord · 原声麦克风已直通");
@@ -95,6 +109,7 @@ public sealed class TranslationEngine : IAsyncDisposable
             }
 
             LocalOutgoingTranslation translation;
+            byte[]? cloudTts = null;
             stage = "识别和翻译";
             var translationTimer = Stopwatch.StartNew();
             using var translationTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
@@ -104,6 +119,18 @@ public sealed class TranslationEngine : IAsyncDisposable
             {
                 await Task.Delay(300, translationToken).ConfigureAwait(false);
                 translation = new LocalOutgoingTranslation("模拟模式：他们在二楼", "They're on the second floor.");
+            }
+            else if (_settings.CloudMode)
+            {
+                var pcm = AudioTranscoder.ToPcm16Mono16Khz(captured);
+                var transcription = await (_localOutgoing ?? throw new InvalidOperationException("本机语音识别尚未启动。"))
+                    .TranscribeChineseSpeechAsync(pcm, translationToken).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(transcription.Text))
+                    throw new InvalidOperationException("本机中文识别没有听清，请再说一次。");
+                var remoteSpeech = await (_remote ?? throw new InvalidOperationException("自建服务尚未连接。"))
+                    .TranslateChineseWithSpeechAsync(transcription.Text, translationToken).ConfigureAwait(false);
+                translation = new LocalOutgoingTranslation(transcription.Text, remoteSpeech.EnglishText);
+                cloudTts = remoteSpeech.Pcm16Mono16Khz;
             }
             else
             {
@@ -128,8 +155,10 @@ public sealed class TranslationEngine : IAsyncDisposable
             using var playbackTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
             playbackTimeout.CancelAfter(TimeSpan.FromSeconds(60));
             var playbackToken = playbackTimeout.Token;
-            var tts = await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, playbackToken,
-                _settings.EnglishVoiceName).ConfigureAwait(false);
+            var tts = _settings.CloudMode
+                ? cloudTts ?? throw new InvalidOperationException("自建 Piper 没有返回音频。")
+                : await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, playbackToken,
+                    _settings.EnglishVoiceName).ConfigureAwait(false);
             await _router.PlayTtsAsync(tts, playbackToken, _settings.MonitorTranslatedSpeech).ConfigureAwait(false);
             _state.TryBeginCooldown();
             await Task.Delay(500, playbackToken).ConfigureAwait(false);
@@ -161,7 +190,7 @@ public sealed class TranslationEngine : IAsyncDisposable
     public async Task TranslateAndPreviewAsync(string chineseText, CancellationToken cancellationToken)
     {
         if (!IsRunning) throw new InvalidOperationException("请先启动程序。");
-        if (_settings.DemoMode) throw new InvalidOperationException("请先取消模拟模式并重新启动，才能测试真实本地翻译。");
+        if (_settings.DemoMode) throw new InvalidOperationException("请先选择本地或免费自建服务模式并重新启动。");
         if (string.IsNullOrWhiteSpace(chineseText)) throw new InvalidOperationException("请输入要测试的中文。");
         if (Interlocked.Exchange(ref _processingOutgoing, 1) != 0)
             throw new InvalidOperationException("当前正在处理另一条语音。");
@@ -172,13 +201,19 @@ public sealed class TranslationEngine : IAsyncDisposable
             _state.TryBeginTranslation();
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(30));
-            var local = _localOutgoing ?? throw new InvalidOperationException("本地翻译服务尚未启动。");
-            var english = await local.TranslateChineseTextAsync(chineseText, timeout.Token).ConfigureAwait(false);
+            SelfHostedSpeechResult? remoteSpeech = null;
+            var english = _settings.CloudMode
+                ? (remoteSpeech = await (_remote ?? throw new InvalidOperationException("自建服务尚未连接。"))
+                    .TranslateChineseWithSpeechAsync(chineseText, timeout.Token).ConfigureAwait(false)).EnglishText
+                : await (_localOutgoing ?? throw new InvalidOperationException("本地翻译服务尚未启动。"))
+                    .TranslateChineseTextAsync(chineseText, timeout.Token).ConfigureAwait(false);
             SubtitleProduced?.Invoke(this, ("mine", $"测试中文：{chineseText.Trim()}"));
             SubtitleProduced?.Invoke(this, ("sent", $"试听英文：{english}"));
             _state.TryBeginTts();
-            var audio = await OfflineSpeech.SynthesizeEnglishAsync(english, timeout.Token,
-                _settings.EnglishVoiceName).ConfigureAwait(false);
+            var audio = _settings.CloudMode
+                ? remoteSpeech!.Pcm16Mono16Khz
+                : await OfflineSpeech.SynthesizeEnglishAsync(english, timeout.Token,
+                    _settings.EnglishVoiceName).ConfigureAwait(false);
             await _router.PlayMonitorTtsAsync(audio, timeout.Token).ConfigureAwait(false);
             _state.TryBeginCooldown();
         }
@@ -193,9 +228,19 @@ public sealed class TranslationEngine : IAsyncDisposable
 
     private ValueTask SendIncomingFrameAsync(byte[] frame, CancellationToken cancellationToken)
     {
-        if (_localIncoming is null) return ValueTask.CompletedTask;
-        return _localIncoming.AddFrameAsync(frame, _state.ShouldAcceptRemoteResult, cancellationToken);
+        if (_incoming is null) return ValueTask.CompletedTask;
+        return _incoming.AddFrameAsync(frame, _state.ShouldAcceptRemoteResult, cancellationToken);
     }
+
+    private void SubscribeIncoming(IIncomingAudioProcessor incoming)
+    {
+        incoming.TranslationReady += OnIncomingTranslation;
+        incoming.PreviewChanged += OnIncomingPreview;
+        incoming.Error += OnIncomingError;
+        incoming.Status += OnIncomingStatus;
+    }
+
+    private void OnIncomingError(object? sender, string message) => Error?.Invoke(this, message);
 
     /// <summary>只捕获 Discord 进程树；失败时不允许回退到整张声卡，避免游戏声音进入字幕。</summary>
     private IDisposable CreateIncomingCapture()
@@ -312,9 +357,9 @@ public sealed class TranslationEngine : IAsyncDisposable
             VoiceScreenLog.Info($"Audio monitor selected automatically: output={monitor.Name}");
         }
         var voices = OfflineSpeech.GetInstalledEnglishVoices();
-        if (voices.Count == 0)
+        if (!_settings.CloudMode && voices.Count == 0)
             throw new InvalidOperationException("没有检测到 Windows 英文语音，请在 Windows 语音设置中安装英文男声或女声。");
-        if (!voices.Any(voice => voice.Id == _settings.EnglishVoiceName))
+        if (!_settings.CloudMode && !voices.Any(voice => voice.Id == _settings.EnglishVoiceName))
         {
             _settings.EnglishVoiceName = voices[0].Id;
             VoiceScreenLog.Info($"English TTS voice selected automatically: voice={voices[0].Name}");
@@ -352,20 +397,26 @@ public sealed class TranslationEngine : IAsyncDisposable
                 VoiceScreenLog.Warn($"incoming capture dispose error: {ex.Message}");
             }
         }
-        if (_localIncoming is not null)
+        if (_incoming is not null)
         {
-            _localIncoming.TranslationReady -= OnIncomingTranslation;
-            _localIncoming.PreviewChanged -= OnIncomingPreview;
-            _localIncoming.Status -= OnIncomingStatus;
-            try { await _localIncoming.DisposeAsync().ConfigureAwait(false); }
-            catch (Exception ex) { VoiceScreenLog.Warn($"local incoming processor dispose error: {ex.Message}"); }
-            _localIncoming = null;
+            _incoming.TranslationReady -= OnIncomingTranslation;
+            _incoming.PreviewChanged -= OnIncomingPreview;
+            _incoming.Error -= OnIncomingError;
+            _incoming.Status -= OnIncomingStatus;
+            try { await _incoming.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { VoiceScreenLog.Warn($"incoming processor dispose error: {ex.Message}"); }
+            _incoming = null;
         }
         if (_localOutgoing is not null)
         {
             try { await _localOutgoing.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex) { VoiceScreenLog.Warn($"local outgoing service dispose error: {ex.Message}"); }
             _localOutgoing = null;
+        }
+        if (_remote is not null)
+        {
+            _remote.Dispose();
+            _remote = null;
         }
         if (_demoTask is not null)
         {

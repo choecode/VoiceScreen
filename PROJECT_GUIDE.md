@@ -1,5 +1,7 @@
 # VoiceScreen 项目说明
 
+> 除下文的纯本地模式外，客户端现已增加免费自建服务模式：本机 Whisper 负责 ASR，`voice.choenas.top:88` 的 OPUS-MT + Piper 负责翻译和语音合成。详见 [免费自建服务指南](SELF_HOSTED_API.md)。
+
 VoiceScreen 是一款面向 Windows 11 和 Discord 桌面客户端的本地双向语音翻译工具。它解决的核心问题是：玩游戏并加入 Discord 语音频道时，让中文用户看懂外国玩家的发言，同时把自己说的中文转换成英文语音发送给对方。
 
 项目运行时不依赖讯飞或其他云端 API。语音识别、文本翻译和英文语音合成都在本机完成，默认使用 CPU INT8 推理，避免与 3A 游戏争抢显卡资源。
@@ -241,4 +243,3 @@ VOICE_SCREEN/
 ├─ TEST_REPORT.md                验证结果
 └─ THIRD_PARTY_MODELS.md         第三方模型与许可
 ```
-

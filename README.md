@@ -1,5 +1,7 @@
 # VoiceScreen
 
+> 新增免费自建服务模式、国内延迟实测及战地全屏热键说明，见 [免费自建服务指南](SELF_HOSTED_API.md)。本地模式仍可完全离线运行，不使用科大讯飞。
+
 VoiceScreen 是一个在 Windows 11 上运行的 Discord 双向语音翻译工具，运行时不依赖任何云端 API。
 
 > 新电脑安装、模型下载、VB-CABLE/Discord 设置、离线验收和故障排查，请阅读 [完整部署教程](DEPLOYMENT.md)。

@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Windows;
 using System.Windows.Interop;
 using VoiceScreen.App.Audio;
@@ -66,11 +67,20 @@ public partial class MainWindow : Window
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        DemoModeCheckBox.IsChecked = _settings.DemoMode;
+        DemoModeRadioButton.IsChecked = _settings.DemoMode;
+        CloudModeRadioButton.IsChecked = !_settings.DemoMode && _settings.CloudMode;
+        LocalModeRadioButton.IsChecked = !_settings.DemoMode && !_settings.CloudMode;
         LowLatencyIncomingCheckBox.IsChecked = _settings.LowLatencyIncoming;
         MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
         SubtitleFontSizeSlider.Value = Math.Clamp(_settings.SubtitleFontSize, 14, 42);
         UseProcessLoopbackCheckBox.IsChecked = true;
+        RemoteApiBaseUrlTextBox.Text = string.IsNullOrWhiteSpace(_settings.RemoteApiBaseUrl)
+            ? "http://voice.choenas.top:88/"
+            : _settings.RemoteApiBaseUrl;
+        var elevated = IsElevated();
+        RestartElevatedButton.IsEnabled = !elevated;
+        RestartElevatedButton.Content = elevated ? "已是管理员模式" : "以管理员重启（战地）";
+        VoiceScreenLog.Info($"Process integrity: elevated={elevated}");
         RefreshDevices();
     }
 
@@ -121,7 +131,8 @@ public partial class MainWindow : Window
     {
         return new AppSettings
         {
-            DemoMode = DemoModeCheckBox.IsChecked == true,
+            DemoMode = DemoModeRadioButton.IsChecked == true,
+            CloudMode = CloudModeRadioButton.IsChecked == true,
             LowLatencyIncoming = LowLatencyIncomingCheckBox.IsChecked == true,
             UseProcessLoopback = true,
             MicrophoneDeviceId = (MicrophoneCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
@@ -130,6 +141,7 @@ public partial class MainWindow : Window
             MonitorRenderDeviceId = (MonitorOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             MonitorTranslatedSpeech = MonitorTranslatedSpeechCheckBox.IsChecked == true,
             EnglishVoiceName = (EnglishVoiceCombo.SelectedItem as SpeechVoiceOption)?.Id ?? string.Empty,
+            RemoteApiBaseUrl = RemoteApiBaseUrlTextBox.Text.Trim(),
             MaxSubtitleLines = _settings.MaxSubtitleLines,
             OverlayLeft = _settings.OverlayLeft,
             OverlayTop = _settings.OverlayTop,
@@ -159,6 +171,7 @@ public partial class MainWindow : Window
             StopButton.IsEnabled = true;
             TestTranslationButton.IsEnabled = !_settings.DemoMode;
             AdjustOverlayButton.IsEnabled = true;
+            TestCloudApiButton.IsEnabled = false;
             _overlay.SetStatus("运行中 · 原声麦克风直通", ok: true);
         }
         catch (Exception ex)
@@ -193,6 +206,30 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void TestCloudApiButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            TestCloudApiButton.IsEnabled = false;
+            var settings = ReadSettings();
+            _settingsStore.Save(settings);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            using var cloud = new SelfHostedApiService(settings.RemoteApiBaseUrl);
+            StatusText.Text = "正在测试自建 OPUS-MT + Piper 服务……";
+            var result = await cloud.TestAsync(timeout.Token);
+            StatusText.Text = result;
+            MessageBox.Show(this, result, "免费自建服务测试", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            OnError(this, ex.Message);
+        }
+        finally
+        {
+            TestCloudApiButton.IsEnabled = _engine is null;
+        }
+    }
+
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();
 
     private void SubtitleFontSizeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -209,6 +246,38 @@ public partial class MainWindow : Window
         _overlay.SetInteractive(!_overlay.IsInteractive);
         AdjustOverlayButton.Content = _overlay.IsInteractive ? "② 完成并锁定" : "① 解锁移动/缩放";
         if (!_overlay.IsInteractive) SaveOverlayBounds();
+    }
+
+    private void RestartElevatedButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _settings = ReadSettings();
+            _settingsStore.Save(_settings);
+            var executable = Environment.ProcessPath
+                ?? throw new InvalidOperationException("无法定位 VoiceScreen 可执行文件。");
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = executable,
+                UseShellExecute = true,
+                Verb = "runas"
+            });
+            Application.Current.Shutdown();
+        }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            StatusText.Text = "已取消管理员模式重启。";
+        }
+        catch (Exception ex)
+        {
+            OnError(this, ex.Message);
+        }
+    }
+
+    private static bool IsElevated()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     private void OnSubtitleProduced(object? sender, (string Kind, string Text) item) => _overlay?.AddLine(item.Kind, item.Text);
@@ -246,6 +315,7 @@ public partial class MainWindow : Window
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
         TestTranslationButton.IsEnabled = false;
+        TestCloudApiButton.IsEnabled = true;
         StatusText.Text = "已停止";
     }
 

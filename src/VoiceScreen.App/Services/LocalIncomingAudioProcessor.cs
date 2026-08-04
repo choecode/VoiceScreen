@@ -11,7 +11,7 @@ namespace VoiceScreen.App.Services;
 /// 将 Discord 40ms PCM 帧切成语音会话。稳定模式在句末处理一次；低延迟模式会产生音频快照，
 /// ASR 与 OPUS 分别在独立流水线上运行，只保留有价值的最新临时结果，最终句永不丢弃。
 /// </summary>
-public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
+public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
 {
     private const int FrameBytes = 1280; // 16kHz * 40ms * PCM16 mono
     private const int VoiceRmsThreshold = 120;
@@ -28,6 +28,7 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
     private readonly object _previewGate = new();
     private readonly LocalOutgoingService _localService;
     private readonly bool _lowLatency;
+    private readonly Func<string, string, CancellationToken, Task<LocalIncomingTranslation>>? _translateOverride;
     private readonly Queue<byte[]> _preRoll = new();
     private readonly Channel<AudioSnapshot> _audioSnapshots = Channel.CreateUnbounded<AudioSnapshot>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
@@ -55,10 +56,12 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
     private int _voicedFrames;
     private int _totalFrames;
 
-    public LocalIncomingAudioProcessor(LocalOutgoingService localService, bool lowLatency = false)
+    public LocalIncomingAudioProcessor(LocalOutgoingService localService, bool lowLatency = false,
+        Func<string, string, CancellationToken, Task<LocalIncomingTranslation>>? translateOverride = null)
     {
         _localService = localService;
         _lowLatency = lowLatency;
+        _translateOverride = translateOverride;
         _asrWorker = Task.Run(ProcessAudioSnapshotsAsync);
         _translationWorker = Task.Run(ProcessTranslationSnapshotsAsync);
     }
@@ -67,6 +70,8 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
     public event EventHandler<LocalIncomingTranslation?>? PreviewChanged;
     public event EventHandler<string>? Error;
     public event EventHandler<string>? Status;
+
+    public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public ValueTask AddFrameAsync(byte[] frame, bool acceptIncoming, CancellationToken cancellationToken)
     {
@@ -238,8 +243,11 @@ public sealed class LocalIncomingAudioProcessor : IAsyncDisposable
                 {
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
                     timeout.CancelAfter(snapshot.IsFinal ? TimeSpan.FromSeconds(60) : TimeSpan.FromSeconds(20));
-                    var translated = await _localService.TranslateIncomingTextAsync(snapshot.SourceForTranslation,
-                        snapshot.Language, timeout.Token).ConfigureAwait(false);
+                    var translated = _translateOverride is null
+                        ? await _localService.TranslateIncomingTextAsync(snapshot.SourceForTranslation,
+                            snapshot.Language, timeout.Token).ConfigureAwait(false)
+                        : await _translateOverride(snapshot.SourceForTranslation, snapshot.Language, timeout.Token)
+                            .ConfigureAwait(false);
                     if (IsSupersededByFinal(snapshot.UtteranceId, snapshot.IsFinal, _finalTranslationRevision))
                         continue;
                     if (string.IsNullOrWhiteSpace(translated.TranslatedText))

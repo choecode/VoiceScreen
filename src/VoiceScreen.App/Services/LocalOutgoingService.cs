@@ -19,6 +19,9 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private readonly SemaphoreSlim _translationGate = new(1, 1);
     private Process? _asrProcess;
     private bool _ownsAsr;
+    private readonly bool _asrOnly;
+
+    public LocalOutgoingService(bool asrOnly = false) => _asrOnly = asrOnly;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -36,6 +39,10 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             cancellationToken).ConfigureAwait(false);
         return new LocalOutgoingTranslation(transcription.Text, english);
     }
+
+    public async Task<LocalTranscription> TranscribeChineseSpeechAsync(byte[] pcm16Mono16Khz,
+        CancellationToken cancellationToken)
+        => await TranscribeWithGateAsync(pcm16Mono16Khz, "zh", cancellationToken).ConfigureAwait(false);
 
     public async Task<LocalIncomingTranslation> TranslateIncomingSpeechAsync(byte[] pcm16Mono16Khz,
         CancellationToken cancellationToken)
@@ -272,7 +279,8 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         if (await IsHealthyAsync(_asr, "health", cancellationToken).ConfigureAwait(false)) return;
         var script = Path.Combine(AppContext.BaseDirectory, "LocalService", "local_outgoing_service.py");
         if (!File.Exists(script)) throw new FileNotFoundException("缺少本地语音识别服务脚本。", script);
-        _asrProcess = StartHiddenProcess("python", $"\"{script}\" --port {AsrPort}");
+        var arguments = $"\"{script}\" --port {AsrPort}" + (_asrOnly ? " --asr-only" : string.Empty);
+        _asrProcess = StartHiddenProcess("python", arguments);
         _ownsAsr = true;
         // 首次启动会同时把两套 Whisper 和三套 OPUS 模型装入内存；游戏运行时磁盘/CPU
         // 较忙，冷启动可能超过 30 秒。放宽这里只影响启动等待，不影响单次翻译超时。

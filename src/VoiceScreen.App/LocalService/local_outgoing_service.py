@@ -194,12 +194,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18765)
+    parser.add_argument("--asr-only", action="store_true")
     args = parser.parse_args()
 
     root = model_root()
-    zh_en_model = require_model("opus-mt-zh-en-ct2-int8")
-    en_zh_model = require_model("opus-mt-en-zh-ct2-int8")
-    th_en_model = require_model("opus-mt-th-en-ct2-int8")
     State.whisper = WhisperModel(
         "small", device="cpu", compute_type="int8", cpu_threads=8, num_workers=1,
         local_files_only=True,
@@ -208,18 +206,22 @@ def main():
         "base", device="cpu", compute_type="int8", cpu_threads=6, num_workers=1,
         local_files_only=True,
     )
-    State.zh_en = ctranslate2.Translator(
-        zh_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
-    )
-    State.en_zh = ctranslate2.Translator(
-        en_zh_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
-    )
-    State.th_en = ctranslate2.Translator(
-        th_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
-    )
-    State.zh_en_tokenizer = MarianTokenizer.from_pretrained(zh_en_model, local_files_only=True)
-    State.en_zh_tokenizer = MarianTokenizer.from_pretrained(en_zh_model, local_files_only=True)
-    State.th_en_tokenizer = MarianTokenizer.from_pretrained(th_en_model, local_files_only=True)
+    if not args.asr_only:
+        zh_en_model = require_model("opus-mt-zh-en-ct2-int8")
+        en_zh_model = require_model("opus-mt-en-zh-ct2-int8")
+        th_en_model = require_model("opus-mt-th-en-ct2-int8")
+        State.zh_en = ctranslate2.Translator(
+            zh_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+        )
+        State.en_zh = ctranslate2.Translator(
+            en_zh_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+        )
+        State.th_en = ctranslate2.Translator(
+            th_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+        )
+        State.zh_en_tokenizer = MarianTokenizer.from_pretrained(zh_en_model, local_files_only=True)
+        State.en_zh_tokenizer = MarianTokenizer.from_pretrained(en_zh_model, local_files_only=True)
+        State.th_en_tokenizer = MarianTokenizer.from_pretrained(th_en_model, local_files_only=True)
     ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 

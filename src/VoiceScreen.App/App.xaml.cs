@@ -22,9 +22,9 @@ public partial class App : Application
             // 手动创建时我们在 MainWindow.OnSourceInitialized 里撤销 OLE 注册。
             var main = new MainWindow();
             MainWindow = main;
-            main.Show();
             if (autoStart)
                 main.Loaded += (_, _) => Dispatcher.InvokeAsync(AutoStartPipelineAsync);
+            main.Show();
         }
         else
         {

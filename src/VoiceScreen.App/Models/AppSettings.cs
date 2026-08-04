@@ -3,6 +3,7 @@ namespace VoiceScreen.App.Models;
 public sealed class AppSettings
 {
     public bool DemoMode { get; set; } = true;
+    public bool CloudMode { get; set; }
     public bool LowLatencyIncoming { get; set; } = true;
     public string MicrophoneDeviceId { get; set; } = string.Empty;
     public string DiscordOutputDeviceId { get; set; } = string.Empty;
@@ -10,6 +11,7 @@ public sealed class AppSettings
     public string MonitorRenderDeviceId { get; set; } = string.Empty;
     public bool MonitorTranslatedSpeech { get; set; } = true;
     public string EnglishVoiceName { get; set; } = string.Empty;
+    public string RemoteApiBaseUrl { get; set; } = "http://voice.choenas.top:88/";
     public int MaxSubtitleLines { get; set; } = 8;
     public double OverlayLeft { get; set; } = 20;
     public double OverlayTop { get; set; } = 20;

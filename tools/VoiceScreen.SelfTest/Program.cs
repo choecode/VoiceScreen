@@ -3,6 +3,16 @@ using VoiceScreen.App.Models;
 using VoiceScreen.App.Services;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
+if (args.Any(arg => arg.Equals("--remote-api", StringComparison.OrdinalIgnoreCase)))
+{
+    Console.WriteLine("VoiceScreen 免费自建服务自检");
+    var remoteSettings = new SettingsStore().Load();
+    using var remote = new SelfHostedApiService(remoteSettings.RemoteApiBaseUrl);
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+    Console.WriteLine(await remote.TestAsync(timeout.Token));
+    return;
+}
+
 if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreCase)))
 {
     Console.WriteLine("VoiceScreen 纯本地双向模型自检");
