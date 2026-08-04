@@ -11,13 +11,33 @@ namespace VoiceScreen.App.Services;
 public sealed class SelfHostedApiService : IDisposable
 {
     private readonly HttpClient _http;
+    private readonly string _englishVoice;
 
-    public SelfHostedApiService(string baseUrl)
+    public SelfHostedApiService(string baseUrl, string? englishVoice = null)
     {
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
             || uri.Scheme is not ("http" or "https"))
             throw new InvalidOperationException("自建服务地址无效，请填写完整的 http:// 或 https:// 地址。");
         _http = new HttpClient { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(60) };
+        _englishVoice = string.IsNullOrWhiteSpace(englishVoice) ? "en_US-lessac-medium" : englishVoice.Trim();
+    }
+
+    public async Task<IReadOnlyList<string>> GetEnglishVoicesAsync(CancellationToken cancellationToken)
+    {
+        using var response = await _http.GetAsync("providers", cancellationToken).ConfigureAwait(false);
+        var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(json);
+        if (!document.RootElement.TryGetProperty("providers", out var providers)) return [];
+        foreach (var provider in providers.EnumerateArray())
+        {
+            if (!provider.TryGetProperty("id", out var id) || id.GetString() != "local-opus") continue;
+            if (!provider.TryGetProperty("voices", out var voices)
+                || !voices.TryGetProperty("zh-en", out var english)) return [];
+            return english.EnumerateArray().Select(item => item.GetString())
+                .Where(item => !string.IsNullOrWhiteSpace(item)).Select(item => item!).ToArray();
+        }
+        return [];
     }
 
     public async Task<string> TestAsync(CancellationToken cancellationToken)
@@ -93,7 +113,7 @@ public sealed class SelfHostedApiService : IDisposable
             beamSize = 4,
             maxDecodingLength = 128,
             includeTts,
-            voice = includeTts ? "en_US-lessac-medium" : null
+            voice = includeTts ? _englishVoice : null
         };
         using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
         using var response = await _http.PostAsync("evaluate", content, cancellationToken).ConfigureAwait(false);

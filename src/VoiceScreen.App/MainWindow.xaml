@@ -76,11 +76,14 @@
             <Border Grid.Row="4" Background="#161B22" BorderBrush="#1F6FEB" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,14,0,0">
                 <Grid>
                     <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                     <TextBlock Grid.ColumnSpan="2" Text="免费自建服务（OPUS-MT + Piper，无 API 密钥）" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
                     <TextBlock Grid.Row="1" Text="服务地址" VerticalAlignment="Center" />
-                    <TextBox x:Name="RemoteApiBaseUrlTextBox" Grid.Row="1" Grid.Column="1" Margin="0,5" Text="http://voice.choenas.top:88/" />
-                    <DockPanel Grid.Row="2" Grid.Column="1" Margin="0,8,0,0">
+                    <TextBox x:Name="RemoteApiBaseUrlTextBox" Grid.Row="1" Grid.Column="1" Margin="0,5" Text="http://192.168.0.119:18765/" />
+                    <TextBlock Grid.Row="2" Text="Piper 英文音色" VerticalAlignment="Center" />
+                    <ComboBox x:Name="RemoteEnglishVoiceCombo" Grid.Row="2" Grid.Column="1" Margin="0,5" IsEditable="False"
+                              ToolTip="从自建服务 /providers 动态读取；服务器新增音色后点击测试即可刷新" />
+                    <DockPanel Grid.Row="3" Grid.Column="1" Margin="0,8,0,0">
                         <Button x:Name="TestCloudApiButton" Content="测试自建服务与延迟" Width="180" Height="34" Click="TestCloudApiButton_Click" />
                         <TextBlock Text="当前服务器 ASR 未启用：语音识别仍在本机，文本翻译和英语语音由服务器完成。" Foreground="#E3B341" Margin="12,7,0,0" TextWrapping="Wrap" />
                     </DockPanel>
@@ -93,7 +96,24 @@
                                Foreground="#E3B341" TextWrapping="Wrap" />
                 </Border>
                 <WrapPanel Margin="0,16,0,0">
-                    <Button x:Name="StartButton" Content="启动" Width="120" Height="40" Margin="0,0,10,0" Click="StartButton_Click" Background="#238636" Foreground="White" />
+                    <Button x:Name="StartButton" Content="启动" Width="120" Height="40" Margin="0,0,10,0" Click="StartButton_Click">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Background" Value="#238636" />
+                                <Setter Property="Foreground" Value="#FFFFFF" />
+                                <Setter Property="BorderBrush" Value="#2EA043" />
+                                <Setter Property="BorderThickness" Value="1" />
+                                <Style.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#2EA043" /></Trigger>
+                                    <Trigger Property="IsEnabled" Value="False">
+                                        <Setter Property="Background" Value="#21262D" />
+                                        <Setter Property="Foreground" Value="#8B949E" />
+                                        <Setter Property="BorderBrush" Value="#30363D" />
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                    </Button>
                     <Button x:Name="StopButton" Content="停止" Width="100" Height="40" Margin="0,0,10,0" Click="StopButton_Click" IsEnabled="False" />
                     <Button Content="刷新设备" Width="110" Height="40" Margin="0,0,10,0" Click="RefreshDevicesButton_Click" />
                     <Button x:Name="AdjustOverlayButton" Content="① 解锁移动/缩放" Width="160" Height="40"

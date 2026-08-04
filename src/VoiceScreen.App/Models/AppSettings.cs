@@ -11,7 +11,8 @@ public sealed class AppSettings
     public string MonitorRenderDeviceId { get; set; } = string.Empty;
     public bool MonitorTranslatedSpeech { get; set; } = true;
     public string EnglishVoiceName { get; set; } = string.Empty;
-    public string RemoteApiBaseUrl { get; set; } = "http://voice.choenas.top:88/";
+    public string RemoteApiBaseUrl { get; set; } = "http://192.168.0.119:18765/";
+    public string RemoteEnglishVoice { get; set; } = "en_US-lessac-medium";
     public int MaxSubtitleLines { get; set; } = 8;
     public double OverlayLeft { get; set; } = 20;
     public double OverlayTop { get; set; } = 20;
