@@ -15,14 +15,16 @@ class WindowsSelfHostedVoiceContractTests(unittest.TestCase):
         engine = (APP / "Services" / "TranslationEngine.cs").read_text(encoding="utf-8")
         self_test = (ROOT / "tools" / "VoiceScreen.SelfTest" / "Program.cs").read_text(encoding="utf-8")
 
-        self.assertIn("SelfHostedEnglishVoiceName", settings)
-        self.assertIn('x:Name="SelfHostedEnglishVoiceCombo"', xaml)
-        self.assertIn("SelfHostedEnglishVoiceCombo.ItemsSource", window)
-        self.assertIn("SelfHostedEnglishVoiceName =", window)
+        self.assertIn("RemoteEnglishVoice", settings)
+        self.assertIn('x:Name="RemoteEnglishVoiceCombo"', xaml)
+        self.assertIn("RemoteEnglishVoiceCombo.ItemsSource", window)
+        self.assertIn("RemoteEnglishVoice =", window)
         self.assertIn("private readonly string _englishVoice", service)
+        self.assertIn("GetEnglishVoicesAsync", service)
+        self.assertIn("voiceAvailability", service)
         self.assertIn("voice = includeTts ? _englishVoice : null", service)
-        self.assertIn("_settings.SelfHostedEnglishVoiceName", engine)
-        self.assertIn("remoteSettings.SelfHostedEnglishVoiceName", self_test)
+        self.assertIn("_settings.RemoteEnglishVoice", engine)
+        self.assertIn("remoteSettings.RemoteEnglishVoice", self_test)
         self.assertNotIn('voice = includeTts ? "en_US-lessac-medium" : null', service)
 
 

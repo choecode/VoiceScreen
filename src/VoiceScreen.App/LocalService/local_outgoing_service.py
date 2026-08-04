@@ -325,7 +325,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "ready",
                 "asr": "faster-whisper-base-preview+small-final-cpu-int8" if State.whisper else "disabled",
-                "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8",
+                "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8"
+                               if State.zh_en_tokenizer is not None else "disabled",
                 "localTts": "piper-tts" if local_tts_available() else "disabled",
                 "evaluationUi": "/",
             })

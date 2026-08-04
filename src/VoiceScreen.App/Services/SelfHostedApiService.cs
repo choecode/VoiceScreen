@@ -4,21 +4,13 @@ using System.Text;
 using System.Text.Json;
 using NAudio.Wave;
 using VoiceScreen.App.Diagnostics;
+using VoiceScreen.App.Models;
 
 namespace VoiceScreen.App.Services;
 
 /// <summary>调用用户自建的 VoiceScreen OPUS-MT + Piper 服务，不使用任何收费 API。</summary>
 public sealed class SelfHostedApiService : IDisposable
 {
-    public const string DefaultEnglishVoice = "en_US-lessac-medium";
-    public static IReadOnlyList<PiperVoiceOption> EnglishVoices { get; } = new[]
-    {
-        new PiperVoiceOption(DefaultEnglishVoice, "Lessac · 美式英文（默认）", "Blizzard 2013 Lessac dataset license"),
-        new PiperVoiceOption("en_US-joe-medium", "Joe · 美式英文男声", "CC0"),
-        new PiperVoiceOption("en_US-mike-medium", "Mike · 美式英文男声", "CC0"),
-        new PiperVoiceOption("en_US-john-medium", "John · 美式英文男声", "Public Domain")
-    };
-
     private readonly HttpClient _http;
     private readonly string _englishVoice;
 
@@ -27,10 +19,40 @@ public sealed class SelfHostedApiService : IDisposable
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
             || uri.Scheme is not ("http" or "https"))
             throw new InvalidOperationException("自建服务地址无效，请填写完整的 http:// 或 https:// 地址。");
-        _englishVoice = string.IsNullOrWhiteSpace(englishVoice) ? DefaultEnglishVoice : englishVoice.Trim();
-        if (!EnglishVoices.Any(voice => voice.Id.Equals(_englishVoice, StringComparison.Ordinal)))
-            throw new InvalidOperationException($"不支持的自建 Piper 英文音色：{_englishVoice}");
         _http = new HttpClient { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(60) };
+        _englishVoice = string.IsNullOrWhiteSpace(englishVoice) ? "en_US-lessac-medium" : englishVoice.Trim();
+    }
+
+    public async Task<IReadOnlyList<PiperVoiceOption>> GetEnglishVoicesAsync(CancellationToken cancellationToken)
+    {
+        using var response = await _http.GetAsync("providers", cancellationToken).ConfigureAwait(false);
+        var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(json);
+        if (!document.RootElement.TryGetProperty("providers", out var providers)) return [];
+        foreach (var provider in providers.EnumerateArray())
+        {
+            if (!provider.TryGetProperty("id", out var id) || id.GetString() != "local-opus") continue;
+            if (!provider.TryGetProperty("voices", out var voices)
+                || !voices.TryGetProperty("zh-en", out var english)) return [];
+            provider.TryGetProperty("voiceLabels", out var labels);
+            provider.TryGetProperty("voiceLicenses", out var licenses);
+            provider.TryGetProperty("voiceAvailability", out var availability);
+            var result = new List<PiperVoiceOption>();
+            foreach (var item in english.EnumerateArray())
+            {
+                var voice = item.GetString();
+                if (string.IsNullOrWhiteSpace(voice)) continue;
+                if (availability.ValueKind == JsonValueKind.Object
+                    && availability.TryGetProperty(voice, out var installed)
+                    && installed.ValueKind == JsonValueKind.False) continue;
+                var label = ReadStringMap(labels, voice, voice);
+                var license = ReadStringMap(licenses, voice, "许可证未声明");
+                result.Add(new PiperVoiceOption(voice, label, license));
+            }
+            return result;
+        }
+        return [];
     }
 
     public async Task<string> TestAsync(CancellationToken cancellationToken)
@@ -132,6 +154,11 @@ public sealed class SelfHostedApiService : IDisposable
         try { return JsonDocument.Parse(json).RootElement.GetProperty("error").GetString() ?? json; }
         catch { return json; }
     }
+
+    private static string ReadStringMap(JsonElement map, string key, string fallback)
+        => map.ValueKind == JsonValueKind.Object && map.TryGetProperty(key, out var value)
+            ? value.GetString() ?? fallback
+            : fallback;
 
     public void Dispose() => _http.Dispose();
     private sealed record EvaluationResult(string Text, string? AudioUrl);

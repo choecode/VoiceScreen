@@ -1,12 +1,14 @@
 # 免费自建服务模式
 
-VoiceScreen 客户端可连接 `http://voice.choenas.top:88/` 上的自托管 OPUS-MT + Piper 服务，不使用科大讯飞，也不需要任何收费 API 或密钥。
+VoiceScreen 客户端默认连接内网 `http://192.168.0.119:18765/` 上的自托管 OPUS-MT + Piper 服务，不使用科大讯飞，也不需要任何收费 API 或密钥。
 
 当前服务的 `/health` 返回 `asr: disabled`，因此现阶段的链路是：
 
+自建模式使用的本机仅 ASR 服务固定监听 `127.0.0.1:18766`；完整纯本地模式监听 `127.0.0.1:18765`。两者分离，避免切换模式后把未加载 tokenizer 的仅 ASR 进程误当成完整 OPUS-MT 服务。
+
 ```text
 Discord/麦克风音频 → 本机 faster-whisper 识别
-识别文本 → voice.choenas.top:88/evaluate → OPUS-MT 翻译
+识别文本 → 192.168.0.119:18765/evaluate → OPUS-MT 翻译
 我方中文 → 服务器 OPUS-MT → Piper 英语 WAV → 客户端 → VB-CABLE → Discord
 ```
 
@@ -15,9 +17,10 @@ Discord/麦克风音频 → 本机 faster-whisper 识别
 ## 使用
 
 1. 在运行模式中选择“免费自建服务”。
-2. 服务地址保持 `http://voice.choenas.top:88/`。
-3. 点击“测试自建服务与延迟”。
-4. 测试成功后启动；Discord 和 VB-CABLE 设置与本地模式相同。
+2. 服务地址保持 `http://192.168.0.119:18765/`。
+3. 在“Piper 英文音色”中选择服务器公布的音色；列表来自 `/providers`，服务器安装新音色后点击测试即可刷新。
+4. 点击“测试自建服务与延迟”。
+5. 测试成功后启动；Discord 和 VB-CABLE 设置与本地模式相同。
 
 客户端使用 Web 评测台相同的协议：`GET /health`、`GET /providers`、`POST /evaluate` 和返回的 `/audio/*.wav`。固定选用服务器上的 `local-opus`，不会调用 Web 页面另一个 `mymemory-edge` 第三方提供商。
 
@@ -25,9 +28,8 @@ Discord/麦克风音频 → 本机 faster-whisper 识别
 
 测试出口为中国电信云南昆明：主页约 90 ms，热连接 `/health` 约 20–95 ms，一次短句中译英约 614 ms；本地 OPUS-MT + Piper 的短句翻译及完整语音流水线实测约 3.3 秒，其中翻译约 489 ms、Piper 合成约 2.8 秒。结果会受服务器负载、线路和句长影响。
 
-当前地址是明文 HTTP 88。语音本身不会上传，但识别后的文本会上传到自建服务器；请勿发送敏感内容。后续应给域名配置 HTTPS。
+当前地址是内网明文 HTTP。语音本身不会上传，但识别后的文本会发送到内网服务器。
 
 ## 战地全屏热键
 
 右 Alt 同时由 Raw Input、低级键盘钩子、异步按键状态轮询和 `RegisterHotKey` 监听，并进行聚合去重。若战地以管理员权限运行，请点击主界面的“以管理员重启（战地）”，确保 VoiceScreen 与游戏拥有同等权限。程序不注入游戏、不读取游戏内存，也不绕过反作弊。
-

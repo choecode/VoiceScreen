@@ -12,21 +12,33 @@ namespace VoiceScreen.App.Services;
 /// </summary>
 public sealed class LocalOutgoingService : IAsyncDisposable
 {
-    private const int AsrPort = 18765;
-    private static readonly Uri AsrBaseUri = new($"http://127.0.0.1:{AsrPort}/");
-    private readonly HttpClient _asr = new() { BaseAddress = AsrBaseUri, Timeout = TimeSpan.FromSeconds(120) };
+    private const int FullLocalPort = 18765;
+    private const int AsrOnlyPort = 18766;
+    private readonly HttpClient _asr;
+    private readonly int _port;
     private readonly SemaphoreSlim _speechGate = new(1, 1);
     private readonly SemaphoreSlim _translationGate = new(1, 1);
     private Process? _asrProcess;
     private bool _ownsAsr;
     private readonly bool _asrOnly;
 
-    public LocalOutgoingService(bool asrOnly = false) => _asrOnly = asrOnly;
+    public LocalOutgoingService(bool asrOnly = false)
+    {
+        _asrOnly = asrOnly;
+        _port = asrOnly ? AsrOnlyPort : FullLocalPort;
+        _asr = new HttpClient
+        {
+            BaseAddress = new Uri($"http://127.0.0.1:{_port}/"),
+            Timeout = TimeSpan.FromSeconds(120)
+        };
+    }
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         await EnsureAsrAsync(cancellationToken).ConfigureAwait(false);
-        VoiceScreenLog.Info("Local models ready: faster-whisper base preview + small final + OPUS-MT zh-en/en-zh/th-en CPU INT8");
+        VoiceScreenLog.Info(_asrOnly
+            ? $"Local ASR ready on {_port}: faster-whisper base preview + small final CPU INT8"
+            : $"Local models ready on {_port}: faster-whisper + OPUS-MT zh-en/en-zh/th-en CPU INT8");
     }
 
     public async Task<LocalOutgoingTranslation> TranslateSpeechAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
@@ -276,15 +288,17 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
     private async Task EnsureAsrAsync(CancellationToken cancellationToken)
     {
-        if (await IsHealthyAsync(_asr, "health", cancellationToken).ConfigureAwait(false)) return;
+        if (await IsHealthyAsync(_asr, "health", requireTranslation: !_asrOnly, cancellationToken)
+                .ConfigureAwait(false)) return;
         var script = Path.Combine(AppContext.BaseDirectory, "LocalService", "local_outgoing_service.py");
         if (!File.Exists(script)) throw new FileNotFoundException("缺少本地语音识别服务脚本。", script);
-        var arguments = $"\"{script}\" --port {AsrPort}" + (_asrOnly ? " --asr-only" : string.Empty);
+        var arguments = $"\"{script}\" --port {_port}" + (_asrOnly ? " --asr-only" : string.Empty);
         _asrProcess = StartHiddenProcess("python", arguments);
         _ownsAsr = true;
         // 首次启动会同时把两套 Whisper 和三套 OPUS 模型装入内存；游戏运行时磁盘/CPU
         // 较忙，冷启动可能超过 30 秒。放宽这里只影响启动等待，不影响单次翻译超时。
-        await WaitUntilHealthyAsync(_asr, "health", _asrProcess, TimeSpan.FromMinutes(2), cancellationToken,
+        await WaitUntilHealthyAsync(_asr, "health", _asrProcess, TimeSpan.FromMinutes(2),
+            requireTranslation: !_asrOnly, cancellationToken,
             "本地模型服务启动失败。请先运行 setup_local_models.ps1，并确认 Python 依赖已安装。")
             .ConfigureAwait(false);
     }
@@ -302,27 +316,36 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     }
 
     private static async Task WaitUntilHealthyAsync(HttpClient client, string path, Process process, TimeSpan timeout,
-        CancellationToken cancellationToken, string failureMessage)
+        bool requireTranslation, CancellationToken cancellationToken, string failureMessage)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (process.HasExited) throw new InvalidOperationException($"{failureMessage} 进程退出码：{process.ExitCode}");
-            if (await IsHealthyAsync(client, path, cancellationToken).ConfigureAwait(false)) return;
+            if (await IsHealthyAsync(client, path, requireTranslation, cancellationToken).ConfigureAwait(false)) return;
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
         throw new TimeoutException(failureMessage);
     }
 
-    private static async Task<bool> IsHealthyAsync(HttpClient client, string path, CancellationToken cancellationToken)
+    private static async Task<bool> IsHealthyAsync(HttpClient client, string path, bool requireTranslation,
+        CancellationToken cancellationToken)
     {
         try
         {
             using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(500));
             using var response = await client.GetAsync(path, requestTimeout.Token).ConfigureAwait(false);
-            return response.IsSuccessStatusCode;
+            if (!response.IsSuccessStatusCode) return false;
+            var json = await response.Content.ReadAsStringAsync(requestTimeout.Token).ConfigureAwait(false);
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            var asrReady = root.TryGetProperty("asr", out var asr)
+                           && !string.Equals(asr.GetString(), "disabled", StringComparison.OrdinalIgnoreCase);
+            var translationReady = root.TryGetProperty("translation", out var translation)
+                                   && !string.Equals(translation.GetString(), "disabled", StringComparison.OrdinalIgnoreCase);
+            return asrReady && (!requireTranslation || translationReady);
         }
         catch
         {
