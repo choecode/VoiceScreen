@@ -24,47 +24,120 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private readonly SemaphoreSlim _translationGate = new(1, 1);
     private readonly ChildProcessJob? _processJob = ChildProcessJob.TryCreate();
     private readonly string _asrEngine;
+    private readonly string _asrDevice;
     private Process? _asrProcess;
     private bool _ownsAsr;
 
-    public LocalOutgoingService(string asrEngine = "whisper")
+    public LocalOutgoingService(string asrEngine = "whisper", string asrDevice = "auto")
     {
         _asrEngine = NormalizeAsrEngine(asrEngine);
-        _asr = new HttpClient
+        _asrDevice = NormalizeAsrDevice(asrDevice);
+
+        // 低延迟模式每 600ms 就要发一次识别请求，中间还夹着翻译请求。默认的
+        // HttpClient 会周期性回收连接，每次回收都让下一个快照多付一次 TCP 握手。
+        // 这里让连接常驻：目标是 127.0.0.1 上的固定进程，没有 DNS 变更或负载均衡
+        // 需要靠回收来跟进；服务端同时声明了 HTTP/1.1 keep-alive。
+        var handler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = Timeout.InfiniteTimeSpan,
+            PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
+            // ASR 和翻译各占一条，剩下的留给发送方向的抢跑识别。
+            MaxConnectionsPerServer = 4,
+            UseProxy = false,
+            AllowAutoRedirect = false,
+            ConnectTimeout = TimeSpan.FromSeconds(5)
+        };
+        _asr = new HttpClient(handler)
         {
             BaseAddress = new Uri($"http://127.0.0.1:{ServicePort}/"),
-            Timeout = TimeSpan.FromSeconds(120)
+            Timeout = TimeSpan.FromSeconds(120),
+            DefaultRequestVersion = System.Net.HttpVersion.Version11,
+            DefaultVersionPolicy = System.Net.Http.HttpVersionPolicy.RequestVersionOrLower
         };
     }
+
+    /// <summary>
+    /// 服务端实际用上的 Whisper 设备（cuda 或 cpu）。请求的是 auto 时，只有服务起来
+    /// 之后才知道显卡到底能不能用，界面要显示真实结果而不是我们的意愿。
+    /// </summary>
+    public string ActiveAsrDevice { get; private set; } = "cpu";
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         await EnsureAsrAsync(cancellationToken).ConfigureAwait(false);
-        var asrModelLabel = _asrEngine == "sherpa" ? "Sherpa-ONNX Zipformer" : "faster-whisper (base/small)";
+        ActiveAsrDevice = await ReadActiveAsrDeviceAsync(cancellationToken).ConfigureAwait(false);
+        var asrModelLabel = _asrEngine == "sherpa"
+            ? "Sherpa-ONNX Zipformer (streaming)"
+            : $"faster-whisper (base/small) on {ActiveAsrDevice.ToUpperInvariant()}";
         VoiceScreenLog.Info(
             $"Local models ready on {ServicePort}: {asrModelLabel} + OPUS-MT zh-en/en-zh/th-en CPU INT8");
     }
 
+    private async Task<string> ReadActiveAsrDeviceAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var response = await _asr.GetAsync("health", cancellationToken).ConfigureAwait(false);
+            var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            using var document = JsonDocument.Parse(json);
+            return document.RootElement.TryGetProperty("asrDevice", out var value)
+                ? value.GetString() ?? "cpu"
+                : "cpu";
+        }
+        catch
+        {
+            // 只是一条展示信息，拿不到就当 CPU，不能因此让启动失败。
+            return "cpu";
+        }
+    }
+
     public async Task<LocalTranscription> TranscribeChineseSpeechAsync(ReadOnlyMemory<byte> pcm16Mono16Khz,
         CancellationToken cancellationToken)
-        => await TranscribeWithGateAsync(pcm16Mono16Khz, SpokenLanguage.Chinese, cancellationToken)
-            .ConfigureAwait(false);
+        => await TranscribeChineseSpeechAsync(pcm16Mono16Khz,
+            new TranscriptionRequest { Language = SpokenLanguage.Chinese }, cancellationToken).ConfigureAwait(false);
+
+    public async Task<LocalTranscription> TranscribeChineseSpeechAsync(ReadOnlyMemory<byte> pcm16Mono16Khz,
+        TranscriptionRequest request, CancellationToken cancellationToken)
+        => await TranscribeWithGateAsync(pcm16Mono16Khz, request with { Language = SpokenLanguage.Chinese },
+            cancellationToken).ConfigureAwait(false);
 
     /// <summary>
     /// 接收 <see cref="ReadOnlyMemory{T}"/> 而不是 byte[]，调用方可以直接传入
     /// ArrayPool 租来的缓冲的一段，不必为每个音频快照单独分配精确长度的数组。
     /// </summary>
     public async Task<LocalTranscription> TranscribeIncomingSpeechAsync(ReadOnlyMemory<byte> pcm16Mono16Khz,
-        CancellationToken cancellationToken, bool preview = false)
+        TranscriptionRequest request, CancellationToken cancellationToken)
     {
-        var transcription = await TranscribeWithGateAsync(pcm16Mono16Khz, SpokenLanguage.Unknown, cancellationToken,
-            preview).ConfigureAwait(false);
+        var transcription = await TranscribeWithGateAsync(pcm16Mono16Khz,
+            request with { Language = SpokenLanguage.Unknown }, cancellationToken).ConfigureAwait(false);
         VoiceScreenLog.Info($"Incoming ASR language={transcription.Language} text={LogExcerpt(transcription.Text)}");
         return transcription;
     }
 
+    /// <summary>识别引擎是否天然按增量音频工作。</summary>
+    /// <remarks>
+    /// Sherpa 的 OnlineRecognizer 把解码状态留在服务端会话里，客户端每次只送新到的
+    /// 那几百毫秒；Whisper 无状态，只能每次重送整个滚动窗口，靠词级时间戳裁掉已确认
+    /// 的部分来控制窗口长度。两条路的音频送法完全相反，调用方必须能区分。
+    /// </remarks>
+    public bool UsesStreamingSessions => _asrEngine == "sherpa";
+
+    /// <summary>
+    /// 临时字幕用的束宽。临时结果注定会被下一次识别覆盖，为它跑四路束搜索是纯浪费；
+    /// 贪心解码在同一个 OPUS-MT 模型上通常快一倍以上，质量差异在最终定稿时会被修正。
+    /// </summary>
+    public const int PartialBeamSize = 1;
+
+    /// <summary>最终定稿用的束宽，保持一期的翻译质量。</summary>
+    public const int FinalBeamSize = 4;
+
     public async Task<LocalIncomingTranslation> TranslateIncomingTextAsync(string text, string detectedLanguage,
         CancellationToken cancellationToken)
+        => await TranslateIncomingTextAsync(text, detectedLanguage, FinalBeamSize, cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<LocalIncomingTranslation> TranslateIncomingTextAsync(string text, string detectedLanguage,
+        int beamSize, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(text))
             return new LocalIncomingTranslation(string.Empty, string.Empty, detectedLanguage);
@@ -89,7 +162,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             ? TranslationDirection.ThaiToChinese
             : TranslationDirection.EnglishToChinese;
 
-        var chinese = await TranslateThroughModelPairAsync(text.Trim(), direction, cancellationToken)
+        var chinese = await TranslateThroughModelPairAsync(text.Trim(), direction, beamSize, cancellationToken)
             .ConfigureAwait(false);
         if (TranscriptSanitizer.IsUnsafeTranslation(text, chinese))
         {
@@ -101,11 +174,15 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     }
 
     public async Task<string> TranslateChineseTextAsync(string chineseText, CancellationToken cancellationToken)
+        => await TranslateChineseTextAsync(chineseText, FinalBeamSize, cancellationToken).ConfigureAwait(false);
+
+    public async Task<string> TranslateChineseTextAsync(string chineseText, int beamSize,
+        CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(chineseText))
             throw new ArgumentException("请输入要测试的中文。", nameof(chineseText));
         return await TranslateThroughModelPairAsync(chineseText.Trim(), TranslationDirection.ChineseToEnglish,
-            cancellationToken).ConfigureAwait(false);
+            beamSize, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -114,11 +191,12 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     /// 数据驱动的，不再是散落在各调用点的 if 分支。
     /// </summary>
     private async Task<string> TranslateThroughModelPairAsync(string text, TranslationDirection direction,
-        CancellationToken cancellationToken)
+        int beamSize, CancellationToken cancellationToken)
     {
         var current = text;
         foreach (var modelPair in direction.ToModelPair())
-            current = await TranslateTextWithGateAsync(current, modelPair, cancellationToken).ConfigureAwait(false);
+            current = await TranslateTextWithGateAsync(current, modelPair, beamSize, cancellationToken)
+                .ConfigureAwait(false);
         return current;
     }
 
@@ -131,13 +209,13 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         return normalized.Length <= 120 ? normalized : normalized[..120] + "…";
     }
 
-    private async Task<LocalTranscription> TranscribeWithGateAsync(ReadOnlyMemory<byte> pcm16Mono16Khz, string language,
-        CancellationToken cancellationToken, bool preview = false)
+    private async Task<LocalTranscription> TranscribeWithGateAsync(ReadOnlyMemory<byte> pcm16Mono16Khz,
+        TranscriptionRequest request, CancellationToken cancellationToken)
     {
         await _speechGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await TranscribeAsync(pcm16Mono16Khz, language, cancellationToken, preview).ConfigureAwait(false);
+            return await TranscribeAsync(pcm16Mono16Khz, request, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -145,13 +223,13 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         }
     }
 
-    private async Task<string> TranslateTextWithGateAsync(string source, string modelPair,
+    private async Task<string> TranslateTextWithGateAsync(string source, string modelPair, int beamSize,
         CancellationToken cancellationToken)
     {
         await _translationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await TranslateTextAsync(source, modelPair, cancellationToken).ConfigureAwait(false);
+            return await TranslateTextAsync(source, modelPair, beamSize, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -159,23 +237,46 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         }
     }
 
-    private async Task<LocalTranscription> TranscribeAsync(ReadOnlyMemory<byte> pcm16Mono16Khz, string language,
-        CancellationToken cancellationToken, bool preview = false)
+    private async Task<LocalTranscription> TranscribeAsync(ReadOnlyMemory<byte> pcm16Mono16Khz,
+        TranscriptionRequest request, CancellationToken cancellationToken)
     {
-        var mode = preview ? "preview" : "final";
-        using var response = await PostAudioWithRetryAsync($"transcribe?language={language}&mode={mode}",
-            pcm16Mono16Khz, cancellationToken).ConfigureAwait(false);
+        using var response = await PostAudioWithRetryAsync(BuildTranscribePath(request), pcm16Mono16Khz,
+            cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException($"本地语音识别失败：{ReadError(body)}");
         var result = JsonSerializer.Deserialize<TranscriptionResponse>(body, JsonOptions);
-        return new LocalTranscription(result?.Text?.Trim() ?? string.Empty, result?.Language?.Trim() ?? string.Empty);
+        return new LocalTranscription(result?.Text?.Trim() ?? string.Empty, result?.Language?.Trim() ?? string.Empty,
+            ConvertWords(result?.Words));
     }
 
-    private async Task<string> TranslateTextAsync(string source, string modelPair,
+    private static string BuildTranscribePath(TranscriptionRequest request)
+    {
+        var path = $"transcribe?language={request.Language}&mode={(request.Preview ? "preview" : "final")}";
+        if (request.WantWords) path += "&words=1";
+        if (!string.IsNullOrEmpty(request.Session))
+        {
+            path += $"&session={Uri.EscapeDataString(request.Session)}";
+            if (request.ResetSession) path += "&reset=1";
+        }
+        return path;
+    }
+
+    /// <summary>词级时间戳用的是紧凑字段名，转换成 Core 里可测试的语义类型。</summary>
+    private static IReadOnlyList<TranscribedWord>? ConvertWords(IReadOnlyList<WordResponse>? words)
+    {
+        if (words is null || words.Count == 0) return null;
+        var converted = new TranscribedWord[words.Count];
+        for (var index = 0; index < words.Count; index++)
+            converted[index] = new TranscribedWord(words[index].T ?? string.Empty, words[index].S, words[index].E);
+        return converted;
+    }
+
+    private async Task<string> TranslateTextAsync(string source, string modelPair, int beamSize,
         CancellationToken cancellationToken)
     {
-        var requestJson = JsonSerializer.Serialize(new { text = source, direction = modelPair }, JsonOptions);
+        var requestJson = JsonSerializer.Serialize(
+            new { text = source, direction = modelPair, beamSize }, JsonOptions);
         using var translationResponse = await PostJsonWithRetryAsync("translate", requestJson, cancellationToken)
             .ConfigureAwait(false);
         var translationBody = await translationResponse.Content.ReadAsStringAsync(cancellationToken)
@@ -230,7 +331,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         if (await IsHealthyAsync(_asr, "health", cancellationToken).ConfigureAwait(false)) return;
         var script = Path.Combine(AppContext.BaseDirectory, "LocalService", "local_outgoing_service.py");
         if (!File.Exists(script)) throw new FileNotFoundException("缺少本地语音识别服务脚本。", script);
-        var arguments = $"\"{script}\" --port {ServicePort} --asr-engine {_asrEngine}";
+        var arguments = $"\"{script}\" --port {ServicePort} --asr-engine {_asrEngine} --asr-device {_asrDevice}";
         _asrProcess = StartHiddenProcess("python", arguments);
         _ownsAsr = true;
 
@@ -323,6 +424,14 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         _ => "whisper"
     };
 
+    /// <summary>auto 表示有 CUDA 就用；显卡忙或驱动不全时 Python 侧会自己退回 CPU。</summary>
+    private static string NormalizeAsrDevice(string asrDevice) => asrDevice?.Trim().ToLowerInvariant() switch
+    {
+        "cuda" or "gpu" => "cuda",
+        "cpu" => "cpu",
+        _ => "auto"
+    };
+
     /// <summary>ASR 和翻译两套模型都装载完成才算就绪，否则第一句话必然失败。</summary>
     private static async Task<bool> IsHealthyAsync(HttpClient client, string path,
         CancellationToken cancellationToken)
@@ -374,10 +483,30 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    private sealed record TranscriptionResponse(string Text, string Language);
+    private sealed record TranscriptionResponse(string Text, string Language, IReadOnlyList<WordResponse>? Words);
+
+    /// <summary>词级时间戳的紧凑传输格式：t=文本, s=起始秒, e=结束秒。</summary>
+    private sealed record WordResponse(string? T, double S, double E);
+
     private sealed record TranslationResponse(string Text);
+}
+
+/// <summary>一次识别请求的全部可选项。</summary>
+/// <param name="Language">送给模型的语种提示；<c>auto</c> 表示让模型自己判断。</param>
+/// <param name="Preview">true 走 base 临时模型，false 走 small 定稿模型。</param>
+/// <param name="WantWords">是否要词级时间戳。只有需要裁剪滚动窗口的临时快照才要。</param>
+/// <param name="Session">流式识别会话 id；仅 Sherpa 引擎有效，Whisper 会忽略。</param>
+/// <param name="ResetSession">true 表示丢弃同名旧会话，用于一句话的第一个快照。</param>
+public sealed record TranscriptionRequest
+{
+    public string Language { get; init; } = SpokenLanguage.Unknown;
+    public bool Preview { get; init; }
+    public bool WantWords { get; init; }
+    public string? Session { get; init; }
+    public bool ResetSession { get; init; }
 }
 
 public sealed record LocalOutgoingTranslation(string SourceText, string TranslatedText);
 public sealed record LocalIncomingTranslation(string SourceText, string TranslatedText, string Language);
-public sealed record LocalTranscription(string Text, string Language);
+public sealed record LocalTranscription(string Text, string Language,
+    IReadOnlyList<TranscribedWord>? Words = null);

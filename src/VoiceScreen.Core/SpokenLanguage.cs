@@ -24,6 +24,16 @@ public static class SpokenLanguage
         => text is not null && text.Any(character => character is >= '฀' and <= '๿');
 
     /// <summary>
+    /// 这个字符所属的书写系统是否不使用词间空格。拼接文本片段时用它决定要不要补空格：
+    /// 英文补，中文和泰文不补。
+    /// </summary>
+    public static bool IsIdeographic(char character)
+        => character is >= '㐀' and <= '鿿'   // CJK 统一表意文字
+            or >= '　' and <= '〿'            // CJK 标点
+            or >= '＀' and <= '￯'            // 全角字符
+            or >= '฀' and <= '๿';           // 泰文
+
+    /// <summary>
     /// 优先用文本字符判定，判不出来时才退回 ASR 报告的语种标签。
     /// </summary>
     public static string Detect(string? text, string? reportedLanguage)

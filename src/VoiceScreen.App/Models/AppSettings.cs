@@ -6,9 +6,24 @@ public sealed class AppSettings
     // CloudMode is retained only to migrate settings written by older releases.
     public bool CloudMode { get; set; }
     public string AsrEngine { get; set; } = "whisper";
+
+    /// <summary>
+    /// Whisper 推理设备：auto（有 CUDA 就用）、cuda 或 cpu。
+    /// GPU 上 small 只占约 0.5GB 显存，换来 5–10 倍的识别速度；显卡被游戏占满或
+    /// 驱动不全时本地服务会自己退回 CPU，不需要用户干预。
+    /// </summary>
+    public string AsrDevice { get; set; } = "auto";
+
     public bool UseApiTranslation { get; set; }
     public bool UseApiTts { get; set; }
     public bool LowLatencyIncoming { get; set; } = true;
+
+    /// <summary>
+    /// 按住右 Alt 期间，说完一个短句就抢先翻译并送进 Discord，不等松手。
+    /// 对方能提早一到三秒听到第一句，代价是已经播出的英文收不回来，
+    /// 所以默认关闭，由用户显式打开。
+    /// </summary>
+    public bool OutgoingClauseStreaming { get; set; }
     public string MicrophoneDeviceId { get; set; } = string.Empty;
     public string DiscordOutputDeviceId { get; set; } = string.Empty;
     public string CableRenderDeviceId { get; set; } = string.Empty;

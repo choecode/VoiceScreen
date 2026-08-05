@@ -40,6 +40,15 @@ public partial class OverlayWindow : Window
     {
         Dispatcher.Invoke(() =>
         {
+            // Incoming final subtitles replace the realtime preview. Keep both changes in
+            // one dispatcher turn so WPF cannot render the same utterance in preview and
+            // history at the same time between two separate UI updates.
+            if (string.Equals(kind, "remote", StringComparison.OrdinalIgnoreCase))
+            {
+                PreviewText.Text = string.Empty;
+                PreviewBorder.Visibility = Visibility.Collapsed;
+            }
+
             Lines.Add(new SubtitleLine { Kind = kind, Text = text });
             while (Lines.Count > _historyCapacity)
             {

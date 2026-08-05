@@ -51,9 +51,16 @@ MODEL_PAIRS = ("zh-en", "en-zh", "th-en")
 
 class State:
     asr_engine = "whisper"
+    asr_device = "cpu"
+    # 是否在喂给 ASR 前对 PCM 做谱减降噪。30 段 noisy LibriSpeech 评测显示
+    # noisereduce + faster-whisper-small 把 WER 从 5.22% 降到 4.56% (-0.66pp)；
+    # RNNoise / ffmpeg afftdn 在同一评测上无效。环境变量 VOICESCREEN_ASR_DENOISE
+    # 可以强制 0/1 覆盖，默认 1。
+    asr_denoise = os.environ.get("VOICESCREEN_ASR_DENOISE", "1") != "0"
     whisper = None
     whisper_preview = None
     sherpa = None
+    sherpa_streams = {}
     zh_en = None
     en_zh = None
     th_en = None
@@ -100,6 +107,37 @@ def read_sherpa_result(result):
     return str(getattr(result, "text", "") or "").strip()
 
 
+# noisereduce 是个 30KB 纯 Python 谱减法降噪库。导入失败时 graceful fallback，
+# 不影响 ASR 本身。
+try:
+    import noisereduce as _noisereduce
+    _NOISEREDUCE_AVAILABLE = True
+except Exception:
+    _noisereduce = None
+    _NOISEREDUCE_AVAILABLE = False
+
+
+def denoise_pcm(audio, sample_rate=SAMPLE_RATE):
+    """对一段 [-1, 1] 范围的 float32 音频做谱减降噪。
+
+    用前 0.5s 当噪声采样（要求段总长 > 0.5s）。prop_decrease=0.75 跟评测一致。
+    太短的段直接返回原音频——0.5s 都没有, 噪声估计不可信。
+    """
+    if not State.asr_denoise or not _NOISEREDUCE_AVAILABLE:
+        return audio
+    if audio is None or len(audio) < int(0.6 * sample_rate):
+        return audio
+    noise_clip = audio[: int(0.5 * sample_rate)]
+    try:
+        return _noisereduce.reduce_noise(
+            y=audio, sr=sample_rate, y_noise=noise_clip, prop_decrease=0.75,
+        )
+    except Exception as exc:
+        # 降噪失败不能影响 ASR 主流程
+        print(f"denoise_pcm skipped: {type(exc).__name__}: {exc}", flush=True)
+        return audio
+
+
 def detect_language(text):
     """按字符分布判定语种；和 C# 侧 SpokenLanguage.Detect 保持同一套区间。
 
@@ -119,6 +157,57 @@ def normalize_asr_engine(value):
     if value in {"sherpa", "sherpa-onnx", "zipformer"}:
         return "sherpa"
     return "whisper"
+
+
+def normalize_asr_device(value):
+    value = (value or "").strip().lower()
+    if value in {"cuda", "gpu"}:
+        return "cuda"
+    if value == "cpu":
+        return "cpu"
+    return "auto"
+
+
+def cuda_is_usable():
+    try:
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def collect_word_timestamps(segments):
+    words = []
+    for segment in segments:
+        for word in getattr(segment, "words", None) or ():
+            words.append({
+                "t": str(getattr(word, "word", "") or ""),
+                "s": round(float(getattr(word, "start", 0.0) or 0.0), 3),
+                "e": round(float(getattr(word, "end", 0.0) or 0.0), 3),
+            })
+    return words
+
+
+def acquire_sherpa_stream(session_id, reset=False):
+    if State.sherpa is None:
+        raise RuntimeError("Sherpa-ONNX ASR model is not loaded")
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return State.sherpa.create_stream()
+    if reset:
+        State.sherpa_streams.pop(session_id, None)
+    stream = State.sherpa_streams.get(session_id)
+    if stream is not None:
+        return stream
+    while len(State.sherpa_streams) >= 8:
+        State.sherpa_streams.pop(next(iter(State.sherpa_streams)))
+    stream = State.sherpa.create_stream()
+    State.sherpa_streams[session_id] = stream
+    return stream
+
+
+def release_sherpa_stream(session_id):
+    if session_id:
+        State.sherpa_streams.pop(str(session_id), None)
 
 
 def _pick_first_file(files, *, exact=None, suffix="", contains=""):
@@ -185,17 +274,33 @@ def initialize_sherpa_asr():
     )
 
 
-def initialize_whisper_asr():
+def initialize_whisper_asr(requested_device="auto"):
     from faster_whisper import WhisperModel
 
-    State.whisper = WhisperModel(
-        "small", device="cpu", compute_type="int8", cpu_threads=8, num_workers=1,
-        local_files_only=True,
-    )
-    State.whisper_preview = WhisperModel(
-        "base", device="cpu", compute_type="int8", cpu_threads=6, num_workers=1,
-        local_files_only=True,
-    )
+    requested_device = normalize_asr_device(requested_device)
+    selected_device = "cuda" if requested_device != "cpu" and cuda_is_usable() else "cpu"
+
+    def load(device):
+        compute_type = "int8_float16" if device == "cuda" else "int8"
+        final_model = WhisperModel(
+            "small", device=device, compute_type=compute_type, cpu_threads=8, num_workers=1,
+            local_files_only=True,
+        )
+        preview_model = WhisperModel(
+            "base", device=device, compute_type=compute_type, cpu_threads=6, num_workers=1,
+            local_files_only=True,
+        )
+        return final_model, preview_model
+
+    try:
+        State.whisper, State.whisper_preview = load(selected_device)
+    except Exception as exc:
+        if selected_device != "cuda":
+            raise
+        print(f"CUDA Whisper initialization failed; falling back to CPU: {exc}", flush=True)
+        State.whisper, State.whisper_preview = load("cpu")
+        selected_device = "cpu"
+    State.asr_device = selected_device
 
 
 def normalize_game_terms(text, direction):
@@ -453,6 +558,7 @@ def evaluate_online(text, direction, use_glossary=True, include_tts=False, voice
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "VoiceScreenLocalModels/2.0"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
         return
@@ -483,8 +589,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "ready",
                 "asr": "sherpa-onnx-zipformer" if State.sherpa else (
-                    "faster-whisper-base-preview+small-final-cpu-int8" if State.whisper else "disabled"
+                    f"faster-whisper-base-preview+small-final-{State.asr_device}" if State.whisper else "disabled"
                 ),
+                "asrDevice": State.asr_device,
+                "asrDenoise": State.asr_denoise and _NOISEREDUCE_AVAILABLE,
                 "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8"
                                if State.zh_en_tokenizer is not None else "disabled",
                 "localTts": "piper-tts" if local_tts_available() else "disabled",
@@ -587,8 +695,12 @@ class Handler(BaseHTTPRequestHandler):
 
         pcm = self.read_body(16 * 1024 * 1024)
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-        requested = parse_qs(parsed.query).get("language", ["auto"])[0]
-        preview_mode = parse_qs(parsed.query).get("mode", ["final"])[0] == "preview"
+        query = parse_qs(parsed.query)
+        requested = query.get("language", ["auto"])[0]
+        preview_mode = query.get("mode", ["final"])[0] == "preview"
+        want_words = query.get("words", ["0"])[0] == "1"
+        session_id = query.get("session", [""])[0]
+        reset_session = query.get("reset", ["0"])[0] == "1"
         if requested not in ("zh", "en", "auto"):
             raise ValueError("language must be zh, en, or auto")
         options = dict(
@@ -599,7 +711,8 @@ class Handler(BaseHTTPRequestHandler):
             # VAD again can discard clauses around normal pauses in a long sentence.
             vad_filter=False,
             condition_on_previous_text=False,
-            without_timestamps=True,
+            without_timestamps=not want_words,
+            word_timestamps=want_words,
         )
         if requested != "auto":
             options["language"] = requested
@@ -607,13 +720,16 @@ class Handler(BaseHTTPRequestHandler):
             if State.sherpa is None:
                 raise RuntimeError("Sherpa-ONNX ASR model is not loaded")
             with State.asr_lock:
-                stream = State.sherpa.create_stream()
+                stream = acquire_sherpa_stream(session_id, reset=reset_session)
                 stream.accept_waveform(SAMPLE_RATE, audio)
-                stream.accept_waveform(SAMPLE_RATE, np.zeros(int(0.66 * SAMPLE_RATE), dtype=np.float32))
-                stream.input_finished()
+                if not preview_mode:
+                    stream.accept_waveform(SAMPLE_RATE, np.zeros(int(0.66 * SAMPLE_RATE), dtype=np.float32))
+                    stream.input_finished()
                 while State.sherpa.is_ready(stream):
                     State.sherpa.decode_streams([stream])
                 result = State.sherpa.get_result(stream)
+                if not preview_mode:
+                    release_sherpa_stream(session_id)
             text = read_sherpa_result(result)
             # OnlineRecognizer 不报告语种，只能按字符分布判定。
             language = requested if requested != "auto" else detect_language(text)
@@ -622,22 +738,31 @@ class Handler(BaseHTTPRequestHandler):
 
         if State.whisper is None:
             raise RuntimeError("Whisper ASR model is not loaded")
+        audio = denoise_pcm(audio)
         # Whisper requests stay serialized. Translation uses separate model objects
         # and a separate lock, so incremental ASR and OPUS can run as a CPU pipeline.
         with State.asr_lock:
             model = State.whisper_preview if preview_mode else State.whisper
             segments, info = model.transcribe(audio, **options)
+            segments = list(segments)
             text = "".join(segment.text for segment in segments).strip()
-        self.send_json(200, {"text": text, "language": info.language})
+            words = collect_word_timestamps(segments) if want_words else None
+        response = {"text": text, "language": info.language}
+        if words is not None:
+            response["words"] = words
+        self.send_json(200, response)
 
     def translate(self):
         request = json.loads(self.read_body(64 * 1024).decode("utf-8"))
         text = str(request.get("text", "")).strip()
         direction = str(request.get("direction", ""))
+        beam_size = request.get("beamSize", 4)
         if not text or len(text) > 1000:
             raise ValueError("translation text is empty or too long")
+        if not isinstance(beam_size, int) or not 1 <= beam_size <= 8:
+            raise ValueError("beamSize must be an integer between 1 and 8")
         with State.translation_lock:
-            translated = translate_text(text, direction)
+            translated = translate_text(text, direction, beam_size=beam_size)
         self.send_json(200, {"text": translated})
 
     def online_tts(self):
@@ -734,6 +859,8 @@ def main():
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--asr-engine", type=str, default="whisper",
                         help="ASR backend: whisper (default), sherpa-onnx, or zipformer")
+    parser.add_argument("--asr-device", type=str, default="auto",
+                        help="Whisper device: auto (default), cuda/gpu, or cpu")
     parser.add_argument("--translation-only", action="store_true",
                         help="Load OPUS-MT only and serve the browser evaluation lab without the ASR pipeline")
     parser.add_argument("--model-root",
@@ -743,12 +870,13 @@ def main():
     if args.model_root:
         os.environ["VOICESCREEN_MODEL_ROOT"] = args.model_root
     State.asr_engine = normalize_asr_engine(args.asr_engine)
+    State.asr_device = "cpu"
 
     if not args.translation_only:
         if State.asr_engine == "sherpa":
             initialize_sherpa_asr()
         else:
-            initialize_whisper_asr()
+            initialize_whisper_asr(args.asr_device)
 
     # 翻译模型任何模式下都要加载：桌面端的健康检查要求 ASR 和翻译同时就绪，
     # 评估实验室本身也只需要这一组模型。

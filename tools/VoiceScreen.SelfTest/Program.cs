@@ -25,7 +25,8 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
     await local.StartAsync(CancellationToken.None);
 
     // 识别与翻译是两步，自检也照着真实链路走：先转写，再把文本送去翻译。
-    var heard = await local.TranscribeIncomingSpeechAsync(englishPcm, CancellationToken.None);
+    var heard = await local.TranscribeIncomingSpeechAsync(englishPcm, new TranscriptionRequest(),
+        CancellationToken.None);
     var direct = await local.TranslateIncomingTextAsync(heard.Text, heard.Language, CancellationToken.None);
     Console.WriteLine($"PASS：本地英译中直连，{direct.SourceText} → {direct.TranslatedText}");
     if (string.IsNullOrWhiteSpace(direct.SourceText) || string.IsNullOrWhiteSpace(direct.TranslatedText))

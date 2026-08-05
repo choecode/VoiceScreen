@@ -17,6 +17,7 @@ public sealed class TranslationEngine : IAsyncDisposable
     private LocalOutgoingService? _localOutgoing;
     private OnlineApiService? _remote;
     private IIncomingAudioProcessor? _incoming;
+    private OutgoingClauseStreamer? _clauseStreamer;
     private int _processingOutgoing;
 
     public TranslationEngine(AppSettings settings)
@@ -38,7 +39,7 @@ public sealed class TranslationEngine : IAsyncDisposable
         ValidateSettings();
         _router.Start(_settings.MicrophoneDeviceId, _settings.CableRenderDeviceId, _settings.MonitorRenderDeviceId);
         StatusChanged?.Invoke(this, $"正在加载本机 {AsrEngineDisplayName()} 与本地翻译备用模型……");
-        _localOutgoing = new LocalOutgoingService(asrEngine: _settings.AsrEngine);
+        _localOutgoing = new LocalOutgoingService(asrEngine: _settings.AsrEngine, asrDevice: _settings.AsrDevice);
         await _localOutgoing.StartAsync(cancellationToken).ConfigureAwait(false);
         _remote = new OnlineApiService(_settings.ApiEnglishVoice);
         if (_settings.UseApiTranslation || _settings.UseApiTts)
@@ -49,15 +50,19 @@ public sealed class TranslationEngine : IAsyncDisposable
         await _incoming.StartAsync(cancellationToken).ConfigureAwait(false);
         _discordCapture = CreateIncomingCapture();
         IsRunning = true;
-        VoiceScreenLog.Info($"TranslationEngine started. ASR=local translation={ProviderName(_settings.UseApiTranslation)} tts={ProviderName(_settings.UseApiTts)} lowLatency={_settings.LowLatencyIncoming}");
+        VoiceScreenLog.Info($"TranslationEngine started. ASR=local translation={ProviderName(_settings.UseApiTranslation)} tts={ProviderName(_settings.UseApiTts)} lowLatency={_settings.LowLatencyIncoming} clauseStreaming={_settings.OutgoingClauseStreaming}");
         StatusChanged?.Invoke(this,
             $"运行中 · ASR={AsrEngineDisplayName()} · 翻译={ProviderName(_settings.UseApiTranslation)} · TTS={ProviderName(_settings.UseApiTts)} · 只监听 Discord");
     }
 
     private string AsrEngineDisplayName()
-        => string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase)
-            ? "Sherpa-ONNX Zipformer"
-            : "Whisper";
+    {
+        if (string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase))
+            return "Sherpa-ONNX Zipformer";
+        // 请求的是 auto 时，显卡到底能不能用只有服务起来之后才知道，界面要显示真实结果。
+        var device = _localOutgoing?.ActiveAsrDevice;
+        return string.IsNullOrEmpty(device) ? "Whisper" : $"Whisper/{device.ToUpperInvariant()}";
+    }
 
     public void UpdateProviders(bool useApiTranslation, bool useApiTts)
     {
@@ -72,6 +77,7 @@ public sealed class TranslationEngine : IAsyncDisposable
         try
         {
             _router.BeginTranslationCapture();
+            StartClauseStreamingIfEnabled();
         }
         catch (Exception ex)
         {
@@ -82,12 +88,58 @@ public sealed class TranslationEngine : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 分句抢跑：按住键的过程中，说完一个短句就先翻译播出去，不等松手。
+    /// 只有用户显式打开才启用——已经播出的英文收不回来。
+    /// </summary>
+    private void StartClauseStreamingIfEnabled()
+    {
+        if (!_settings.OutgoingClauseStreaming || _localOutgoing is null) return;
+
+        // 这一句的翻译和 TTS 走哪条链路在开始时就冻结，和松手后的收尾保持一致；
+        // 中途在界面上切换 API/本地不会让同一句话前半段和后半段用不同的音色。
+        var useApiTranslation = _settings.UseApiTranslation;
+        var useApiTts = _settings.UseApiTts;
+        var streamer = new OutgoingClauseStreamer(
+            _localOutgoing,
+            _router.PeekTranslationCapture,
+            (chinese, token) => TranslateChineseSelectedAsync(chinese, useApiTranslation, token),
+            (english, token) => SynthesizeEnglishSelectedAsync(english, useApiTts, token),
+            audio => _router.EnqueueTts(audio, _settings.MonitorTranslatedSpeech));
+        streamer.ClauseSpoken += OnClauseSpoken;
+        _clauseStreamer = streamer;
+        streamer.Start();
+    }
+
+    private void OnClauseSpoken(object? sender, (string Chinese, string English) clause)
+    {
+        SubtitleProduced?.Invoke(this, ("mine", $"我说：{clause.Chinese}"));
+        SubtitleProduced?.Invoke(this, ("sent", $"已发送：{clause.English}"));
+        _echo.RememberSent(clause.English);
+    }
+
+    private Task<string> TranslateChineseSelectedAsync(string chinese, bool useApi, CancellationToken cancellationToken)
+        => useApi
+            ? (_remote ?? throw new InvalidOperationException("在线翻译尚未就绪。"))
+                .TranslateChineseAsync(chinese, cancellationToken)
+            : (_localOutgoing ?? throw new InvalidOperationException("本地翻译尚未就绪。"))
+                .TranslateChineseTextAsync(chinese, cancellationToken);
+
+    private Task<byte[]> SynthesizeEnglishSelectedAsync(string english, bool useApi,
+        CancellationToken cancellationToken)
+        => useApi
+            ? (_remote ?? throw new InvalidOperationException("Edge TTS 尚未就绪。"))
+                .SynthesizeEnglishAsync(english, cancellationToken)
+            : OfflineSpeech.SynthesizeEnglishAsync(english, cancellationToken, _settings.EnglishVoiceName);
+
     public async Task EndLocalCaptureAsync()
     {
         if (!IsRunning || Interlocked.Exchange(ref _processingOutgoing, 1) != 0) return;
         var stage = "准备";
+        var streamer = Interlocked.Exchange(ref _clauseStreamer, null);
         try
         {
+            if (streamer is not null) await streamer.StopAsync().ConfigureAwait(false);
             if (!_state.TryBeginTranslation()) return;
             var captured = _router.EndTranslationCapture();
             if (captured.Duration < TimeSpan.FromMilliseconds(250) || captured.Data.Length == 0)
@@ -111,11 +163,27 @@ public sealed class TranslationEngine : IAsyncDisposable
             var transcription = await local.TranscribeChineseSpeechAsync(pcm, translationToken).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(transcription.Text))
                 throw new InvalidOperationException("本机中文识别没有听清，请再说一次。");
+
+            // 抢跑已经播出去的短句不能再播一遍。整句识别用的是定稿模型，和抢跑时的
+            // 临时结果字数未必一致，所以按内容对齐后再切，不按字数硬切。
+            var spokenPrefix = streamer?.SpokenPrefix ?? string.Empty;
+            var alreadySpoken = spokenPrefix.Length;
+            var pendingChinese = alreadySpoken > 0
+                ? ClauseSegmenter.RemainderAfterSpoken(transcription.Text, spokenPrefix)
+                : transcription.Text;
+            if (string.IsNullOrWhiteSpace(pendingChinese))
+            {
+                // 整句都已经抢跑发完了，只要等队列播完即可。
+                translationTimer.Stop();
+                await FinishStreamedPlaybackAsync().ConfigureAwait(false);
+                return;
+            }
+
             var english = useApiTranslation
                 ? await (_remote ?? throw new InvalidOperationException("在线翻译尚未就绪。"))
-                    .TranslateChineseAsync(transcription.Text, translationToken).ConfigureAwait(false)
-                : await local.TranslateChineseTextAsync(transcription.Text, translationToken).ConfigureAwait(false);
-            translation = new LocalOutgoingTranslation(transcription.Text, english);
+                    .TranslateChineseAsync(pendingChinese, translationToken).ConfigureAwait(false)
+                : await local.TranslateChineseTextAsync(pendingChinese, translationToken).ConfigureAwait(false);
+            translation = new LocalOutgoingTranslation(pendingChinese, english);
             translationTimer.Stop();
             VoiceScreenLog.Info($"Outgoing ASR+translation completed in {translationTimer.ElapsedMilliseconds}ms");
 
@@ -137,7 +205,19 @@ public sealed class TranslationEngine : IAsyncDisposable
                     .SynthesizeEnglishAsync(translation.TranslatedText, playbackToken).ConfigureAwait(false)
                 : await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, playbackToken,
                     _settings.EnglishVoiceName).ConfigureAwait(false);
-            await _router.PlayTtsAsync(tts, playbackToken, _settings.MonitorTranslatedSpeech).ConfigureAwait(false);
+            if (alreadySpoken > 0)
+            {
+                // 抢跑的短句可能还在播。这里必须追加而不是替换，否则会把还没播完的
+                // 前半句直接掐掉，对方听到的就是一句被砍断的话。
+                _router.EnqueueTts(tts, _settings.MonitorTranslatedSpeech);
+                await _router.WaitForTtsDrainAsync(sendToCable: true,
+                    playOnMonitor: _settings.MonitorTranslatedSpeech, playbackToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await _router.PlayTtsAsync(tts, playbackToken, _settings.MonitorTranslatedSpeech)
+                    .ConfigureAwait(false);
+            }
             _state.TryBeginCooldown();
             await Task.Delay(500, playbackToken).ConfigureAwait(false);
             playbackTimer.Stop();
@@ -158,11 +238,30 @@ public sealed class TranslationEngine : IAsyncDisposable
         }
         finally
         {
+            if (streamer is not null)
+            {
+                streamer.ClauseSpoken -= OnClauseSpoken;
+                await streamer.DisposeAsync().ConfigureAwait(false);
+            }
             _router.RestorePassThrough();
             _state.Complete();
             Interlocked.Exchange(ref _processingOutgoing, 0);
             StatusChanged?.Invoke(this, "原声麦克风已恢复");
         }
+    }
+
+    /// <summary>
+    /// 整句都被抢跑发完时的收尾：没有新的语音要合成，只要等队列里已经排好的那几段播完，
+    /// 再把麦克风还回去。提前恢复原声会让最后一段英文被自己的说话声盖住。
+    /// </summary>
+    private async Task FinishStreamedPlaybackAsync()
+    {
+        if (!_state.TryBeginTts()) return;
+        using var playbackTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        playbackTimeout.CancelAfter(TimeSpan.FromSeconds(60));
+        await _router.WaitForTtsDrainAsync(sendToCable: true,
+            playOnMonitor: _settings.MonitorTranslatedSpeech, playbackTimeout.Token).ConfigureAwait(false);
+        _state.TryBeginCooldown();
     }
 
     public async Task TranslateAndPreviewAsync(string chineseText, CancellationToken cancellationToken)
@@ -323,13 +422,17 @@ public sealed class TranslationEngine : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// <paramref name="beamSize"/> 只对本地 OPUS-MT 有意义：临时字幕用贪心解码，
+    /// 最终定稿才用束搜索。MyMemory 没有这个旋钮，走 API 时忽略。
+    /// </summary>
     private Task<LocalIncomingTranslation> TranslateIncomingSelectedAsync(string text, string language,
-        CancellationToken cancellationToken)
+        int beamSize, CancellationToken cancellationToken)
         => _settings.UseApiTranslation
             ? (_remote ?? throw new InvalidOperationException("在线翻译尚未就绪。"))
                 .TranslateIncomingAsync(text, language, cancellationToken)
             : (_localOutgoing ?? throw new InvalidOperationException("本地翻译尚未就绪。"))
-                .TranslateIncomingTextAsync(text, language, cancellationToken);
+                .TranslateIncomingTextAsync(text, language, beamSize, cancellationToken);
 
     private static string ProviderName(bool online) => online ? "API" : "本地";
 
@@ -348,6 +451,13 @@ public sealed class TranslationEngine : IAsyncDisposable
         IsRunning = false;
         VoiceScreenLog.Info("TranslationEngine dispose: cancelling lifetime token");
         _lifetime.Cancel();
+        var streamer = Interlocked.Exchange(ref _clauseStreamer, null);
+        if (streamer is not null)
+        {
+            streamer.ClauseSpoken -= OnClauseSpoken;
+            try { await streamer.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { VoiceScreenLog.Warn($"clause streamer dispose error: {ex.Message}"); }
+        }
         _router.RestorePassThrough();
         _router.Dispose();
         if (_discordCapture is not null)

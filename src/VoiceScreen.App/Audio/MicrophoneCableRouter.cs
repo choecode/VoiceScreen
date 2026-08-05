@@ -106,6 +106,21 @@ public sealed class MicrophoneCableRouter : IDisposable
         }
     }
 
+    /// <summary>
+    /// 取一份「到目前为止录到的中文」的副本，不结束录音。分句抢跑靠它在用户还按着
+    /// 右 Alt 的时候就开始识别；正式的 <see cref="EndTranslationCapture"/> 依旧拿到完整录音。
+    /// </summary>
+    public CapturedAudio? PeekTranslationCapture()
+    {
+        if (_capture is null) return null;
+        lock (_recordingGate)
+        {
+            if (_recording is null) return null;
+            return new CapturedAudio(_recording.ToArray(), _capture.WaveFormat,
+                DateTimeOffset.UtcNow - _recordingStarted);
+        }
+    }
+
     public CapturedAudio EndTranslationCapture()
     {
         if (_capture is null) throw new InvalidOperationException("音频路由尚未启动。");
@@ -131,39 +146,66 @@ public sealed class MicrophoneCableRouter : IDisposable
 
     public async Task PlayTtsAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken,
         bool playOnMonitor = true)
-        => await PlayTtsInternalAsync(pcm16Mono16Khz, sendToCable: true,
-            playOnMonitor: playOnMonitor && _monitorTtsBuffer is not null, cancellationToken).ConfigureAwait(false);
+    {
+        var monitor = playOnMonitor && _monitorTtsBuffer is not null;
+        EnqueueTts(pcm16Mono16Khz, sendToCable: true, playOnMonitor: monitor, replaceQueued: true);
+        await WaitForTtsDrainAsync(sendToCable: true, playOnMonitor: monitor, cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     public async Task PlayMonitorTtsAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
     {
         if (_monitorTtsBuffer is null) throw new InvalidOperationException("没有配置英文试听耳机。");
-        await PlayTtsInternalAsync(pcm16Mono16Khz, sendToCable: false, playOnMonitor: true, cancellationToken)
-            .ConfigureAwait(false);
+        EnqueueTts(pcm16Mono16Khz, sendToCable: false, playOnMonitor: true, replaceQueued: true);
+        await WaitForTtsDrainAsync(sendToCable: false, playOnMonitor: true, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task PlayTtsInternalAsync(byte[] pcm16Mono16Khz, bool sendToCable, bool playOnMonitor,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// 把一段英文语音接在当前播放队列后面，不清空已排队的内容，也不等待播放完成。
+    ///
+    /// 分句抢跑要的就是这个：第一段英文一合成好就入队开始播，第二段还在合成。
+    /// 段与段之间只补一小段静音，听起来是自然的句间停顿而不是断句。
+    /// </summary>
+    public void EnqueueTts(byte[] pcm16Mono16Khz, bool playOnMonitor)
+        => EnqueueTts(pcm16Mono16Khz, sendToCable: true,
+            playOnMonitor: playOnMonitor && _monitorTtsBuffer is not null, replaceQueued: false);
+
+    /// <summary>队列里还有没有没播完的英文语音。</summary>
+    public bool HasPendingTts
+        => (_ttsBuffer?.BufferedBytes ?? 0) > 0 || (_monitorTtsBuffer?.BufferedBytes ?? 0) > 0;
+
+    private void EnqueueTts(byte[] pcm16Mono16Khz, bool sendToCable, bool playOnMonitor, bool replaceQueued)
     {
         if (_ttsBuffer is null) throw new InvalidOperationException("音频路由尚未启动。");
-        if (sendToCable)
-        {
-            _ttsBuffer.ClearBuffer();
-            _ttsBuffer.AddSamples(pcm16Mono16Khz, 0, pcm16Mono16Khz.Length);
-        }
-        if (playOnMonitor && _monitorTtsBuffer is not null)
-        {
-            _monitorTtsBuffer.ClearBuffer();
-            _monitorTtsBuffer.AddSamples(pcm16Mono16Khz, 0, pcm16Mono16Khz.Length);
-        }
 
         // Discord 的语音活动检测和 VB-CABLE/WASAPI 都存在尾部缓冲。
         // 在句尾追加静音，确保最后一个单词完整穿过设备缓冲后再恢复原始麦克风。
         var trailingSilence = new byte[Pcm16Mono16KhzBytesPerSecond * TtsTrailingSilenceMilliseconds / 1000];
-        if (sendToCable) _ttsBuffer.AddSamples(trailingSilence, 0, trailingSilence.Length);
-        if (playOnMonitor) _monitorTtsBuffer?.AddSamples(trailingSilence, 0, trailingSilence.Length);
+        if (sendToCable)
+        {
+            if (replaceQueued) _ttsBuffer.ClearBuffer();
+            _ttsBuffer.AddSamples(pcm16Mono16Khz, 0, pcm16Mono16Khz.Length);
+            _ttsBuffer.AddSamples(trailingSilence, 0, trailingSilence.Length);
+        }
+        if (playOnMonitor && _monitorTtsBuffer is not null)
+        {
+            if (replaceQueued) _monitorTtsBuffer.ClearBuffer();
+            _monitorTtsBuffer.AddSamples(pcm16Mono16Khz, 0, pcm16Mono16Khz.Length);
+            _monitorTtsBuffer.AddSamples(trailingSilence, 0, trailingSilence.Length);
+        }
+    }
 
-        var expected = TimeSpan.FromSeconds(
-            (double)(pcm16Mono16Khz.Length + trailingSilence.Length) / Pcm16Mono16KhzBytesPerSecond);
+    /// <summary>等到队列里的英文语音全部送进声卡为止。</summary>
+    public async Task WaitForTtsDrainAsync(bool sendToCable, bool playOnMonitor,
+        CancellationToken cancellationToken)
+    {
+        if (_ttsBuffer is null) throw new InvalidOperationException("音频路由尚未启动。");
+
+        // 超时按队列里实际剩余的时长算：分句抢跑时排队的可能是好几段，
+        // 按单段长度估算会在最后一段还没播完时就把麦克风放回来。
+        var queued = Math.Max(sendToCable ? _ttsBuffer.BufferedBytes : 0,
+            playOnMonitor && _monitorTtsBuffer is not null ? _monitorTtsBuffer.BufferedBytes : 0);
+        var expected = TimeSpan.FromSeconds((double)queued / Pcm16Mono16KhzBytesPerSecond);
         var deadline = DateTimeOffset.UtcNow + expected + TimeSpan.FromSeconds(2);
         while (((sendToCable && _ttsBuffer.BufferedBytes > 0)
                 || (playOnMonitor && _monitorTtsBuffer is not null && _monitorTtsBuffer.BufferedBytes > 0))

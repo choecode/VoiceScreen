@@ -75,9 +75,11 @@ public partial class MainWindow : Window
             _settings.UseApiTts = true;
         }
         AsrProviderCombo.SelectedIndex = string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        AsrDeviceCombo.SelectedIndex = AsrDeviceIndex(_settings.AsrDevice);
         TranslationProviderCombo.SelectedIndex = _settings.UseApiTranslation ? 1 : 0;
         TtsProviderCombo.SelectedIndex = _settings.UseApiTts ? 1 : 0;
         LowLatencyIncomingCheckBox.IsChecked = _settings.LowLatencyIncoming;
+        OutgoingClauseStreamingCheckBox.IsChecked = _settings.OutgoingClauseStreaming;
         MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
         SubtitleFontSizeSlider.Value = Math.Clamp(_settings.SubtitleFontSize, 14, 42);
         UseProcessLoopbackCheckBox.IsChecked = true;
@@ -148,9 +150,11 @@ public partial class MainWindow : Window
             DemoMode = false,
             CloudMode = false,
             AsrEngine = AsrProviderFromSelection(),
+            AsrDevice = AsrDeviceFromSelection(),
             UseApiTranslation = TranslationProviderCombo.SelectedIndex == 1,
             UseApiTts = TtsProviderCombo.SelectedIndex == 1,
             LowLatencyIncoming = LowLatencyIncomingCheckBox.IsChecked == true,
+            OutgoingClauseStreaming = OutgoingClauseStreamingCheckBox.IsChecked == true,
             UseProcessLoopback = true,
             MicrophoneDeviceId = (MicrophoneCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             DiscordOutputDeviceId = (DiscordOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
@@ -255,6 +259,7 @@ public partial class MainWindow : Window
         if (!IsLoaded || AsrProviderCombo.SelectedIndex < 0
             || TranslationProviderCombo.SelectedIndex < 0 || TtsProviderCombo.SelectedIndex < 0) return;
         _settings.AsrEngine = AsrProviderFromSelection();
+        _settings.AsrDevice = AsrDeviceFromSelection();
         _settings.UseApiTranslation = TranslationProviderCombo.SelectedIndex == 1;
         _settings.UseApiTts = TtsProviderCombo.SelectedIndex == 1;
         _settings.CloudMode = false;
@@ -270,6 +275,38 @@ public partial class MainWindow : Window
         var selected = AsrProviderCombo.SelectedItem as ComboBoxItem;
         var tag = selected?.Tag?.ToString()?.Trim().ToLowerInvariant();
         return tag == "sherpa" ? "sherpa" : "whisper";
+    }
+
+    private string AsrDeviceFromSelection()
+    {
+        var selected = AsrDeviceCombo.SelectedItem as ComboBoxItem;
+        return (selected?.Tag?.ToString()?.Trim().ToLowerInvariant()) switch
+        {
+            "cuda" => "cuda",
+            "cpu" => "cpu",
+            _ => "auto"
+        };
+    }
+
+    private static int AsrDeviceIndex(string? device) => device?.Trim().ToLowerInvariant() switch
+    {
+        "cuda" => 1,
+        "cpu" => 2,
+        _ => 0
+    };
+
+    /// <summary>
+    /// 抢跑开关下一次按住右 Alt 就生效：引擎持有的是同一个设置对象，读取发生在
+    /// <c>BeginLocalCapture</c>，所以不需要重启会话。
+    /// </summary>
+    private void OutgoingClauseStreamingCheckBox_Click(object sender, RoutedEventArgs e)
+    {
+        _settings.OutgoingClauseStreaming = OutgoingClauseStreamingCheckBox.IsChecked == true;
+        _settingsStore.Save(_settings);
+        if (_engine is not null)
+            StatusText.Text = _settings.OutgoingClauseStreaming
+                ? "分句抢跑已开启：说完一个短句就会立即发送，已播出的部分无法撤回。"
+                : "分句抢跑已关闭：恢复为松手后整句发送。";
     }
 
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();

@@ -330,6 +330,7 @@
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
                         <TextBlock Grid.Row="0" Text="语音识别" Style="{StaticResource SectionLabel}" />
@@ -338,19 +339,26 @@
                             <ComboBoxItem Content="本地 Sherpa-ONNX Zipformer" Tag="sherpa" />
                         </ComboBox>
 
-                        <TextBlock Grid.Row="1" Text="翻译引擎" Style="{StaticResource SectionLabel}" />
-                        <ComboBox x:Name="TranslationProviderCombo" Grid.Row="1" Grid.Column="1" Margin="0 2 0 6" SelectionChanged="ProviderCombo_SelectionChanged">
+                        <TextBlock Grid.Row="1" Text="推理设备" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="AsrDeviceCombo" Grid.Row="1" Grid.Column="1" Margin="0 2 0 6" SelectionChanged="ProviderCombo_SelectionChanged">
+                            <ComboBoxItem Content="自动（有显卡就用 GPU）" Tag="auto" />
+                            <ComboBoxItem Content="强制 GPU（CUDA int8_float16）" Tag="cuda" />
+                            <ComboBoxItem Content="强制 CPU（INT8）" Tag="cpu" />
+                        </ComboBox>
+
+                        <TextBlock Grid.Row="2" Text="翻译引擎" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="TranslationProviderCombo" Grid.Row="2" Grid.Column="1" Margin="0 2 0 6" SelectionChanged="ProviderCombo_SelectionChanged">
                             <ComboBoxItem Content="本地 OPUS-MT（CPU INT8）" Tag="local" />
                             <ComboBoxItem Content="云端 MyMemory" Tag="api" />
                         </ComboBox>
 
-                        <TextBlock Grid.Row="2" Text="语音合成" Style="{StaticResource SectionLabel}" />
-                        <ComboBox x:Name="TtsProviderCombo" Grid.Row="2" Grid.Column="1" Margin="0 2 0 0" SelectionChanged="ProviderCombo_SelectionChanged">
+                        <TextBlock Grid.Row="3" Text="语音合成" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="TtsProviderCombo" Grid.Row="3" Grid.Column="1" Margin="0 2 0 0" SelectionChanged="ProviderCombo_SelectionChanged">
                             <ComboBoxItem Content="本地 Windows 语音" Tag="local" />
                             <ComboBoxItem Content="云端 Edge TTS" Tag="api" />
                         </ComboBox>
                     </Grid>
-                    <TextBlock Text="三个模块可独立配置与切换。"
+                    <TextBlock Text="三个模块可独立配置与切换。GPU 不可用时自动退回 CPU。"
                                Style="{StaticResource HintText}" />
                     <CheckBox x:Name="LowLatencyIncomingCheckBox"
                               IsChecked="True"
@@ -358,6 +366,14 @@
                               Margin="0,6,0,0"
                               VerticalContentAlignment="Top">
                         <TextBlock Text="启用低延迟模式（立即开始处理，略微牺牲流畅度）"
+                                   TextWrapping="Wrap" />
+                    </CheckBox>
+                    <CheckBox x:Name="OutgoingClauseStreamingCheckBox"
+                              Click="OutgoingClauseStreamingCheckBox_Click"
+                              Foreground="{StaticResource AccentBrush}"
+                              Margin="0,6,0,0"
+                              VerticalContentAlignment="Top">
+                        <TextBlock Text="松手前抢先发送已说完的短句（对方更早听到，但已播出的部分无法撤回）"
                                    TextWrapping="Wrap" />
                     </CheckBox>
                 </StackPanel>
