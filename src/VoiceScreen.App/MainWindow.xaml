@@ -1,158 +1,593 @@
 <Window x:Class="VoiceScreen.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="VoiceScreen · Discord 双向翻译" Width="920" Height="820" MinWidth="840" MinHeight="700"
-        WindowStartupLocation="CenterScreen" Background="#0D1117" Foreground="#E6EDF3">
-    <ScrollViewer VerticalScrollBarVisibility="Auto">
-        <Grid Margin="28">
+        Title="VoiceScreen – 实时字幕翻译"
+        Width="1080"
+        Height="900"
+        MinWidth="920"
+        MinHeight="760"
+        WindowStartupLocation="CenterScreen"
+        Background="#060b16"
+        Foreground="#EAF0FF"
+        WindowState="Normal"
+        ResizeMode="CanResize"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType"
+        UseLayoutRounding="True">
+    <Window.Resources>
+        <SolidColorBrush x:Key="BgBrush" Color="#060b16" />
+        <SolidColorBrush x:Key="SurfaceBrush" Color="#111a30" />
+        <SolidColorBrush x:Key="SurfaceSoftBrush" Color="#0d1528" />
+        <SolidColorBrush x:Key="PanelBorderBrush" Color="#253868" />
+        <SolidColorBrush x:Key="TextBrush" Color="#eaf0ff" />
+        <SolidColorBrush x:Key="MutedBrush" Color="#9fb0cc" />
+        <SolidColorBrush x:Key="PrimaryBrush" Color="#4fd1f4" />
+        <SolidColorBrush x:Key="AccentBrush" Color="#9ef3c4" />
+        <SolidColorBrush x:Key="WarnBrush" Color="#ffd166" />
+        <SolidColorBrush x:Key="ComboBgBrush" Color="#0d1528" />
+        <SolidColorBrush x:Key="ComboHoverBrush" Color="#1a2647" />
+        <SolidColorBrush x:Key="ComboSelBrush" Color="#21315a" />
+
+        <Style x:Key="SurfaceCard" TargetType="Border">
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="12" />
+            <Setter Property="Padding" Value="14" />
+            <Setter Property="SnapsToDevicePixels" Value="True" />
+            <Setter Property="Effect">
+                <Setter.Value>
+                    <DropShadowEffect BlurRadius="14" ShadowDepth="2" Opacity="0.22" />
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="TitleText" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#cdd7ee" />
+            <Setter Property="FontSize" Value="15" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Margin" Value="0 0 0 8" />
+        </Style>
+
+        <Style x:Key="SectionLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#c6d2e7" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+
+        <Style x:Key="HintText" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="Margin" Value="0,4,0,0" />
+        </Style>
+
+        <Style TargetType="TextBox">
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="Background" Value="{StaticResource SurfaceSoftBrush}" />
+            <Setter Property="CaretBrush" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="BorderBrush" Value="#334169" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="8,5" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Height" Value="30" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+
+        <!-- 完整自定义 ComboBox:深色显示框 + 深色弹出下拉 -->
+        <Style TargetType="ComboBox">
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="Background" Value="{StaticResource ComboBgBrush}" />
+            <Setter Property="BorderBrush" Value="#334169" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Height" Value="30" />
+            <Setter Property="MinWidth" Value="160" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="HorizontalContentAlignment" Value="Left" />
+            <Setter Property="Padding" Value="8,0,28,0" />
+            <Setter Property="SnapsToDevicePixels" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <Border x:Name="Bd"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="6">
+                                <Grid>
+                                    <ContentPresenter x:Name="ContentSite"
+                                                      IsHitTestVisible="False"
+                                                      Content="{TemplateBinding SelectionBoxItem}"
+                                                      ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                                      ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                                                      Margin="{TemplateBinding Padding}"
+                                                      VerticalAlignment="Center"
+                                                      HorizontalAlignment="Stretch"
+                                                      RecognizesAccessKey="True" />
+                                    <ToggleButton x:Name="DropDownToggle"
+                                                  IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                                  Background="Transparent"
+                                                  BorderThickness="0"
+                                                  Focusable="False"
+                                                  ClickMode="Press"
+                                                  HorizontalAlignment="Right"
+                                                  Width="26"
+                                                  Cursor="Hand">
+                                        <ToggleButton.Template>
+                                            <ControlTemplate TargetType="ToggleButton">
+                                                <Border Background="Transparent">
+                                                    <Path x:Name="Arrow"
+                                                          Data="M0,0 L6,6 L12,0"
+                                                          Stroke="#9fb0cc"
+                                                          StrokeThickness="1.5"
+                                                          HorizontalAlignment="Center"
+                                                          VerticalAlignment="Center" />
+                                                </Border>
+                                            </ControlTemplate>
+                                        </ToggleButton.Template>
+                                    </ToggleButton>
+                                </Grid>
+                            </Border>
+                            <Popup x:Name="PART_Popup"
+                                   AllowsTransparency="True"
+                                   Focusable="False"
+                                   StaysOpen="False"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   Placement="Bottom"
+                                   PopupAnimation="Fade">
+                                <Border x:Name="DropDownBorder"
+                                        Background="{StaticResource ComboBgBrush}"
+                                        BorderBrush="#334169"
+                                        BorderThickness="1"
+                                        CornerRadius="6"
+                                        Margin="0,2,0,0"
+                                        MinWidth="{TemplateBinding ActualWidth}"
+                                        MaxHeight="240">
+                                    <ScrollViewer VerticalScrollBarVisibility="Auto" CanContentScroll="True">
+                                        <ItemsPresenter />
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#4a6cb0" />
+                            </Trigger>
+                            <Trigger Property="IsDropDownOpen" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                            </Trigger>
+                            <Trigger Property="HasItems" Value="False">
+                                <Setter TargetName="DropDownBorder" Property="MinHeight" Value="40" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Height" Value="30" />
+            <Setter Property="Padding" Value="8,0" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="OverridesDefaultStyle" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}"
+                                CornerRadius="4"
+                                Margin="2">
+                            <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Left" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource ComboHoverBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource ComboSelBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#7f93b4" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="FontSize" Value="12" />
+        </Style>
+
+        <Style x:Key="PrimaryButton" TargetType="Button">
+            <Setter Property="Foreground" Value="#061224" />
+            <Setter Property="Background" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="BorderBrush" Value="#3f7cff" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="MinWidth" Value="76" />
+            <Setter Property="Padding" Value="12,4" />
+            <Setter Property="Margin" Value="0,0,6,0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" CornerRadius="8" BorderThickness="{TemplateBinding BorderThickness}"
+                                BorderBrush="{TemplateBinding BorderBrush}" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#6ce4ff" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#33c2e0" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Background" Value="#203a50" />
+                                <Setter Property="Foreground" Value="#7f93b4" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="GhostButton" TargetType="Button">
+            <Setter Property="Foreground" Value="#dce7f9" />
+            <Setter Property="Background" Value="{StaticResource SurfaceSoftBrush}" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="BorderBrush" Value="#324167" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="MinWidth" Value="76" />
+            <Setter Property="Padding" Value="12,4" />
+            <Setter Property="Margin" Value="0,0,6,0" />
+            <Setter Property="Cursor" Value="Hand" />
+        </Style>
+
+        <Style x:Key="DangerButton" TargetType="Button">
+            <Setter Property="Foreground" Value="#ffd7df" />
+            <Setter Property="Background" Value="#20152a" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="BorderBrush" Value="#5b2f4a" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="MinWidth" Value="76" />
+            <Setter Property="Padding" Value="12,4" />
+            <Setter Property="Margin" Value="0,0,6,0" />
+            <Setter Property="Cursor" Value="Hand" />
+        </Style>
+    </Window.Resources>
+
+    <Grid Background="{StaticResource BgBrush}" Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- 顶部标题 -->
+        <Border Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource SurfaceCard}" Padding="14,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel>
+                    <TextBlock Text="VoiceScreen · 实时字幕翻译" FontSize="20" FontWeight="Bold" Margin="0,0,0,2" />
+                    <TextBlock Text="Discord / TeamSpeak 实时翻译工作台 · 本地优先架构"
+                               Foreground="{StaticResource MutedBrush}" FontSize="11" TextWrapping="Wrap" />
+                </StackPanel>
+                <Border Grid.Column="1"
+                        VerticalAlignment="Center"
+                        Background="{StaticResource SurfaceSoftBrush}"
+                        BorderBrush="{StaticResource PanelBorderBrush}"
+                        BorderThickness="1"
+                        Padding="10,5"
+                        CornerRadius="999">
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                        <Ellipse Width="8" Height="8" Fill="{StaticResource WarnBrush}" Margin="0,0,6,0" />
+                        <TextBlock x:Name="StatusBadgeText" Text="就绪" Foreground="{StaticResource MutedBrush}" FontSize="11" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Border>
+
+        <!-- 中间：2×2 卡片网格（跨两列） -->
+        <Grid Grid.Row="1" Grid.ColumnSpan="2" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
             <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <StackPanel>
-                <TextBlock Text="VoiceScreen" FontSize="34" FontWeight="Bold" />
-                <TextBlock Text="Discord 英语/泰语 → 中文字幕 · 按住右 Alt：中文 → 英语语音" Foreground="#8B949E" FontSize="15" Margin="0,6,0,0" />
-            </StackPanel>
-
-            <Border Grid.Row="1" Background="#161B22" BorderBrush="#30363D" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,22,0,0">
+            <!-- Row 0：管线配置 + 音频路由 -->
+            <Border Grid.Row="0" Grid.Column="0" Style="{StaticResource SurfaceCard}" Margin="0,0,6,10">
                 <StackPanel>
-                    <TextBlock Text="处理引擎（三个节点可独立切换）" FontSize="18" FontWeight="SemiBold" />
-                    <Grid Margin="0,10,0,0">
-                        <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                        <TextBlock Text="语音识别 ASR" VerticalAlignment="Center" />
-                        <ComboBox x:Name="AsrProviderCombo" Grid.Column="1" Margin="0,4" SelectionChanged="ProviderCombo_SelectionChanged">
-                            <ComboBoxItem Content="本地 Whisper（推荐）" Tag="local" />
+                    <TextBlock Text="管线配置" Style="{StaticResource TitleText}" />
+                    <Grid Margin="0,4,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="92" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Text="语音识别" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="AsrProviderCombo" Grid.Row="0" Grid.Column="1" Margin="0 2 0 6" SelectionChanged="ProviderCombo_SelectionChanged">
+                            <ComboBoxItem Content="本地 Whisper" Tag="whisper" />
+                            <ComboBoxItem Content="本地 Sherpa-ONNX Zipformer" Tag="sherpa" />
                         </ComboBox>
-                        <TextBlock Grid.Row="1" Text="文本翻译" VerticalAlignment="Center" />
-                        <ComboBox x:Name="TranslationProviderCombo" Grid.Row="1" Grid.Column="1" Margin="0,4" SelectionChanged="ProviderCombo_SelectionChanged">
-                            <ComboBoxItem Content="本地 OPUS-MT（离线）" Tag="local" />
-                            <ComboBoxItem Content="API · MyMemory（联网）" Tag="api" />
+
+                        <TextBlock Grid.Row="1" Text="翻译引擎" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="TranslationProviderCombo" Grid.Row="1" Grid.Column="1" Margin="0 2 0 6" SelectionChanged="ProviderCombo_SelectionChanged">
+                            <ComboBoxItem Content="本地 OPUS-MT（CPU INT8）" Tag="local" />
+                            <ComboBoxItem Content="云端 MyMemory" Tag="api" />
                         </ComboBox>
-                        <TextBlock Grid.Row="2" Text="英文 TTS" VerticalAlignment="Center" />
-                        <ComboBox x:Name="TtsProviderCombo" Grid.Row="2" Grid.Column="1" Margin="0,4" SelectionChanged="ProviderCombo_SelectionChanged">
-                            <ComboBoxItem Content="本地 Windows Speech（离线）" Tag="local" />
-                            <ComboBoxItem Content="API · Edge TTS（联网）" Tag="api" />
+
+                        <TextBlock Grid.Row="2" Text="语音合成" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="TtsProviderCombo" Grid.Row="2" Grid.Column="1" Margin="0 2 0 0" SelectionChanged="ProviderCombo_SelectionChanged">
+                            <ComboBoxItem Content="本地 Windows 语音" Tag="local" />
+                            <ComboBoxItem Content="云端 Edge TTS" Tag="api" />
                         </ComboBox>
                     </Grid>
-                    <TextBlock Text="三个节点独立配置；ASR 当前仅有本地 Whisper，翻译和 TTS 可任意组合并在运行中切换。"
-                               Foreground="#8B949E" Margin="0,8,0,0" TextWrapping="Wrap" />
-                    <CheckBox x:Name="LowLatencyIncomingCheckBox" Content="游戏低延迟字幕（边说边显示；停顿约 0.6 秒后定稿）"
-                              IsChecked="True" Foreground="#52D3A5" Margin="0,10,0,0" />
+                    <TextBlock Text="三个模块可独立配置与切换。"
+                               Style="{StaticResource HintText}" />
+                    <CheckBox x:Name="LowLatencyIncomingCheckBox"
+                              IsChecked="True"
+                              Foreground="{StaticResource AccentBrush}"
+                              Margin="0,6,0,0"
+                              VerticalContentAlignment="Top">
+                        <TextBlock Text="启用低延迟模式（立即开始处理，略微牺牲流畅度）"
+                                   TextWrapping="Wrap" />
+                    </CheckBox>
                 </StackPanel>
             </Border>
 
-            <Border Grid.Row="2" Background="#161B22" BorderBrush="#30363D" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,14,0,0">
-                <Grid>
-                    <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <TextBlock Grid.ColumnSpan="2" Text="音频设备" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
-                    <TextBlock Grid.Row="1" Text="实体麦克风" VerticalAlignment="Center" />
-                    <ComboBox x:Name="MicrophoneCombo" Grid.Row="1" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" />
-                    <TextBlock Grid.Row="2" Text="英文试听耳机" VerticalAlignment="Center" />
-                    <ComboBox x:Name="MonitorOutputCombo" Grid.Row="2" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" />
-                    <CheckBox x:Name="MonitorTranslatedSpeechCheckBox" Grid.Row="3" Grid.Column="1" Content="复读已发送英文（在耳机播放；已隔离，不会进入识别循环）" IsChecked="True" Foreground="#E6EDF3" Margin="0,5" />
-                    <TextBlock Grid.Row="4" Text="Discord 声音捕获" VerticalAlignment="Center" />
-                    <ComboBox x:Name="DiscordOutputCombo" Grid.Row="4" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" IsEnabled="False" />
-                    <TextBlock Grid.Row="5" Text="发送给 Discord" VerticalAlignment="Center" />
-                    <ComboBox x:Name="CableRenderCombo" Grid.Row="5" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" IsEnabled="False" />
-                    <CheckBox x:Name="UseProcessLoopbackCheckBox" Grid.Row="6" Grid.Column="1" Content="只抓 Discord 进程音频（已固定启用，不捕获游戏/浏览器声音）" IsChecked="True" IsEnabled="False" Foreground="#E6EDF3" Margin="0,8,0,0" />
-                </Grid>
+            <Border Grid.Row="0" Grid.Column="1" Style="{StaticResource SurfaceCard}" Margin="6,0,0,10">
+                <StackPanel>
+                    <TextBlock Text="音频路由" Style="{StaticResource TitleText}" />
+                    <Grid Margin="0,4,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="92" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Text="麦克风设备" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="MicrophoneCombo" Grid.Row="0" Grid.Column="1" Margin="0,2,0,6"
+                                  ToolTip="{Binding SelectedItem.Name, RelativeSource={RelativeSource Self}}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
+
+                        <TextBlock Grid.Row="1" Text="本地监听输出" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="MonitorOutputCombo" Grid.Row="1" Grid.Column="1" Margin="0,2,0,6"
+                                  ToolTip="{Binding SelectedItem.Name, RelativeSource={RelativeSource Self}}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
+
+                        <CheckBox x:Name="MonitorTranslatedSpeechCheckBox" Grid.Row="2" Grid.Column="1"
+                                  IsChecked="True"
+                                  Foreground="{StaticResource MutedBrush}"
+                                  Margin="0,0,0,6"
+                                  VerticalContentAlignment="Top">
+                            <TextBlock Text="将翻译语音同时输出到本地监听设备" TextWrapping="Wrap" />
+                        </CheckBox>
+
+                        <TextBlock Grid.Row="3" Text="Discord 输出" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="DiscordOutputCombo" Grid.Row="3" Grid.Column="1" Margin="0,2,0,6" IsEnabled="False"
+                                  ToolTip="{Binding SelectedItem.Name, RelativeSource={RelativeSource Self}}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
+
+                        <TextBlock Grid.Row="4" Text="Discord 虚拟线" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="CableRenderCombo" Grid.Row="4" Grid.Column="1" Margin="0,2,0,6" IsEnabled="False"
+                                  ToolTip="{Binding SelectedItem.Name, RelativeSource={RelativeSource Self}}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
+
+                        <CheckBox x:Name="UseProcessLoopbackCheckBox" Grid.Row="5" Grid.Column="1"
+                                  IsChecked="True"
+                                  IsEnabled="False"
+                                  Foreground="{StaticResource MutedBrush}"
+                                  VerticalContentAlignment="Top">
+                            <TextBlock Text="启用进程回环（Discord 录制/回放自检）" TextWrapping="Wrap" />
+                        </CheckBox>
+                    </Grid>
+                </StackPanel>
             </Border>
 
-            <Border Grid.Row="3" Background="#161B22" BorderBrush="#30363D" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,14,0,0">
-                <Grid>
-                    <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <TextBlock Grid.ColumnSpan="2" Text="本地模型（无外部 API）" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
-                    <TextBlock Grid.Row="1" Text="双向语音识别" VerticalAlignment="Center" />
-                    <TextBox Grid.Row="1" Grid.Column="1" Margin="0,5" Text="faster-whisper base 实时预览 + small 最终定稿 · CPU INT8" IsReadOnly="True" />
-                    <TextBlock Grid.Row="2" Text="双向文本翻译" VerticalAlignment="Center" />
-                    <TextBox Grid.Row="2" Grid.Column="1" Margin="0,5" Text="OPUS-MT 中英双向 + 泰英桥接 · CPU INT8" IsReadOnly="True" />
-                    <TextBlock Grid.Row="3" Text="英文语音输出" VerticalAlignment="Center" />
-                    <TextBox Grid.Row="3" Grid.Column="1" Margin="0,5" Text="Windows Speech · 完全离线" IsReadOnly="True" />
-                    <TextBlock Grid.Row="4" Text="英文音色" VerticalAlignment="Center" />
-                    <ComboBox x:Name="EnglishVoiceCombo" Grid.Row="4" Grid.Column="1" Margin="0,5" DisplayMemberPath="Name" />
-                </Grid>
+            <!-- Row 1：模型栈 + 在线服务 -->
+            <Border Grid.Row="1" Grid.Column="0" Style="{StaticResource SurfaceCard}" Margin="0,0,6,0">
+                <StackPanel>
+                    <TextBlock Text="模型栈（本地优先）" Style="{StaticResource TitleText}" />
+                    <TextBlock Margin="0,2,0,0" TextWrapping="Wrap">
+                        <Run Text="语音识别：" Foreground="{StaticResource MutedBrush}" />
+                        <Run Text="Whisper base + small（本地 ASR 管线）" Foreground="{StaticResource TextBrush}" />
+                    </TextBlock>
+                    <TextBlock Margin="0,4,0,0" TextWrapping="Wrap">
+                        <Run Text="翻译引擎：" Foreground="{StaticResource MutedBrush}" />
+                        <Run Text="OPUS-MT + 词表增强本地管线（CPU INT8）" Foreground="{StaticResource TextBrush}" />
+                    </TextBlock>
+                    <TextBlock Margin="0,4,0,0" TextWrapping="Wrap">
+                        <Run Text="语音合成：" Foreground="{StaticResource MutedBrush}" />
+                        <Run Text="Windows Speech 本地语音栈" Foreground="{StaticResource TextBrush}" />
+                    </TextBlock>
+                </StackPanel>
             </Border>
 
-            <Border Grid.Row="4" Background="#161B22" BorderBrush="#1F6FEB" BorderThickness="1" CornerRadius="10" Padding="18" Margin="0,14,0,0">
-                <Grid>
-                    <Grid.ColumnDefinitions><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                    <TextBlock Grid.ColumnSpan="2" Text="在线组件配置（可选）" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,14" />
-                    <TextBlock Grid.Row="1" Text="Edge 英文音色" VerticalAlignment="Center" />
-                    <ComboBox x:Name="ApiEnglishVoiceCombo" Grid.Row="1" Grid.Column="1" Margin="0,5" IsEditable="False" />
-                    <DockPanel Grid.Row="2" Grid.Column="1" Margin="0,8,0,0">
-                        <Button x:Name="TestCloudApiButton" Content="测试纯 API 与延迟" Width="180" Height="34" Click="TestCloudApiButton_Click" />
-                        <TextBlock Text="ASR 始终留在本机；MyMemory 仅接收文字，Edge TTS 仅接收英文。" Foreground="#E3B341" Margin="12,7,0,0" TextWrapping="Wrap" />
-                    </DockPanel>
-                </Grid>
-            </Border>
+            <Border Grid.Row="1" Grid.Column="1" Style="{StaticResource SurfaceCard}" Margin="6,0,0,0">
+                <StackPanel>
+                    <TextBlock Text="在线服务" Style="{StaticResource TitleText}" />
+                    <Grid Margin="0,4,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="92" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
 
-            <StackPanel Grid.Row="5" Margin="0,18,0,0">
-                <Border Background="#2D2205" BorderBrush="#9E6A03" BorderThickness="1" CornerRadius="8" Padding="12">
-                    <TextBlock Text="接收方向仅捕获 Discord 桌面客户端及其子进程。游戏、浏览器和音乐声音不会送去识别；启动 VoiceScreen 前请先打开 Discord。"
-                               Foreground="#E3B341" TextWrapping="Wrap" />
-                </Border>
-                <WrapPanel Margin="0,16,0,0">
-                    <Button x:Name="StartButton" Content="启动" Width="120" Height="40" Margin="0,0,10,0" Click="StartButton_Click">
-                        <Button.Style>
-                            <Style TargetType="Button">
-                                <Setter Property="Background" Value="#238636" />
-                                <Setter Property="Foreground" Value="#FFFFFF" />
-                                <Setter Property="BorderBrush" Value="#2EA043" />
-                                <Setter Property="BorderThickness" Value="1" />
-                                <Style.Triggers>
-                                    <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#2EA043" /></Trigger>
-                                    <Trigger Property="IsEnabled" Value="False">
-                                        <Setter Property="Background" Value="#21262D" />
-                                        <Setter Property="Foreground" Value="#8B949E" />
-                                        <Setter Property="BorderBrush" Value="#30363D" />
-                                    </Trigger>
-                                </Style.Triggers>
-                            </Style>
-                        </Button.Style>
-                    </Button>
-                    <Button x:Name="StopButton" Content="停止" Width="100" Height="40" Margin="0,0,10,0" Click="StopButton_Click" IsEnabled="False" />
-                    <Button Content="刷新设备" Width="110" Height="40" Margin="0,0,10,0" Click="RefreshDevicesButton_Click" />
-                    <Button x:Name="AdjustOverlayButton" Content="① 解锁移动/缩放" Width="160" Height="40"
-                            Click="AdjustOverlayButton_Click" IsEnabled="False" />
-                    <Button x:Name="RestartElevatedButton" Content="以管理员重启（战地）" Width="170" Height="40" Margin="10,0,0,0"
-                            Click="RestartElevatedButton_Click" ToolTip="当战地以前台运行时收不到右 Alt，请用同等管理员权限重启 VoiceScreen" />
-                </WrapPanel>
-                <Grid Margin="0,14,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="120" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="48" />
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Text="字幕字号" VerticalAlignment="Center" />
-                    <Slider x:Name="SubtitleFontSizeSlider" Grid.Column="1" Minimum="14" Maximum="42" Value="24"
-                            TickFrequency="2" IsSnapToTickEnabled="True" ValueChanged="SubtitleFontSizeSlider_ValueChanged" />
-                    <TextBlock Grid.Column="2" Text="{Binding ElementName=SubtitleFontSizeSlider, Path=Value, StringFormat={}{0:F0}}"
-                               HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#52D3A5" />
-                </Grid>
-                <DockPanel Margin="0,14,0,0" LastChildFill="True">
-                    <Button x:Name="TestTranslationButton" DockPanel.Dock="Right" Content="翻译并试听（仅耳机）" Width="190" Height="38"
-                            Margin="10,0,0,0" Click="TestTranslationButton_Click" IsEnabled="False" />
-                    <TextBox x:Name="TestChineseTextBox" Text="敌人在二楼，我们从左边走。" Height="38" Padding="10,7"
-                             ToolTip="输入中文，使用本地 OPUS-MT 翻译并只在所选耳机试听，不发送到 Discord" />
-                </DockPanel>
-                <TextBlock x:Name="StatusText" Text="等待启动" FontSize="15" Margin="0,16,0,0" Foreground="#8B949E" TextWrapping="Wrap" />
-                <TextBlock Text="Discord 设置：输入设备选 CABLE Output，输出设备选 HyperX 耳机。不要开启“侦听此设备”。平时原声直通；按住右 Alt 说中文，松开后发送英文。"
-                           FontSize="14" Margin="0,10,0,0" Foreground="#52D3A5" TextWrapping="Wrap" />
-            </StackPanel>
+                        <TextBlock Grid.Row="0" Text="默认英文音色" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="EnglishVoiceCombo" Grid.Row="0" Grid.Column="1" Margin="0,2,0,6"
+                                  ToolTip="{Binding SelectedItem.Name, RelativeSource={RelativeSource Self}}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
+
+                        <TextBlock Grid.Row="1" Text="Edge 英文音色" Style="{StaticResource SectionLabel}" />
+                        <ComboBox x:Name="ApiEnglishVoiceCombo" Grid.Row="1" Grid.Column="1" Margin="0,2,0,0" IsEditable="False" />
+                    </Grid>
+                    <Button x:Name="TestCloudApiButton" Style="{StaticResource GhostButton}" Content="测试云端 API"
+                            Width="124" Height="28" HorizontalAlignment="Left" Margin="0,10,0,0" Click="TestCloudApiButton_Click" />
+                    <TextBlock Text="ASR 可离线运行；翻译和 TTS 云端服务为可选，可单独验证。"
+                               Foreground="{StaticResource WarnBrush}"
+                               FontSize="11"
+                               TextWrapping="Wrap"
+                               Margin="0,6,0,0" />
+                </StackPanel>
+            </Border>
         </Grid>
-    </ScrollViewer>
+
+        <!-- 底部 Runtime Controls（跨两列）-->
+        <Border Grid.Row="2" Grid.ColumnSpan="2" Style="{StaticResource SurfaceCard}" Margin="0,10,0,0">
+            <StackPanel>
+                <TextBlock Text="运行控制" Style="{StaticResource TitleText}" />
+                <TextBlock Text="保持采集、悬浮窗、翻译三者同步；按需关闭冗余组件以降低噪声、提升稳定性。"
+                           Foreground="{StaticResource WarnBrush}"
+                           FontSize="11"
+                           TextWrapping="Wrap"
+                           Margin="0,-2,0,6" />
+
+                <WrapPanel Margin="0,2,0,0" ItemHeight="34">
+                    <Button x:Name="StartButton"
+                            Style="{StaticResource PrimaryButton}"
+                            Content="开始"
+                            Width="100"
+                            Click="StartButton_Click" />
+                    <Button x:Name="StopButton"
+                            Style="{StaticResource GhostButton}"
+                            Content="停止"
+                            Width="80"
+                            Click="StopButton_Click"
+                            IsEnabled="False" />
+                    <Button x:Name="RefreshDevicesButton"
+                            Style="{StaticResource GhostButton}"
+                            Content="刷新设备"
+                            Width="100"
+                            Click="RefreshDevicesButton_Click" />
+                    <Button x:Name="AdjustOverlayButton"
+                            Style="{StaticResource GhostButton}"
+                            Content="调整悬浮窗"
+                            Width="110"
+                            Click="AdjustOverlayButton_Click"
+                            IsEnabled="False" />
+                    <Button x:Name="RestartElevatedButton"
+                            Style="{StaticResource DangerButton}"
+                            Content="管理员重启"
+                            Width="140"
+                            Click="RestartElevatedButton_Click"
+                            ToolTip="部分场景需要管理员权限。启动被拦截时使用。" />
+                </WrapPanel>
+
+                <Grid Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="80" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="40" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="字幕字号" VerticalAlignment="Center" FontSize="12" />
+                    <Slider x:Name="SubtitleFontSizeSlider"
+                            Grid.Column="1"
+                            Minimum="14"
+                            Maximum="42"
+                            Value="24"
+                            TickFrequency="2"
+                            IsSnapToTickEnabled="True"
+                            ValueChanged="SubtitleFontSizeSlider_ValueChanged" />
+                    <TextBlock Grid.Column="2"
+                               Text="{Binding ElementName=SubtitleFontSizeSlider, Path=Value, StringFormat={}{0:F0}}"
+                               HorizontalAlignment="Right"
+                               VerticalAlignment="Center"
+                               Foreground="{StaticResource AccentBrush}" />
+                </Grid>
+
+                <DockPanel Margin="0,8,0,0" LastChildFill="True">
+                    <Button x:Name="TestTranslationButton"
+                            Style="{StaticResource GhostButton}"
+                            DockPanel.Dock="Right"
+                            Content="测试翻译"
+                            Width="120"
+                            Height="30"
+                            Margin="8,0,0,0"
+                            Click="TestTranslationButton_Click"
+                            IsEnabled="False" />
+                    <TextBox x:Name="TestChineseTextBox"
+                             Text="输入中文句子并快速验证翻译结果"
+                             Height="30"
+                             Padding="8,5"
+                             ToolTip="输入中文并快速验证翻译结果"
+                             TextWrapping="NoWrap" />
+                </DockPanel>
+
+                <TextBlock x:Name="StatusText"
+                           Text="就绪"
+                           FontSize="12"
+                           Margin="0,8,0,0"
+                           Foreground="{StaticResource MutedBrush}"
+                           TextWrapping="Wrap" />
+                <TextBlock Text="Discord 路由提示：CABLE 输出和监听通道应与你配置的虚拟音频链路一致。"
+                           FontSize="11"
+                           Margin="0,4,0,0"
+                           Foreground="{StaticResource AccentBrush}"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </Border>
+    </Grid>
 </Window>

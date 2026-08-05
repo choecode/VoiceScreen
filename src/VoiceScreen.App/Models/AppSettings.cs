@@ -5,6 +5,7 @@ public sealed class AppSettings
     public bool DemoMode { get; set; }
     // CloudMode is retained only to migrate settings written by older releases.
     public bool CloudMode { get; set; }
+    public string AsrEngine { get; set; } = "whisper";
     public bool UseApiTranslation { get; set; }
     public bool UseApiTts { get; set; }
     public bool LowLatencyIncoming { get; set; } = true;
