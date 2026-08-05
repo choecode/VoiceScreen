@@ -55,8 +55,51 @@ public static class TranscriptSanitizer
 
         if (words.Length < MinimumWordsForWordCheck) return false;
         var dominantWords = words.GroupBy(word => word).Max(group => group.Count());
-        return (double)dominantWords / words.Length >= DominantWordRatio;
+        if ((double)dominantWords / words.Length >= DominantWordRatio) return true;
+
+        return HasRepeatingPhrase(words);
     }
+
+    /// <summary>
+    /// 检测短语级复读。
+    ///
+    /// 单词频次统计漏掉了一整类真实幻觉：Whisper 在噪声下会输出
+    /// "or a lightning or a lightning or lightning or lightning ..."，
+    /// 由于 "or a lightning" 和 "or lightning" 交替出现，最高频单词只占约一半，
+    /// 够不到 <see cref="DominantWordRatio"/>；字符级周期检测也会被这个变奏打断。
+    /// 这段文本是 tools/benchmark_asr.py 在 10dB 信噪比下实测到的，24 词的音频
+    /// 被识别成 223 词。
+    ///
+    /// 改为看「最高频 n 元词组覆盖了整句的多大比例」：真正的死循环里，
+    /// 某个短语会铺满绝大部分句子，而正常口语不会。
+    /// </summary>
+    private static bool HasRepeatingPhrase(string[] words)
+    {
+        var maxLength = Math.Min(MaximumPhraseLength, words.Length / 3);
+        for (var length = 2; length <= maxLength; length++)
+        {
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var highest = 0;
+            for (var start = 0; start + length <= words.Length; start++)
+            {
+                var phrase = string.Join(' ', words, start, length);
+                counts[phrase] = counts.TryGetValue(phrase, out var seen) ? seen + 1 : 1;
+                if (counts[phrase] > highest) highest = counts[phrase];
+            }
+
+            // 至少重复三次才算循环，避免把"真的吗 真的吗"这种正常强调误判。
+            if (highest < MinimumPhraseRepeats) continue;
+            if ((double)(highest * length) / words.Length >= PhraseCoverageRatio) return true;
+        }
+
+        return false;
+    }
+
+    private const int MaximumPhraseLength = 5;
+    private const int MinimumPhraseRepeats = 3;
+
+    /// <summary>最高频短语要铺满整句的六成以上才判定为复读。</summary>
+    private const double PhraseCoverageRatio = 0.6;
 
     /// <summary>译文异常膨胀或本身就是病态重复时，整句丢弃。</summary>
     public static bool IsUnsafeTranslation(string? source, string? translated)
