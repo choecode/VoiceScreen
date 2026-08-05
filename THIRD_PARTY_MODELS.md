@@ -34,3 +34,20 @@ VoiceScreen does not commit model weights into this repository. `tools/setup_loc
 - License: MIT.
 
 Review the current upstream model cards before redistributing converted weights. VoiceScreen's source-code license, if one is later added, does not replace third-party model licenses.
+
+## Sherpa-ONNX Zipformer (Optional)
+
+- Package: [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), Apache-2.0.
+- Model installed by `tools/setup_local_models.ps1 -Sherpa`:
+  [csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20](https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20)
+- Files fetched: `tokens.txt` plus the INT8 encoder / decoder / joiner graphs (~190 MB).
+  The FP32 copies in the same repository are deliberately skipped so that exactly one
+  candidate exists per role.
+- Languages: **Chinese and English only.** This model does not recognise Thai;
+  keep the ASR engine on Whisper when Thai support is needed.
+- Purpose: optional local ASR replacement for faster-whisper.
+- Trained by the [k2-fsa / icefall](https://github.com/k2-fsa/icefall) project on
+  WenetSpeech (Chinese) and GigaSpeech (English). Review the upstream model card and
+  the licenses of those corpora before redistributing the weights.
+- Any other Zipformer model also works, as long as its directory contains
+  `tokens.txt`, `encoder*.onnx`, `decoder*.onnx`, and `joiner*.onnx`.

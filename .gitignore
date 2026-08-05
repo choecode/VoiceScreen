@@ -1,15 +1,27 @@
+# 构建产物
 **/bin/
 **/obj/
-dist/
+**/dist/
+**/publish/
 .vs/
 *.user
 *.suo
+
+# 运行时产物
 *.log
-dump-commands.txt
+output/
+
+# Python
 **/__pycache__/
 *.pyc
 .venv/
 .venv-translation-lab/
-models/
-output/
+
+# 本地模型（体积巨大，用 tools/setup_local_models.ps1 下载）
+# 必须用前导斜杠锚定到仓库根：不加的话，Windows 大小写不敏感会让这条规则
+# 把源码目录 src/VoiceScreen.App/Models 也一起忽略掉。
+/models/
+
+# 临时草稿
+dump-commands.txt
 social/

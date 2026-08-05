@@ -74,7 +74,7 @@ public partial class MainWindow : Window
             _settings.UseApiTranslation = true;
             _settings.UseApiTts = true;
         }
-        AsrProviderCombo.SelectedIndex = 0;
+        AsrProviderCombo.SelectedIndex = string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
         TranslationProviderCombo.SelectedIndex = _settings.UseApiTranslation ? 1 : 0;
         TtsProviderCombo.SelectedIndex = _settings.UseApiTts ? 1 : 0;
         LowLatencyIncomingCheckBox.IsChecked = _settings.LowLatencyIncoming;
@@ -147,6 +147,7 @@ public partial class MainWindow : Window
         {
             DemoMode = false,
             CloudMode = false,
+            AsrEngine = AsrProviderFromSelection(),
             UseApiTranslation = TranslationProviderCombo.SelectedIndex == 1,
             UseApiTts = TtsProviderCombo.SelectedIndex == 1,
             LowLatencyIncoming = LowLatencyIncomingCheckBox.IsChecked == true,
@@ -253,13 +254,22 @@ public partial class MainWindow : Window
     {
         if (!IsLoaded || AsrProviderCombo.SelectedIndex < 0
             || TranslationProviderCombo.SelectedIndex < 0 || TtsProviderCombo.SelectedIndex < 0) return;
+        _settings.AsrEngine = AsrProviderFromSelection();
         _settings.UseApiTranslation = TranslationProviderCombo.SelectedIndex == 1;
         _settings.UseApiTts = TtsProviderCombo.SelectedIndex == 1;
         _settings.CloudMode = false;
         _settingsStore.Save(_settings);
         _engine?.UpdateProviders(_settings.UseApiTranslation, _settings.UseApiTts);
         if (_engine is not null)
-            StatusText.Text = $"已切换：翻译={(_settings.UseApiTranslation ? "API" : "本地")}，TTS={(_settings.UseApiTts ? "API" : "本地")}；下一句话生效。";
+            StatusText.Text =
+                $"已切换：ASR={(_settings.AsrEngine == "sherpa" ? "Sherpa-ONNX" : "Whisper")}，翻译={(_settings.UseApiTranslation ? "API" : "本地")}，TTS={(_settings.UseApiTts ? "API" : "本地")}；重启会话后生效。";
+    }
+
+    private string AsrProviderFromSelection()
+    {
+        var selected = AsrProviderCombo.SelectedItem as ComboBoxItem;
+        var tag = selected?.Tag?.ToString()?.Trim().ToLowerInvariant();
+        return tag == "sherpa" ? "sherpa" : "whisper";
     }
 
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();
@@ -351,10 +361,35 @@ public partial class MainWindow : Window
         StatusText.Text = "已停止";
     }
 
+    private bool _shutdownComplete;
+
+    /// <summary>
+    /// 关闭流程必须等 <see cref="StopEngineAsync"/> 真正跑完再让窗口消失。
+    /// 直接在 <c>async void</c> 里 await 的话，窗口会在第一个 await 处就关掉，
+    /// 进程随即退出，<see cref="LocalOutgoingService"/> 里 kill 本地 Python 服务的
+    /// 代码可能永远执行不到——结果是残留一个吃着 Whisper + OPUS 模型内存的
+    /// python.exe，并且继续占着 18765 端口，下次启动直接失败。
+    /// 因此先取消关闭、异步收尾，收尾完成后再重新关闭。
+    /// </summary>
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
-        SaveOverlayBounds();
-        await StopEngineAsync();
+        if (_shutdownComplete) return;
+
+        e.Cancel = true;
+        try
+        {
+            SaveOverlayBounds();
+            await StopEngineAsync();
+        }
+        catch (Exception ex)
+        {
+            VoiceScreenLog.Error("Shutdown cleanup failed", ex);
+        }
+        finally
+        {
+            _shutdownComplete = true;
+            Close();
+        }
     }
 
     private void SaveOverlayBounds()

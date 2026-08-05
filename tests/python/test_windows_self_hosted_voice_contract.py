@@ -11,7 +11,8 @@ class WindowsProviderSelectionContractTests(unittest.TestCase):
         settings = (APP / "Models" / "AppSettings.cs").read_text(encoding="utf-8")
         xaml = (APP / "MainWindow.xaml").read_text(encoding="utf-8")
         window = (APP / "MainWindow.xaml.cs").read_text(encoding="utf-8")
-        service = (APP / "Services" / "SelfHostedApiService.cs").read_text(encoding="utf-8")
+        # 文件名此前是 SelfHostedApiService.cs，和里面的 OnlineApiService 类名对不上，已改名。
+        service = (APP / "Services" / "OnlineApiService.cs").read_text(encoding="utf-8")
         engine = (APP / "Services" / "TranslationEngine.cs").read_text(encoding="utf-8")
         self_test = (ROOT / "tools" / "VoiceScreen.SelfTest" / "Program.cs").read_text(encoding="utf-8")
 

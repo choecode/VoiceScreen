@@ -1,15 +1,19 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.IO;
 using System.Net.Http;
 using System.Threading.Channels;
 using VoiceScreen.App.Diagnostics;
+using VoiceScreen.Core;
 
 namespace VoiceScreen.App.Services;
 
 /// <summary>
 /// 将 Discord 40ms PCM 帧切成语音会话。稳定模式在句末处理一次；低延迟模式会产生音频快照，
 /// ASR 与 OPUS 分别在独立流水线上运行，只保留有价值的最新临时结果，最终句永不丢弃。
+///
+/// 分配策略：这条链路上的音频回调每 40ms 就要跑一次，任何每帧分配都会变成常驻 GC 压力。
+/// 因此预滚缓冲用固定数组环复用，整句缓冲整个生命周期只分配一次，快照走 ArrayPool。
 /// </summary>
 public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
 {
@@ -29,7 +33,18 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private readonly LocalOutgoingService _localService;
     private readonly bool _lowLatency;
     private readonly Func<string, string, CancellationToken, Task<LocalIncomingTranslation>>? _translateOverride;
-    private readonly Queue<byte[]> _preRoll = new();
+
+    // 预滚环形缓冲：数组只在首次用到时分配一次，之后按帧覆盖写入。
+    // 之前这里是 Queue<byte[]> + frame.Clone()，每秒 25 次 1280 字节分配，全程常驻。
+    private readonly byte[][] _preRollFrames = new byte[PreRollFrames][];
+    private int _preRollCount;
+    private int _preRollHead;
+
+    // 整句缓冲：按最长一句（20s + 预滚）一次性分配，靠 SetLength(0) 复用，
+    // 不再每句 new 一个 MemoryStream 再 Dispose。
+    private readonly MemoryStream _utterance = new(FrameBytes * (MaximumUtteranceFrames + PreRollFrames));
+    private bool _utteranceActive;
+
     private readonly Channel<AudioSnapshot> _audioSnapshots = Channel.CreateUnbounded<AudioSnapshot>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     private readonly Channel<TranslationSnapshot> _translationSnapshots = Channel.CreateUnbounded<TranslationSnapshot>(
@@ -44,7 +59,6 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Task _asrWorker;
     private readonly Task _translationWorker;
-    private MemoryStream? _current;
     private long _utteranceStartTimestamp;
     private long _previewUtteranceId;
     private bool _previewIsVisible;
@@ -86,17 +100,17 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
                 return ValueTask.CompletedTask;
             }
 
-            var voiced = CalculateRms(frame) >= VoiceRmsThreshold;
-            if (_current is null)
+            var voiced = PcmLevel.CalculateRms(frame) >= VoiceRmsThreshold;
+            if (!_utteranceActive)
             {
-                AddPreRoll(frame);
+                AddPreRollNoLock(frame);
                 _consecutiveVoiceFrames = voiced ? _consecutiveVoiceFrames + 1 : 0;
                 if (_consecutiveVoiceFrames >= StartVoiceFrames)
                     StartUtteranceNoLock();
                 return ValueTask.CompletedTask;
             }
 
-            _current.Write(frame, 0, frame.Length);
+            _utterance.Write(frame, 0, frame.Length);
             _totalFrames++;
             if (voiced)
             {
@@ -127,43 +141,61 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
 
     private void StartUtteranceNoLock()
     {
-        _current = new MemoryStream(FrameBytes * 100);
-        foreach (var bufferedFrame in _preRoll)
-            _current.Write(bufferedFrame, 0, bufferedFrame.Length);
+        _utterance.SetLength(0);
+        _utteranceActive = true;
+
+        // 预滚按写入顺序回放，保证句首的辅音不被 RMS 门限吃掉。
+        for (var offset = 0; offset < _preRollCount; offset++)
+        {
+            var buffered = _preRollFrames[(_preRollHead + offset) % PreRollFrames];
+            _utterance.Write(buffered, 0, FrameBytes);
+        }
+
         _utteranceId++;
         _utteranceStartTimestamp = Stopwatch.GetTimestamp();
         _revision = 0;
-        _totalFrames = _preRoll.Count;
+        _totalFrames = _preRollCount;
         _lastSnapshotFrame = 0;
         _voicedFrames = _consecutiveVoiceFrames;
         _silenceFrames = 0;
-        _preRoll.Clear();
+        _preRollCount = 0;
+        _preRollHead = 0;
     }
 
     private void CompleteUtteranceNoLock()
     {
-        if (_current is not null && _voicedFrames >= MinimumVoicedFrames)
+        if (_utteranceActive && _voicedFrames >= MinimumVoicedFrames)
             QueueSnapshotNoLock(isFinal: true);
         ResetNoLock(clearPreview: false);
     }
 
+    /// <summary>
+    /// 从池里租一段刚好够用的缓冲拷走当前音频。租用的数组由 <see cref="ProcessAudioSnapshotsAsync"/>
+    /// 统一归还——快照被判定过期而丢弃时也要还，否则池会被慢慢掏空。
+    /// </summary>
     private void QueueSnapshotNoLock(bool isFinal)
     {
-        if (_current is null || _current.Length == 0) return;
+        if (!_utteranceActive || _utterance.Length == 0) return;
+        var length = (int)_utterance.Length;
         var revision = ++_revision;
         _lastSnapshotFrame = _totalFrames;
-        var snapshot = new AudioSnapshot(_utteranceId, revision, _current.ToArray(), isFinal,
-            _utteranceStartTimestamp);
+
+        var rented = ArrayPool<byte>.Shared.Rent(length);
+        Buffer.BlockCopy(_utterance.GetBuffer(), 0, rented, 0, length);
+
+        var snapshot = new AudioSnapshot(_utteranceId, revision, rented, length, isFinal, _utteranceStartTimestamp);
         _latestAudioRevision[_utteranceId] = revision;
         if (isFinal) _finalAudioRevision[_utteranceId] = revision;
-        _audioSnapshots.Writer.TryWrite(snapshot);
+        if (!_audioSnapshots.Writer.TryWrite(snapshot))
+            ArrayPool<byte>.Shared.Return(rented);
     }
 
     private void ResetNoLock(bool clearPreview)
     {
-        _current?.Dispose();
-        _current = null;
-        _preRoll.Clear();
+        _utterance.SetLength(0);
+        _utteranceActive = false;
+        _preRollCount = 0;
+        _preRollHead = 0;
         _consecutiveVoiceFrames = 0;
         _silenceFrames = 0;
         _voicedFrames = 0;
@@ -173,10 +205,23 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         if (clearPreview) ClearPreview();
     }
 
-    private void AddPreRoll(byte[] frame)
+    private void AddPreRollNoLock(byte[] frame)
     {
-        _preRoll.Enqueue((byte[])frame.Clone());
-        while (_preRoll.Count > PreRollFrames) _preRoll.Dequeue();
+        int slot;
+        if (_preRollCount == PreRollFrames)
+        {
+            // 环已满：覆盖最旧的一帧，并把队首往前推。
+            slot = _preRollHead;
+            _preRollHead = (_preRollHead + 1) % PreRollFrames;
+        }
+        else
+        {
+            slot = (_preRollHead + _preRollCount) % PreRollFrames;
+            _preRollCount++;
+        }
+
+        _preRollFrames[slot] ??= new byte[FrameBytes];
+        Buffer.BlockCopy(frame, 0, _preRollFrames[slot], 0, FrameBytes);
     }
 
     private async Task ProcessAudioSnapshotsAsync()
@@ -185,41 +230,49 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         {
             await foreach (var snapshot in _audioSnapshots.Reader.ReadAllAsync(_lifetime.Token).ConfigureAwait(false))
             {
-                if (IsStale(snapshot.UtteranceId, snapshot.Revision, snapshot.IsFinal, _latestAudioRevision))
-                    continue;
                 try
                 {
-                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-                    timeout.CancelAfter(snapshot.IsFinal ? TimeSpan.FromSeconds(90) : TimeSpan.FromSeconds(30));
-                    var transcription = await _localService.TranscribeIncomingSpeechAsync(snapshot.Audio, timeout.Token,
-                            preview: !snapshot.IsFinal)
-                        .ConfigureAwait(false);
-                    if (IsSupersededByFinal(snapshot.UtteranceId, snapshot.IsFinal, _finalAudioRevision))
+                    if (IsStale(snapshot.UtteranceId, snapshot.Revision, snapshot.IsFinal, _latestAudioRevision))
                         continue;
-                    if (string.IsNullOrWhiteSpace(transcription.Text)
-                        || LocalOutgoingService.IsLikelyIncomingHallucination(transcription.Text, transcription.Language))
+                    try
+                    {
+                        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                        timeout.CancelAfter(snapshot.IsFinal ? TimeSpan.FromSeconds(90) : TimeSpan.FromSeconds(30));
+                        var transcription = await _localService.TranscribeIncomingSpeechAsync(
+                                snapshot.Buffer.AsMemory(0, snapshot.Length), timeout.Token,
+                                preview: !snapshot.IsFinal)
+                            .ConfigureAwait(false);
+                        if (IsSupersededByFinal(snapshot.UtteranceId, snapshot.IsFinal, _finalAudioRevision))
+                            continue;
+                        if (string.IsNullOrWhiteSpace(transcription.Text)
+                            || TranscriptSanitizer.IsPathologicalRepetition(transcription.Text))
+                        {
+                            if (snapshot.IsFinal) FinishUtterance(snapshot.UtteranceId);
+                            continue;
+                        }
+
+                        var lastTranslation = _lastTranslations.GetValueOrDefault(snapshot.UtteranceId, string.Empty);
+                        SetPreview(snapshot.UtteranceId, new LocalIncomingTranslation(transcription.Text,
+                            lastTranslation, SpokenLanguage.Detect(transcription.Text, transcription.Language)));
+
+                        var sourceForTranslation = SelectStableSource(snapshot, transcription);
+                        if (string.IsNullOrWhiteSpace(sourceForTranslation) && !snapshot.IsFinal) continue;
+                        sourceForTranslation = snapshot.IsFinal ? transcription.Text : sourceForTranslation;
+
+                        _latestTranslationRevision[snapshot.UtteranceId] = snapshot.Revision;
+                        if (snapshot.IsFinal) _finalTranslationRevision[snapshot.UtteranceId] = snapshot.Revision;
+                        _translationSnapshots.Writer.TryWrite(new TranslationSnapshot(snapshot.UtteranceId,
+                            snapshot.Revision, transcription.Text, sourceForTranslation, transcription.Language,
+                            snapshot.IsFinal, snapshot.StartTimestamp));
+                    }
+                    catch (Exception ex) when (HandleWorkerException(ex, snapshot.IsFinal, "ASR"))
                     {
                         if (snapshot.IsFinal) FinishUtterance(snapshot.UtteranceId);
-                        continue;
                     }
-
-                    var lastTranslation = _lastTranslations.GetValueOrDefault(snapshot.UtteranceId, string.Empty);
-                    SetPreview(snapshot.UtteranceId, new LocalIncomingTranslation(transcription.Text, lastTranslation,
-                        NormalizeLanguage(transcription.Text, transcription.Language)));
-
-                    var sourceForTranslation = SelectStableSource(snapshot, transcription);
-                    if (string.IsNullOrWhiteSpace(sourceForTranslation) && !snapshot.IsFinal) continue;
-                    sourceForTranslation = snapshot.IsFinal ? transcription.Text : sourceForTranslation;
-
-                    _latestTranslationRevision[snapshot.UtteranceId] = snapshot.Revision;
-                    if (snapshot.IsFinal) _finalTranslationRevision[snapshot.UtteranceId] = snapshot.Revision;
-                    _translationSnapshots.Writer.TryWrite(new TranslationSnapshot(snapshot.UtteranceId,
-                        snapshot.Revision, transcription.Text, sourceForTranslation, transcription.Language,
-                        snapshot.IsFinal, snapshot.StartTimestamp));
                 }
-                catch (Exception ex) when (HandleWorkerException(ex, snapshot.IsFinal, "ASR"))
+                finally
                 {
-                    if (snapshot.IsFinal) FinishUtterance(snapshot.UtteranceId);
+                    ArrayPool<byte>.Shared.Return(snapshot.Buffer);
                 }
             }
         }
@@ -227,6 +280,17 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         {
             // 正常停止。
         }
+        finally
+        {
+            DrainPendingAudioSnapshots();
+        }
+    }
+
+    /// <summary>停止时把还排在队里的快照全部归还给池。</summary>
+    private void DrainPendingAudioSnapshots()
+    {
+        while (_audioSnapshots.Reader.TryRead(out var pending))
+            ArrayPool<byte>.Shared.Return(pending.Buffer);
     }
 
     private async Task ProcessTranslationSnapshotsAsync()
@@ -289,46 +353,16 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         if (!_previousHypotheses.TryGetValue(snapshot.UtteranceId, out var previous))
         {
             _previousHypotheses[snapshot.UtteranceId] = current.Text;
-            return EndsClause(current.Text) ? current.Text : string.Empty;
+            return IncrementalTranscript.EndsClause(current.Text) ? current.Text : string.Empty;
         }
 
         _previousHypotheses[snapshot.UtteranceId] = current.Text;
-        var stable = LongestStablePrefix(previous, current.Text, current.Language);
-        if (stable.Length < MinimumStableLength(current.Language)) return string.Empty;
+        var stable = IncrementalTranscript.LongestStablePrefix(previous, current.Text, current.Language);
+        if (stable.Length < IncrementalTranscript.MinimumStableLength(current.Language)) return string.Empty;
         if (_lastStableSources.TryGetValue(snapshot.UtteranceId, out var last) && stable == last)
             return string.Empty;
         _lastStableSources[snapshot.UtteranceId] = stable;
         return stable;
-    }
-
-    private static string LongestStablePrefix(string previous, string current, string language)
-    {
-        var length = Math.Min(previous.Length, current.Length);
-        var index = 0;
-        while (index < length && char.ToUpperInvariant(previous[index]) == char.ToUpperInvariant(current[index]))
-            index++;
-        if (index == 0) return string.Empty;
-        var prefix = current[..index].TrimEnd();
-        if (language.StartsWith("en", StringComparison.OrdinalIgnoreCase))
-        {
-            var boundary = prefix.LastIndexOfAny([' ', ',', '.', '!', '?', ';', ':']);
-            if (boundary > 0) prefix = prefix[..boundary].TrimEnd();
-        }
-        return prefix;
-    }
-
-    private static int MinimumStableLength(string language)
-        => language.StartsWith("th", StringComparison.OrdinalIgnoreCase) ? 4 : 3;
-
-    private static bool EndsClause(string text)
-        => text.EndsWith('.') || text.EndsWith('!') || text.EndsWith('?')
-           || text.EndsWith('。') || text.EndsWith('！') || text.EndsWith('？');
-
-    private static string NormalizeLanguage(string text, string detectedLanguage)
-    {
-        if (text.Any(character => character is >= '\u3400' and <= '\u9fff')) return "zh";
-        if (text.Any(character => character is >= '\u0e00' and <= '\u0e7f')) return "th";
-        return detectedLanguage;
     }
 
     private static bool IsStale(long utteranceId, int revision, bool isFinal,
@@ -408,18 +442,6 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private static long ElapsedMilliseconds(long startTimestamp)
         => (long)Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
 
-    private static double CalculateRms(byte[] pcm)
-    {
-        double sum = 0;
-        var sampleCount = pcm.Length / 2;
-        for (var i = 0; i < pcm.Length; i += 2)
-        {
-            var sample = (short)(pcm[i] | (pcm[i + 1] << 8));
-            sum += (double)sample * sample;
-        }
-        return Math.Sqrt(sum / sampleCount);
-    }
-
     public async ValueTask DisposeAsync()
     {
         lock (_gate) ResetNoLock(clearPreview: true);
@@ -428,10 +450,16 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         _lifetime.Cancel();
         try { await Task.WhenAll(_asrWorker, _translationWorker).ConfigureAwait(false); }
         catch (OperationCanceledException) { }
+        DrainPendingAudioSnapshots();
+        _utterance.Dispose();
         _lifetime.Dispose();
     }
 
-    private sealed record AudioSnapshot(long UtteranceId, int Revision, byte[] Audio, bool IsFinal,
+    /// <summary>
+    /// <paramref name="Buffer"/> 来自 <see cref="ArrayPool{T}"/>，长度可能大于
+    /// <paramref name="Length"/>；只有前 <paramref name="Length"/> 字节是有效音频。
+    /// </summary>
+    private sealed record AudioSnapshot(long UtteranceId, int Revision, byte[] Buffer, int Length, bool IsFinal,
         long StartTimestamp);
 
     private sealed record TranslationSnapshot(long UtteranceId, int Revision, string DisplaySource,

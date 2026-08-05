@@ -35,11 +35,25 @@ from local_tts_provider import (
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
+SAMPLE_RATE = 16_000
+
+# 方向词表要区分两件此前被混为一谈的事：
+#   USER_DIRECTIONS —— HTTP 契约和界面上暴露的方向，和 C# 侧 TranslationDirection 一一对应。
+#   MODEL_PAIRS     —— 实际存在的 OPUS-MT 模型。泰译中没有直接模型，必须经英文桥接。
+# 之前 translate_text 认 "th-en"、evaluate_translation 认 "th-zh"，两张表分头演化，
+# 结果是泰语的 glossaryAvailable 恒为 False。
+# th-zh 会依次经过 th-en 和 en-zh 两个模型，其余方向一步到位。
+# 桌面端通过 /translate 直接按模型对逐段调用（见 C# TranslationDirections.ToModelPair），
+# 评估实验室通过 /evaluate 按用户方向调用，桥接在 evaluate_translation 内部完成。
+USER_DIRECTIONS = ("zh-en", "en-zh", "th-zh")
+MODEL_PAIRS = ("zh-en", "en-zh", "th-en")
 
 
 class State:
+    asr_engine = "whisper"
     whisper = None
     whisper_preview = None
+    sherpa = None
     zh_en = None
     en_zh = None
     th_en = None
@@ -72,7 +86,127 @@ def require_model(name):
     return path
 
 
+def read_sherpa_result(result):
+    """从 sherpa-onnx 的识别结果里取出文本。
+
+    OnlineRecognizer.get_result() 直接返回 str；部分版本和其他识别器类型返回带
+    .text 属性的结果对象。之前这里只做 getattr(result, "text", "")，遇到字符串
+    时永远拿到空串——所有 Sherpa 识别结果被静默丢弃，日志里只剩 `text=`。
+    这个 bug 一直没被发现，因为 setup 脚本从来没下载过 Zipformer 模型，
+    整条 Sherpa 路径从未被执行。
+    """
+    if isinstance(result, str):
+        return result.strip()
+    return str(getattr(result, "text", "") or "").strip()
+
+
+def detect_language(text):
+    """按字符分布判定语种；和 C# 侧 SpokenLanguage.Detect 保持同一套区间。
+
+    Sherpa-ONNX 不报语种，Whisper 在短句上报的也不可靠，所以两条链路都以字符为准。
+    """
+    if any("㐀" <= character <= "鿿" for character in text):
+        return "zh"
+    if any("฀" <= character <= "๿" for character in text):
+        return "th"
+    if any(character.isalpha() for character in text):
+        return "en"
+    return "auto"
+
+
+def normalize_asr_engine(value):
+    value = (value or "").strip().lower()
+    if value in {"sherpa", "sherpa-onnx", "zipformer"}:
+        return "sherpa"
+    return "whisper"
+
+
+def _pick_first_file(files, *, exact=None, suffix="", contains=""):
+    exact_set = {name.lower() for name in (exact or [])}
+    for item in sorted(files):
+        name = item.name.lower()
+        if exact_set and name in exact_set:
+            return str(item)
+        if suffix and item.suffix.lower() != suffix:
+            continue
+        if contains and contains not in name:
+            continue
+        if not suffix and not contains:
+            continue
+        return str(item)
+    return None
+
+
+def find_sherpa_model_files():
+    root = Path(model_root())
+    if not root.is_dir():
+        raise RuntimeError(
+            "Local model root is missing. Run tools/setup_local_models.ps1 first."
+        )
+    directories = [root]
+    directories.extend(sorted(path for path in root.rglob("*") if path.is_dir()))
+    for directory in directories:
+        files = [item for item in directory.iterdir() if item.is_file()]
+        if not files:
+            continue
+        tokens = _pick_first_file(
+            files,
+            exact=("tokens.txt", "tokens"),
+            contains=""
+        )
+        if tokens is None:
+            tokens = _pick_first_file(files, suffix=".txt", contains="token")
+        encoder = _pick_first_file(files, suffix=".onnx", contains="encoder")
+        decoder = _pick_first_file(files, suffix=".onnx", contains="decoder")
+        joiner = _pick_first_file(files, suffix=".onnx", contains="joiner")
+        if all((tokens, encoder, decoder, joiner)):
+            return tokens, encoder, decoder, joiner
+    raise RuntimeError(
+        "Sherpa-ONNX Zipformer local model was not found. "
+        "Expected a directory with tokens.txt, encoder*.onnx, decoder*.onnx, and joiner*.onnx "
+        "under " + model_root() + "."
+    )
+
+
+def initialize_sherpa_asr():
+    import sherpa_onnx
+
+    tokens, encoder, decoder, joiner = find_sherpa_model_files()
+    State.sherpa = sherpa_onnx.OnlineRecognizer.from_transducer(
+        tokens=tokens,
+        encoder=encoder,
+        decoder=decoder,
+        joiner=joiner,
+        num_threads=max(1, (os.cpu_count() or 1) // 2),
+        provider="cpu",
+        sample_rate=SAMPLE_RATE,
+        feature_dim=80,
+        decoding_method="greedy_search",
+    )
+
+
+def initialize_whisper_asr():
+    from faster_whisper import WhisperModel
+
+    State.whisper = WhisperModel(
+        "small", device="cpu", compute_type="int8", cpu_threads=8, num_workers=1,
+        local_files_only=True,
+    )
+    State.whisper_preview = WhisperModel(
+        "base", device="cpu", compute_type="int8", cpu_threads=6, num_workers=1,
+        local_files_only=True,
+    )
+
+
 def normalize_game_terms(text, direction):
+    """按模型对应用术语表。direction 是 MODEL_PAIRS 中的值，不是用户方向。
+
+    这里刻意不接受 "th-zh"：泰语原文没有可用的术语规则，能被规范化的是桥接出来的
+    英文。调用方必须自己决定把哪一段文本喂进来，避免出现"传了 th-zh 却静默什么都没做"。
+    """
+    if direction not in MODEL_PAIRS:
+        raise ValueError(f"normalize_game_terms expects a model pair {MODEL_PAIRS}, got {direction!r}")
+
     if direction == "zh-en":
         replacements = {
             "先别冲": "暂时不要进攻",
@@ -97,6 +231,7 @@ def split_clauses(text, direction):
 
 
 def translate_text(text, direction, use_glossary=True, beam_size=4, max_decoding_length=96):
+    """跑单个 OPUS-MT 模型。direction 必须是 MODEL_PAIRS 里的值。"""
     if direction == "zh-en":
         translator = State.zh_en
         tokenizer = State.zh_en_tokenizer
@@ -107,7 +242,7 @@ def translate_text(text, direction, use_glossary=True, beam_size=4, max_decoding
         translator = State.th_en
         tokenizer = State.th_en_tokenizer
     else:
-        raise ValueError("direction must be zh-en, en-zh, or th-en")
+        raise ValueError(f"direction must be one of {MODEL_PAIRS}")
 
     normalized = normalize_game_terms(text.strip(), direction) if use_glossary else text.strip()
     clauses = split_clauses(normalized, direction)
@@ -132,16 +267,22 @@ def translate_text(text, direction, use_glossary=True, beam_size=4, max_decoding
     return output
 
 
-def has_glossary_rules(text, direction):
-    return normalize_game_terms(text.strip(), direction) != text.strip() or (
-        direction == "zh-en" and "不要介意" in text
+def has_glossary_rules(text, model_pair):
+    """这段文本在给定模型对上是否真的会被术语表改写。
+
+    注意参数是模型对而不是用户方向：泰译中的术语规则作用在桥接出来的英文上，
+    传泰语原文进来永远得不到有意义的答案。
+    """
+    stripped = text.strip()
+    return normalize_game_terms(stripped, model_pair) != stripped or (
+        model_pair == "zh-en" and "不要介意" in text
     )
 
 
 def evaluate_translation(text, direction, use_glossary=True, beam_size=4, max_decoding_length=96):
     """Run one translation experiment and return enough trace data for evaluation."""
-    if direction not in ("zh-en", "en-zh", "th-zh"):
-        raise ValueError("direction must be zh-en, en-zh, or th-zh")
+    if direction not in USER_DIRECTIONS:
+        raise ValueError(f"direction must be one of {USER_DIRECTIONS}")
     if not isinstance(beam_size, int) or not 1 <= beam_size <= 8:
         raise ValueError("beamSize must be an integer between 1 and 8")
     if not isinstance(max_decoding_length, int) or not 32 <= max_decoding_length <= 256:
@@ -166,6 +307,9 @@ def evaluate_translation(text, direction, use_glossary=True, beam_size=4, max_de
         )
         normalized = normalize_game_terms(bridge_text, "en-zh") if use_glossary else bridge_text
         model = "opus-mt-th-en + opus-mt-en-zh"
+        # 术语表作用在桥接出来的英文上，所以要拿 bridge_text 去问，而不是泰语原文。
+        # 之前这里传的是原文和 "th-zh"，泰语的 glossaryAvailable 因此恒为 False。
+        glossary_available = has_glossary_rules(bridge_text, "en-zh")
     else:
         normalized = normalize_game_terms(text.strip(), direction) if use_glossary else text.strip()
         translated = translate_text(
@@ -176,6 +320,7 @@ def evaluate_translation(text, direction, use_glossary=True, beam_size=4, max_de
             max_decoding_length=max_decoding_length,
         )
         model = f"opus-mt-{direction}"
+        glossary_available = has_glossary_rules(text, direction)
 
     translation_latency_ms = round((time.perf_counter() - started) * 1000, 2)
     source_chars = len(text)
@@ -195,7 +340,7 @@ def evaluate_translation(text, direction, use_glossary=True, beam_size=4, max_de
         "totalPipelineLatencyMs": translation_latency_ms,
         "tts": None,
         "model": model,
-        "glossaryAvailable": has_glossary_rules(text, direction),
+        "glossaryAvailable": glossary_available,
         "qualitySignals": {
             "sourceCharacters": source_chars,
             "outputCharacters": output_chars,
@@ -222,7 +367,7 @@ def local_tts_voice_availability():
     except Exception:
         voices = {
             voice
-            for direction in ("zh-en", "en-zh", "th-zh")
+            for direction in USER_DIRECTIONS
             for voice in local_voices_for_direction(direction)
         }
         return {voice: False for voice in voices}
@@ -252,8 +397,21 @@ def get_cached_audio(token):
 
 
 def evaluate_online(text, direction, use_glossary=True, include_tts=False, voice=None):
+    if direction not in USER_DIRECTIONS:
+        raise ValueError(f"direction must be one of {USER_DIRECTIONS}")
+
     started = time.perf_counter()
-    normalized = normalize_game_terms(text.strip(), direction) if use_glossary else text.strip()
+
+    # MyMemory 直接支持 th->zh，不走英文桥接，所以泰语原文这一侧没有可套用的术语规则。
+    # 术语表只对 zh-en / en-zh 这两个模型对有定义。
+    glossary_pair = direction if direction in MODEL_PAIRS else None
+    if use_glossary and glossary_pair:
+        normalized = normalize_game_terms(text.strip(), glossary_pair)
+        glossary_available = has_glossary_rules(text, glossary_pair)
+    else:
+        normalized = text.strip()
+        glossary_available = False
+
     translation = translate_mymemory(normalized, direction)
     translated = translation["translatedText"]
     source_chars = len(text)
@@ -282,7 +440,7 @@ def evaluate_online(text, direction, use_glossary=True, include_tts=False, voice
         "totalPipelineLatencyMs": total_latency_ms,
         "tts": tts,
         "model": "MyMemory public translation + Microsoft Edge TTS" if include_tts else "MyMemory public translation",
-        "glossaryAvailable": has_glossary_rules(text, direction),
+        "glossaryAvailable": glossary_available,
         "qualitySignals": {
             "providerMatch": translation["providerMatch"],
             "sourceCharacters": source_chars,
@@ -324,7 +482,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json(200, {
                 "status": "ready",
-                "asr": "faster-whisper-base-preview+small-final-cpu-int8" if State.whisper else "disabled",
+                "asr": "sherpa-onnx-zipformer" if State.sherpa else (
+                    "faster-whisper-base-preview+small-final-cpu-int8" if State.whisper else "disabled"
+                ),
                 "translation": "opus-mt-zh-en+en-zh+th-en-cpu-int8"
                                if State.zh_en_tokenizer is not None else "disabled",
                 "localTts": "piper-tts" if local_tts_available() else "disabled",
@@ -339,10 +499,10 @@ class Handler(BaseHTTPRequestHandler):
                 "privacy": "local-only",
                 "translation": True,
                 "tts": local_tts_available(),
-                "directions": ["zh-en", "en-zh", "th-zh"],
+                "directions": list(USER_DIRECTIONS),
                 "voices": {
                     direction: local_voices_for_direction(direction)
-                    for direction in ("zh-en", "en-zh", "th-zh")
+                    for direction in USER_DIRECTIONS
                 },
                 "voiceLabels": local_voice_labels(),
                 "voiceLicenses": local_voice_licenses(),
@@ -355,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
                 "privacy": "text-sent-to-third-party",
                 "translation": True,
                 "tts": online_tts_available(),
-                "directions": ["zh-en", "en-zh", "th-zh"],
+                "directions": list(USER_DIRECTIONS),
                 "voices": {
                     "zh-en": ["en-US-JennyNeural", "en-US-GuyNeural"],
                     "en-zh": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural"],
@@ -421,7 +581,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
     def transcribe(self, parsed):
-        if State.whisper is None:
+        if State.whisper is None and State.sherpa is None:
             raise RuntimeError("speech recognition is disabled in translation-only mode")
         import numpy as np
 
@@ -443,6 +603,25 @@ class Handler(BaseHTTPRequestHandler):
         )
         if requested != "auto":
             options["language"] = requested
+        if State.asr_engine == "sherpa":
+            if State.sherpa is None:
+                raise RuntimeError("Sherpa-ONNX ASR model is not loaded")
+            with State.asr_lock:
+                stream = State.sherpa.create_stream()
+                stream.accept_waveform(SAMPLE_RATE, audio)
+                stream.accept_waveform(SAMPLE_RATE, np.zeros(int(0.66 * SAMPLE_RATE), dtype=np.float32))
+                stream.input_finished()
+                while State.sherpa.is_ready(stream):
+                    State.sherpa.decode_streams([stream])
+                result = State.sherpa.get_result(stream)
+            text = read_sherpa_result(result)
+            # OnlineRecognizer 不报告语种，只能按字符分布判定。
+            language = requested if requested != "auto" else detect_language(text)
+            self.send_json(200, {"text": text, "language": language})
+            return
+
+        if State.whisper is None:
+            raise RuntimeError("Whisper ASR model is not loaded")
         # Whisper requests stay serialized. Translation uses separate model objects
         # and a separate lock, so incremental ASR and OPUS can run as a CPU pipeline.
         with State.asr_lock:
@@ -487,8 +666,8 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip() or len(text.strip()) > 1000:
             raise ValueError("translation text is empty or too long")
         direction = request.get("direction")
-        if not isinstance(direction, str) or direction not in ("zh-en", "en-zh", "th-zh"):
-            raise ValueError("direction must be zh-en, en-zh, or th-zh")
+        if not isinstance(direction, str) or direction not in USER_DIRECTIONS:
+            raise ValueError(f"direction must be one of {USER_DIRECTIONS}")
         provider = request.get("provider", "local-opus")
         if provider not in ("local-opus", "mymemory-edge"):
             raise ValueError("provider must be local-opus or mymemory-edge")
@@ -553,47 +732,41 @@ def main():
     parser.add_argument("--host", type=parse_bind_host, default="127.0.0.1",
                         help="IPv4 listen address; use 0.0.0.0 only with a restrictive firewall")
     parser.add_argument("--port", type=int, default=18765)
-    parser.add_argument("--asr-only", action="store_true",
-                        help="Load Whisper only and skip OPUS-MT translation models")
+    parser.add_argument("--asr-engine", type=str, default="whisper",
+                        help="ASR backend: whisper (default), sherpa-onnx, or zipformer")
     parser.add_argument("--translation-only", action="store_true",
-                        help="Load OPUS-MT only and serve the browser evaluation lab without Whisper/WPF")
+                        help="Load OPUS-MT only and serve the browser evaluation lab without the ASR pipeline")
     parser.add_argument("--model-root",
                         help="Model directory; overrides VOICESCREEN_MODEL_ROOT and Windows LOCALAPPDATA")
     args = parser.parse_args()
 
-    if args.asr_only and args.translation_only:
-        parser.error("--asr-only and --translation-only cannot be used together")
-
     if args.model_root:
         os.environ["VOICESCREEN_MODEL_ROOT"] = args.model_root
+    State.asr_engine = normalize_asr_engine(args.asr_engine)
 
     if not args.translation_only:
-        from faster_whisper import WhisperModel
-        State.whisper = WhisperModel(
-            "small", device="cpu", compute_type="int8", cpu_threads=8, num_workers=1,
-            local_files_only=True,
-        )
-        State.whisper_preview = WhisperModel(
-            "base", device="cpu", compute_type="int8", cpu_threads=6, num_workers=1,
-            local_files_only=True,
-        )
+        if State.asr_engine == "sherpa":
+            initialize_sherpa_asr()
+        else:
+            initialize_whisper_asr()
 
-    if not args.asr_only:
-        zh_en_model = require_model("opus-mt-zh-en-ct2-int8")
-        en_zh_model = require_model("opus-mt-en-zh-ct2-int8")
-        th_en_model = require_model("opus-mt-th-en-ct2-int8")
-        State.zh_en = ctranslate2.Translator(
-            zh_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
-        )
-        State.en_zh = ctranslate2.Translator(
-            en_zh_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
-        )
-        State.th_en = ctranslate2.Translator(
-            th_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
-        )
-        State.zh_en_tokenizer = MarianTokenizer.from_pretrained(zh_en_model, local_files_only=True)
-        State.en_zh_tokenizer = MarianTokenizer.from_pretrained(en_zh_model, local_files_only=True)
-        State.th_en_tokenizer = MarianTokenizer.from_pretrained(th_en_model, local_files_only=True)
+    # 翻译模型任何模式下都要加载：桌面端的健康检查要求 ASR 和翻译同时就绪，
+    # 评估实验室本身也只需要这一组模型。
+    zh_en_model = require_model("opus-mt-zh-en-ct2-int8")
+    en_zh_model = require_model("opus-mt-en-zh-ct2-int8")
+    th_en_model = require_model("opus-mt-th-en-ct2-int8")
+    State.zh_en = ctranslate2.Translator(
+        zh_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+    )
+    State.en_zh = ctranslate2.Translator(
+        en_zh_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+    )
+    State.th_en = ctranslate2.Translator(
+        th_en_model, device="cpu", compute_type="int8", inter_threads=1, intra_threads=8
+    )
+    State.zh_en_tokenizer = MarianTokenizer.from_pretrained(zh_en_model, local_files_only=True)
+    State.en_zh_tokenizer = MarianTokenizer.from_pretrained(en_zh_model, local_files_only=True)
+    State.th_en_tokenizer = MarianTokenizer.from_pretrained(th_en_model, local_files_only=True)
 
     service_url = f"http://{args.host}:{args.port}/"
     if args.translation_only:

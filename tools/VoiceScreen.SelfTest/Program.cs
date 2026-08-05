@@ -24,7 +24,9 @@ if (args.Any(arg => arg.Equals("--local-models", StringComparison.OrdinalIgnoreC
     await using var local = new LocalOutgoingService();
     await local.StartAsync(CancellationToken.None);
 
-    var direct = await local.TranslateIncomingSpeechAsync(englishPcm, CancellationToken.None);
+    // 识别与翻译是两步，自检也照着真实链路走：先转写，再把文本送去翻译。
+    var heard = await local.TranscribeIncomingSpeechAsync(englishPcm, CancellationToken.None);
+    var direct = await local.TranslateIncomingTextAsync(heard.Text, heard.Language, CancellationToken.None);
     Console.WriteLine($"PASS：本地英译中直连，{direct.SourceText} → {direct.TranslatedText}");
     if (string.IsNullOrWhiteSpace(direct.SourceText) || string.IsNullOrWhiteSpace(direct.TranslatedText))
         throw new InvalidOperationException("本地英译中没有返回完整结果。");

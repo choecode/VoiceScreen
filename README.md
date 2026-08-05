@@ -31,6 +31,24 @@ ASR 固定使用本机 Whisper；文本翻译和英文 TTS 可分别选择本地
 
 语音始终只在本机识别。选择本地翻译和本地 TTS 时不会上传语音或文字；选择 API 时，识别出的文字会发给 MyMemory，英文译文会发给 Edge TTS。
 
+### 项目结构
+
+| 项目 | 职责 |
+|---|---|
+| `src/VoiceScreen.Core` | 与平台无关的纯逻辑：翻译方向、语种判定、病态输出检测、增量字幕稳定前缀、PCM 电平。全部有单元测试覆盖。 |
+| `src/VoiceScreen.App` | WPF 界面、音频路由、Discord 捕获、本地服务进程管理。 |
+| `src/VoiceScreen.App/LocalService` | Python 推理服务：Whisper/Sherpa ASR + OPUS-MT 翻译 + 评测台 HTTP 接口。 |
+| `tools/VoiceScreen.SelfTest` | 需要真实模型的端到端自检。 |
+
+**翻译方向只有一处定义**：`TranslationDirection` 区分「用户方向」（`zh-en` / `en-zh` /
+`th-zh`，即 HTTP 契约和界面暴露的）和「模型对」（`zh-en` / `en-zh` / `th-en`，即实际存在的
+OPUS-MT 模型）。泰译中没有直接模型，`ToModelPair()` 会返回 `th-en → en-zh` 两段桥接路径，
+Python 侧的 `USER_DIRECTIONS` / `MODEL_PAIRS` 与之一一对应。
+
+**语种判定只有一处实现**：`SpokenLanguage.Detect` 以文本字符分布为准，ASR 报告的语种标签
+只作为回退——Whisper 在短句上的 `language` 字段并不可靠。Python 侧的 `detect_language`
+使用同一套 Unicode 区间。
+
 ## 浏览器翻译质量评测台
 
 本地模型服务启动后，浏览器打开：
@@ -100,17 +118,39 @@ Discord 的“语音和视频”设置：
 
 ## 开发和验证
 
+全部测试（C# 68 个 + Python 30 个）走同一条命令。两套测试对工作目录的要求不同，
+脚本已经封装好，本地和 CI 用的是同一个入口：
+
 ```powershell
-dotnet build VoiceScreen.sln -c Release
-dotnet test tests\VoiceScreen.Tests\VoiceScreen.Tests.csproj -c Release --no-build
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
+```
+
+只跑其中一侧：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1 -DotnetOnly
+```
+
+源码编码检查（几秒钟，CI 里排在最前面）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\check_encoding.ps1
+```
+
+它会拦住两类曾经真实发生过的问题：源码文件里出现非法 UTF-8 序列（中文常量被截断，
+Python 直接 SyntaxError 起不来），以及含中文的 `.ps1` 缺少 UTF-8 BOM
+（Windows PowerShell 5.1 会按 ANSI 解码并报 ParserError）。
+
+需要真实模型的端到端自检：
+
+```powershell
 dotnet run --project tools\VoiceScreen.SelfTest\VoiceScreen.SelfTest.csproj -c Release -- --local-models
 ```
 
-应用发布：
+`.github/workflows/ci.yml` 在 push 和 PR 上跑「编码检查 → 构建 → 全部测试」。
+Python 用例全部使用桩模块，不需要安装模型运行时。
 
-```powershell
-dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj -c Release -r win-x64 --self-contained false -o dist\VoiceScreen-local-offline
-```
+发布步骤见 [完整部署教程](DEPLOYMENT.md)。
 
 ## 隐私与限制
 
@@ -120,3 +160,24 @@ dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj -c Release -r win-x64 
 - 第一次准备模型需要联网；准备完成后的翻译流程可以完全离线运行。
 - 纯 CPU 方案优先减少显卡占用，实际延迟取决于 CPU；当前开发机预热后的完整发送链路约在 5 秒目标内。
 - Discord 降噪可能裁掉 TTS 开头；程序已增加尾部静音和播放排空保护，仍建议在 Discord 中用“麦克风测试”确认一次。
+
+## 可选的 ASR 引擎
+
+默认使用 faster-whisper（`base` 实时预览 + `small` 最终定稿），支持中/英/泰三语。
+
+也可以切到 Sherpa-ONNX Zipformer。它**不在默认安装范围内**，需要显式装一次
+（Python 包 + 约 190 MB 模型文件，一条命令装齐）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1 -Sherpa
+```
+
+脚本会下载 [csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20](https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20)
+的 INT8 版本，装完会立刻加载一次做验证，装坏了当场就报错，而不是等到应用启动时
+给一句看不懂的提示。
+
+> **Sherpa 只支持中文和英文。** 这个 Zipformer 是 zh-en 双语模型，不认泰语。
+> 需要泰语字幕就把 ASR 引擎保持在 Whisper。
+
+没装就在界面上选了 Sherpa 的话，点「开始」会失败，错误信息里会直接写明缺的是
+`sherpa_onnx` 包还是模型文件。

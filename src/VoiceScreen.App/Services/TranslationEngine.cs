@@ -37,8 +37,8 @@ public sealed class TranslationEngine : IAsyncDisposable
         NormalizeAudioRoutingDevices();
         ValidateSettings();
         _router.Start(_settings.MicrophoneDeviceId, _settings.CableRenderDeviceId, _settings.MonitorRenderDeviceId);
-        StatusChanged?.Invoke(this, "正在加载本机 Whisper 与本地翻译备用模型……");
-        _localOutgoing = new LocalOutgoingService();
+        StatusChanged?.Invoke(this, $"正在加载本机 {AsrEngineDisplayName()} 与本地翻译备用模型……");
+        _localOutgoing = new LocalOutgoingService(asrEngine: _settings.AsrEngine);
         await _localOutgoing.StartAsync(cancellationToken).ConfigureAwait(false);
         _remote = new OnlineApiService(_settings.ApiEnglishVoice);
         if (_settings.UseApiTranslation || _settings.UseApiTts)
@@ -50,8 +50,14 @@ public sealed class TranslationEngine : IAsyncDisposable
         _discordCapture = CreateIncomingCapture();
         IsRunning = true;
         VoiceScreenLog.Info($"TranslationEngine started. ASR=local translation={ProviderName(_settings.UseApiTranslation)} tts={ProviderName(_settings.UseApiTts)} lowLatency={_settings.LowLatencyIncoming}");
-        StatusChanged?.Invoke(this, $"运行中 · ASR=本地 · 翻译={ProviderName(_settings.UseApiTranslation)} · TTS={ProviderName(_settings.UseApiTts)} · 只监听 Discord");
+        StatusChanged?.Invoke(this,
+            $"运行中 · ASR={AsrEngineDisplayName()} · 翻译={ProviderName(_settings.UseApiTranslation)} · TTS={ProviderName(_settings.UseApiTts)} · 只监听 Discord");
     }
+
+    private string AsrEngineDisplayName()
+        => string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase)
+            ? "Sherpa-ONNX Zipformer"
+            : "Whisper";
 
     public void UpdateProviders(bool useApiTranslation, bool useApiTts)
     {
@@ -241,15 +247,11 @@ public sealed class TranslationEngine : IAsyncDisposable
     {
         if (!_state.ShouldAcceptRemoteResult || string.IsNullOrWhiteSpace(result.TranslatedText)) return;
         if (_echo.IsLikelyEcho(result.SourceText)) return;
-        if (!result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
-            && !result.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
-            && !result.Language.StartsWith("th", StringComparison.OrdinalIgnoreCase)) return;
-        var subtitle = result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+        if (!SpokenLanguage.IsSupportedIncoming(result.Language)) return;
+        // 原文和中文译文作为同一个字幕项，滚动和淘汰时不会错位。
+        var subtitle = SpokenLanguage.Is(result.Language, SpokenLanguage.Chinese)
             ? $"中：{result.SourceText}"
-            : result.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
-                ? $"EN：{result.SourceText}\n中：{result.TranslatedText}"
-                : $"TH：{result.SourceText}\n中：{result.TranslatedText}";
-        // 英文原文和中文译文作为同一个字幕项，滚动和淘汰时不会错位。
+            : $"{SubtitleLabel(result.Language)}：{result.SourceText}\n中：{result.TranslatedText}";
         SubtitleProduced?.Invoke(this, ("remote", subtitle));
     }
 
@@ -261,20 +263,19 @@ public sealed class TranslationEngine : IAsyncDisposable
             return;
         }
         if (string.IsNullOrWhiteSpace(result.SourceText) || _echo.IsLikelyEcho(result.SourceText)) return;
-        if (!IsSupportedIncomingLanguage(result.Language)) return;
-        var label = result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase) ? "中"
-            : result.Language.StartsWith("th", StringComparison.OrdinalIgnoreCase) ? "TH" : "EN";
-        var preview = $"{label}（实时）：{result.SourceText}";
-        if (!result.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+        if (!SpokenLanguage.IsSupportedIncoming(result.Language)) return;
+        var preview = $"{SubtitleLabel(result.Language)}（实时）：{result.SourceText}";
+        if (!SpokenLanguage.Is(result.Language, SpokenLanguage.Chinese)
             && !string.IsNullOrWhiteSpace(result.TranslatedText))
             preview += $"\n中（实时）：{result.TranslatedText}";
         SubtitlePreviewChanged?.Invoke(this, preview);
     }
 
-    private static bool IsSupportedIncomingLanguage(string language)
-        => language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
-           || language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
-           || language.StartsWith("th", StringComparison.OrdinalIgnoreCase);
+    private static string SubtitleLabel(string language)
+    {
+        if (SpokenLanguage.Is(language, SpokenLanguage.Chinese)) return "中";
+        return SpokenLanguage.Is(language, SpokenLanguage.Thai) ? "TH" : "EN";
+    }
 
     private void OnIncomingStatus(object? sender, string message) => StatusChanged?.Invoke(this, message);
 

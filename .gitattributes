@@ -1,0 +1,16 @@
+# 仓库内统一以 LF 存储；Windows 工作区检出为 CRLF。
+# 没有这个文件时，每次 git 操作都会刷 "LF will be replaced by CRLF" 警告，
+# 而且换行符变化会把整个文件染成 diff，掩盖真正的改动。
+* text=auto eol=crlf
+
+# 二进制文件不做任何换行符转换。
+*.png binary
+*.jpg binary
+*.zip binary
+*.dll binary
+*.exe binary
+*.pdb binary
+*.onnx binary
+*.bin binary
+*.wav binary
+*.mp3 binary

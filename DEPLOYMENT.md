@@ -126,6 +126,38 @@ powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 
 OPUS-MT 是专用机器翻译模型，不是聊天模型。中译英模型采用 CC-BY-4.0，英译中和泰译英模型采用 Apache-2.0；分发程序时应保留模型来源与许可说明。
 
+上面这条命令**不包含** Sherpa-ONNX Zipformer。默认 ASR 是 Whisper，装到这里就够用了。
+
+### 3.3.1 可选：安装 Sherpa-ONNX Zipformer
+
+只有在你想把主界面的「语音识别」切到 `本地 Sherpa-ONNX Zipformer` 时才需要这一步。
+加 `-Sherpa` 重跑同一个脚本即可，已经装好的部分会自动跳过：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1 -Sherpa
+```
+
+它会额外完成：
+
+1. 安装 `sherpa-onnx` Python 包。
+2. 从 HuggingFace 下载 `csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20`
+   的 INT8 模型文件（`tokens.txt` 与 encoder / decoder / joiner 三个 `.onnx`，合计约 190 MB）。
+3. 立刻加载一次模型做验证，确认这个引擎真的可用。
+
+看到下面这行才算成功：
+
+```text
+Sherpa-ONNX Zipformer loaded successfully
+```
+
+> **重要：Sherpa 这个模型只支持中文和英文，不支持泰语。**
+> 需要泰语字幕，请把 ASR 引擎保持在 Whisper。
+
+包和模型缺任何一样，Sherpa 都无法工作。**只装包不下模型是不够的** —— 应用会在点击
+「开始」时报 `Sherpa-ONNX Zipformer local model was not found`。从 2026-08-05 起，
+启动失败的弹窗会直接显示本地服务的真实报错（比如 `ModuleNotFoundError: No module
+named 'sherpa_onnx'`），不必再翻日志猜原因。
+
 ### 3.4 安装 Windows 英文语音
 
 打开：
@@ -152,7 +184,7 @@ OPUS-MT 是专用机器翻译模型，不是聊天模型。中译英模型采用
 
 ### 4.1 直接使用已发布目录
 
-如果开发者已经把 `VoiceScreen-local-offline` 文件夹发给你，完整解压到固定目录，例如：
+如果开发者已经把发布目录发给你，完整解压到固定目录，例如：
 
 ```text
 C:\Apps\VoiceScreen\
@@ -163,14 +195,19 @@ C:\Apps\VoiceScreen\
 ```text
 VoiceScreen.App.exe
 VoiceScreen.App.dll
-VoiceScreen.Core.dll
+VoiceScreen.Core.dll          <- 少了它程序会在启动时直接崩
 LocalService\local_outgoing_service.py
+LocalService\online_providers.py
+LocalService\local_tts_provider.py
+LocalService\web\
 其他 .dll 和 .json 文件
 ```
 
-不能只复制 `VoiceScreen.App.exe`，否则程序无法启动。
+**只复制 `VoiceScreen.App.exe` 是不行的。** 缺少同目录的 `VoiceScreen.Core.dll` 时，
+程序会弹出「启动失败 · Could not load file or assembly 'VoiceScreen.Core'」并无法继续。
+排查见 [9.13](#913-提示-could-not-load-file-or-assembly-voicescreencore)。
 
-### 4.2 从私有 GitHub 仓库编译
+### 4.2 从源码编译
 
 先安装 Git 和 GitHub CLI，并登录有仓库权限的 GitHub 账号：
 
@@ -180,25 +217,30 @@ winget install --id GitHub.cli -e
 gh auth login
 ```
 
-克隆、编译并发布：
+克隆、编译、测试并发布：
 
 ```powershell
 Set-Location "$env:USERPROFILE\Desktop"
 gh repo clone choecode/VoiceScreen
 Set-Location VoiceScreen
 dotnet restore VoiceScreen.sln
-dotnet build VoiceScreen.sln -c Release
-dotnet test tests\VoiceScreen.Tests\VoiceScreen.Tests.csproj -c Release --no-build
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
 dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
   -c Release -r win-x64 --self-contained false `
-  -o dist\VoiceScreen-local-offline
+  -o dist\VoiceScreen-latest
 ```
+
+`run_tests.ps1` 会跑完 C# 与 Python 两套测试（分别 68 个和 30 个）。它在发布之前跑，
+是为了挡住一类真实发生过的事故：本地推理服务是 Python 脚本，编译期不会检查，
+文件坏掉时 `dotnet build` 照样成功，直到运行时才崩。
 
 发布结果位于：
 
 ```text
-dist\VoiceScreen-local-offline\VoiceScreen.App.exe
+dist\VoiceScreen-latest\VoiceScreen.App.exe
 ```
+
+发布后请从这个目录整体启动或整体打包，不要单独拷贝 exe。
 
 仓库是私有的；没有权限的账号无法克隆。
 
@@ -425,6 +467,46 @@ powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
 
 当前 Windows Process Loopback 捕获的是 Discord 输出的混合音轨，Discord 没有把参与者用户名交给 VoiceScreen。因此当前字幕不能可靠标出真实说话人。后续可以增加纯本地说话人聚类并显示“说话人 1/2”，但它无法知道真实用户名，而且重叠说话时准确率有限。若必须显示 Discord 用户名，需要改成 Discord Bot 分用户接收音轨。
 
+### 9.13 提示 Could not load file or assembly 'VoiceScreen.Core'
+
+弹窗内容类似：
+
+```text
+启动失败
+Could not load file or assembly 'VoiceScreen.Core, Version=1.0.0.0,
+Culture=neutral, PublicKeyToken=null'. 系统找不到指定的文件。
+```
+
+说明你启动的那个 `VoiceScreen.App.exe` 旁边没有 `VoiceScreen.Core.dll`。常见原因：
+
+- 只把 exe 单独复制了出来，没有带上同目录的其他文件；
+- 启动的是某个残留的旧发布目录，而它的内容已经被清理或不完整；
+- 机器上存在多份历史 `dist\` / `bin\` 副本，点开的不是最新那份。
+
+处理办法——重新发布一份完整的，并从这个目录启动：
+
+```powershell
+Set-Location "$env:USERPROFILE\Desktop\VoiceScreen"
+dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
+  -c Release -r win-x64 --self-contained false `
+  -o dist\VoiceScreen-latest
+.\dist\VoiceScreen-latest\VoiceScreen.App.exe
+```
+
+确认下列文件都在同一个目录里再启动：
+
+```powershell
+Get-ChildItem dist\VoiceScreen-latest\VoiceScreen.Core.dll,
+              dist\VoiceScreen-latest\VoiceScreen.App.dll,
+              dist\VoiceScreen-latest\LocalService\local_outgoing_service.py
+```
+
+排查前先确认没有旧实例还开着：
+
+```powershell
+Get-Process VoiceScreen.App -ErrorAction SilentlyContinue
+```
+
 ## 10. 日志与配置位置
 
 运行日志：
@@ -461,10 +543,15 @@ Remove-Item "$env:LOCALAPPDATA\VoiceScreen\settings.dat" -ErrorAction SilentlyCo
 Set-Location "$env:USERPROFILE\Desktop\VoiceScreen"
 git pull --ff-only
 dotnet restore VoiceScreen.sln
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
 dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
   -c Release -r win-x64 --self-contained false `
-  -o dist\VoiceScreen-local-offline
+  -o dist\VoiceScreen-latest
 ```
+
+更新前请先退出正在运行的 VoiceScreen，否则发布会因为文件被占用而失败。
+发布目录是整体替换的，旧目录可以直接删掉——里面没有任何配置或模型，
+设置存在 `%LOCALAPPDATA%\VoiceScreen\`，模型存在模型根目录。
 
 更新前先退出 VoiceScreen。不要在程序运行时覆盖发布目录。
 

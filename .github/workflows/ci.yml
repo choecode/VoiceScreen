@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    # WPF 只能在 Windows 上编译，Python 用例也按 Windows 路径约定写的。
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Python 用例全部是 stdlib + 桩模块，不需要装 ctranslate2/transformers/
+      # faster-whisper 这些模型运行时，CI 因此能在一分钟内跑完。
+
+      - name: 检查源码文件编码
+        shell: pwsh
+        run: ./tools/check_encoding.ps1
+
+      - name: 构建
+        run: dotnet build VoiceScreen.sln --nologo -c Release
+
+      - name: 测试
+        shell: pwsh
+        run: ./tools/run_tests.ps1

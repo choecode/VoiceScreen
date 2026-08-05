@@ -220,14 +220,49 @@ Discord 输出设备必须是实体耳机。关闭 Windows CABLE Output 属性�
 
 正式模式需要加载两套 Whisper 和三套 OPUS-MT 模型。冷启动可能需要数秒到几十秒，游戏占用 CPU 或磁盘时会更久。
 
-## 12. 开发与验证
+### 退出后仍有 python.exe 占着内存
+
+VoiceScreen 会在关闭时结束自己启动的本地推理服务，并且把该进程放进 Windows Job Object，
+即使主程序崩溃或被强杀，系统也会连带回收它。如果仍看到残留进程，多半是手工用命令行
+单独启动过 `local_outgoing_service.py`，那种情况下的进程不归程序管：
 
 ```powershell
-dotnet build VoiceScreen.sln -c Release
-dotnet test VoiceScreen.sln -c Release --no-build
+Get-Process python -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -like '*local_outgoing_service*' }
+```
+
+### 启动时提示找不到 VoiceScreen.Core
+
+说明启动的那个 exe 旁边缺少 `VoiceScreen.Core.dll`，通常是单独复制了 exe，
+或者点开了残留的旧发布目录。处理办法见 [部署教程 9.13](DEPLOYMENT.md)。
+
+## 12. 开发与验证
+
+一条命令跑完全部测试（C# 68 个 + Python 30 个）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
+```
+
+C# 和 Python 两套测试对工作目录的要求不同（Python 用例通过 `sys.path` 直接引入
+`LocalService` 里的模块，必须在 `tests/python` 下 discover），脚本已经把差异封装掉，
+本地和 CI 用的是同一个入口。
+
+源码编码检查：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\check_encoding.ps1
+```
+
+需要真实模型的端到端自检：
+
+```powershell
 dotnet run --project tools\VoiceScreen.SelfTest\VoiceScreen.SelfTest.csproj `
   -c Release -- --local-models
 ```
+
+`.github/workflows/ci.yml` 在 push 和 PR 上依次跑「编码检查 → 构建 → 全部测试」。
+Python 用例使用桩模块，CI 不需要安装 ctranslate2 / transformers / faster-whisper。
 
 自动验证范围及当前结果见 [测试报告](TEST_REPORT.md)。低延迟增量字幕的后续优化计划见 [实时化路线](REALTIME_ROADMAP.md)。
 
@@ -235,13 +270,37 @@ dotnet run --project tools\VoiceScreen.SelfTest\VoiceScreen.SelfTest.csproj `
 
 ```text
 VOICE_SCREEN/
-├─ src/VoiceScreen.App/          WPF 主程序、悬浮窗、音频和翻译编排
-├─ src/VoiceScreen.Core/         双向状态机和回声抑制等核心逻辑
-├─ tests/VoiceScreen.Tests/      xUnit 单元测试
-├─ tools/VoiceScreen.SelfTest/   音频设备和本地模型端到端自检
-├─ tools/setup_local_models.ps1  本地依赖、模型下载和转换脚本
-├─ docs/images/                  文档截图
-├─ DEPLOYMENT.md                 完整部署教程
-├─ TEST_REPORT.md                验证结果
-└─ THIRD_PARTY_MODELS.md         第三方模型与许可
+├─ src/VoiceScreen.App/            WPF 主程序、悬浮窗、音频和翻译编排
+│  └─ LocalService/                Python 推理服务与浏览器评测台
+├─ src/VoiceScreen.Core/           与平台无关的纯逻辑，全部有测试覆盖
+├─ tests/VoiceScreen.Tests/        xUnit 单元测试
+├─ tests/python/                   本地服务与 HTTP 契约的 unittest 用例
+├─ tools/run_tests.ps1             两套测试的统一入口
+├─ tools/check_encoding.ps1        源码 UTF-8 / PowerShell BOM 检查
+├─ tools/VoiceScreen.SelfTest/     音频设备和本地模型端到端自检
+├─ tools/setup_local_models.ps1    本地依赖、模型下载和转换脚本
+├─ .github/workflows/ci.yml        编码检查 + 构建 + 测试
+├─ docs/images/                    文档截图
+├─ DEPLOYMENT.md                   完整部署教程
+├─ TEST_REPORT.md                  验证结果
+└─ THIRD_PARTY_MODELS.md           第三方模型与许可
 ```
+
+### 13.1 Core 里放什么
+
+`VoiceScreen.Core` 收敛的是「不依赖 WPF、音频设备和网络，因此可以被单元测试直接覆盖」
+的逻辑。这些代码原先散在 WPF 项目里，无法测试，阈值只能靠肉眼调：
+
+| 类型 | 职责 |
+|---|---|
+| `DuplexStateMachine` | 收发双向状态流转 |
+| `EchoSuppressor` | 防止程序听见自己刚发出的英文 |
+| `TranslationDirection` / `TranslationDirections` | 用户方向与 OPUS-MT 模型对的唯一定义，泰语桥接路径 |
+| `SpokenLanguage` | 中/英/泰语种判定，文本字符优先于 ASR 标签 |
+| `TranscriptSanitizer` | 病态重复与译文异常膨胀的检测阈值 |
+| `IncrementalTranscript` | 低延迟字幕的稳定前缀提取与词边界回退 |
+| `PcmLevel` | 语音活动检测用的 RMS 电平 |
+
+**方向与语种各只有一处定义。** 之前 C# 侧、Python 的 `translate_text`、Python 的
+`evaluate_translation` 各维护一份方向列表且已经不一致（`th-en` / `th-zh` 混用），
+中/泰 Unicode 区间判定则被复制了四份。加一门语言原本要改四处，现在改一处。
