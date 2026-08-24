@@ -58,6 +58,18 @@ public static class TranscriptWindow
     }
 
     /// <summary>
+    /// 只有能把稳定文本可靠映射回音频时间轴时才允许提交滚动窗口。
+    /// Qwen3-ASR 当前不返回词级时间戳；这种情况下文本可以作为实时预览替换显示，
+    /// 但绝不能在音频没有同步裁掉时累加进已提交前缀，否则下一轮会重复识别并拼接同一段声音。
+    /// </summary>
+    public static bool TryGetCommittedEndSeconds(IReadOnlyList<TranscribedWord>? words, string? committedText,
+        out double seconds)
+    {
+        seconds = CommittedEndSeconds(words, committedText);
+        return seconds > 0;
+    }
+
+    /// <summary>
     /// 裁掉已确认前缀后，上一次的识别假设也要跟着重新对齐到新窗口，否则
     /// LocalAgreement 会拿旧窗口的文本和新窗口的文本比较，得到一个必然为空的公共前缀。
     /// </summary>
@@ -84,6 +96,38 @@ public static class TranscriptWindow
         return needsSpace ? left + ' ' + right : left + right;
     }
 
+    /// <summary>
+    /// 强制音频分段会把很短的一截边界声音同时留在前后两段，ASR 因而可能把边界词识别两次。
+    /// 只比较完整的、去标点后的词，并删除当前段开头与上一段结尾的最长重叠。
+    /// </summary>
+    public static string RemoveBoundaryWordOverlap(string? previousText, string? currentText)
+    {
+        var current = (currentText ?? string.Empty).Trim();
+        if (current.Length == 0 || string.IsNullOrWhiteSpace(previousText)) return current;
+
+        var previousWords = previousText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        var currentWords = current.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        var maximumOverlap = Math.Min(8, Math.Min(previousWords.Length, currentWords.Length));
+        for (var overlap = maximumOverlap; overlap > 0; overlap--)
+        {
+            var matches = true;
+            for (var index = 0; index < overlap; index++)
+            {
+                var left = NormalizeBoundaryWord(previousWords[previousWords.Length - overlap + index]);
+                var right = NormalizeBoundaryWord(currentWords[index]);
+                if (left.Length == 0 || !string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if (matches) return string.Join(' ', currentWords.Skip(overlap));
+        }
+
+        return current;
+    }
+
     private static string Normalize(string? text)
     {
         if (string.IsNullOrEmpty(text)) return string.Empty;
@@ -92,6 +136,18 @@ public static class TranscriptWindow
         foreach (var character in text)
         {
             if (char.IsWhiteSpace(character)) continue;
+            buffer[length++] = char.ToLowerInvariant(character);
+        }
+        return new string(buffer[..length]);
+    }
+
+    private static string NormalizeBoundaryWord(string word)
+    {
+        Span<char> buffer = word.Length <= 64 ? stackalloc char[word.Length] : new char[word.Length];
+        var length = 0;
+        foreach (var character in word)
+        {
+            if (!char.IsLetterOrDigit(character)) continue;
             buffer[length++] = char.ToLowerInvariant(character);
         }
         return new string(buffer[..length]);

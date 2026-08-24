@@ -63,6 +63,16 @@ public class TranscriptWindowTests
     {
         Assert.Equal(0, TranscriptWindow.CommittedEndSeconds(null, "anything"));
         Assert.Equal(0, TranscriptWindow.CommittedEndSeconds([], "anything"));
+        Assert.False(TranscriptWindow.TryGetCommittedEndSeconds(null, "anything", out var seconds));
+        Assert.Equal(0, seconds);
+    }
+
+    [Fact]
+    public void 有可靠时间戳时才允许提交文本与音频窗口()
+    {
+        Assert.True(TranscriptWindow.TryGetCommittedEndSeconds(
+            EnglishWords(), "Enemies are on the", out var seconds));
+        Assert.Equal(1.10 - TranscriptWindow.TrimSafetyMarginSeconds, seconds, 3);
     }
 
     [Fact]
@@ -111,4 +121,28 @@ public class TranscriptWindowTests
     [InlineData("", "", "")]
     public void 拼接容忍空值(string? committed, string? window, string expected)
         => Assert.Equal(expected, TranscriptWindow.Join(committed, window));
+
+    [Fact]
+    public void 强制分段删除重复的英文边界词()
+    {
+        var current = TranscriptWindow.RemoveBoundaryWordOverlap(
+            "But this is a hope, a sort of goal with.",
+            "With the layered structure like this.");
+        Assert.Equal("the layered structure like this.", current);
+    }
+
+    [Fact]
+    public void 强制分段优先删除最长的多词重叠()
+    {
+        var current = TranscriptWindow.RemoveBoundaryWordOverlap(
+            "We can detect edges and patterns like this.",
+            "Patterns like this would be useful elsewhere.");
+        Assert.Equal("would be useful elsewhere.", current);
+    }
+
+    [Fact]
+    public void 不相关的相邻字幕保持不变()
+        => Assert.Equal("A completely new sentence.",
+            TranscriptWindow.RemoveBoundaryWordOverlap("The previous thought ended.",
+                "A completely new sentence."));
 }

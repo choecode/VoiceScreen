@@ -61,4 +61,44 @@ public class IncrementalTranscriptTests
     [InlineData(null, false)]
     public void 句末标点判定(string? text, bool expected)
         => Assert.Equal(expected, IncrementalTranscript.EndsClause(text));
+
+    [Fact]
+    public void 累计快照只返回尚未翻译的新尾部()
+    {
+        var suffix = IncrementalTranscript.NewlyStableSuffix(
+            "Yeah, it's basically that, but on crack. They found a way.",
+            "Yeah, it's basically that, but on crack. They found a way, and there's no hack like that.");
+
+        Assert.Equal("and there's no hack like that.", suffix);
+    }
+
+    [Fact]
+    public void 标点与空白修订不会让整段再次翻译()
+    {
+        var suffix = IncrementalTranscript.NewlyStableSuffix(
+            "Oh, what the fuck! That's crazy. They made a thing.",
+            "Oh what the fuck — that's crazy; they made a thing. They found a way.");
+
+        Assert.Equal("They found a way.", suffix);
+    }
+
+    [Fact]
+    public void 早先一个词被修正后仍按词对齐新尾部()
+    {
+        var suffix = IncrementalTranscript.NewlyStableSuffix(
+            "They basically made a thing and found a way.",
+            "They actually made a thing and found a way. It worked.");
+
+        Assert.Equal("It worked.", suffix);
+    }
+
+    [Fact]
+    public void 无法对齐的识别回卷不会重复追加整段()
+        => Assert.Equal(string.Empty,
+            IncrementalTranscript.NewlyStableSuffix("They found a way.", "A completely different hypothesis."));
+
+    [Fact]
+    public void 没有旧前缀时完整返回当前稳定文本()
+        => Assert.Equal("First stable clause.",
+            IncrementalTranscript.NewlyStableSuffix(null, "First stable clause."));
 }

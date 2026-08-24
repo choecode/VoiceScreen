@@ -10,6 +10,7 @@ namespace VoiceScreen.App.Diagnostics;
 /// </summary>
 public static class VoiceScreenLog
 {
+    private const long MaximumLogBytes = 5 * 1024 * 1024;
     private static readonly object _lock = new();
     private static readonly string _path = InitPath();
 
@@ -26,7 +27,17 @@ public static class VoiceScreenLog
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "VoiceScreen");
         Directory.CreateDirectory(root);
-        return Path.Combine(root, "voicescreen.log");
+        var path = Path.Combine(root, "voicescreen.log");
+        try
+        {
+            if (File.Exists(path) && new FileInfo(path).Length > MaximumLogBytes)
+                File.Move(path, Path.Combine(root, "voicescreen.previous.log"), overwrite: true);
+        }
+        catch
+        {
+            // 日志轮换失败不应阻止应用启动。
+        }
+        return path;
     }
 
     private static void Write(string level, string message)

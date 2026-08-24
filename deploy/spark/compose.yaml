@@ -1,0 +1,71 @@
+services:
+  model-service:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    image: voicescreen/qwen-model-service:2026.08.25.2
+    container_name: voicescreen-model-service
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    shm_size: 4gb
+    environment:
+      VOICESCREEN_BIND_HOST: 0.0.0.0
+      VOICESCREEN_PORT: "18765"
+      VOICESCREEN_API_TOKEN: ${VOICESCREEN_API_TOKEN:?set VOICESCREEN_API_TOKEN in .env}
+      VOICESCREEN_ASR_MODEL: /models/Qwen3-ASR-1.7B
+      VOICESCREEN_TRANSLATION_MODEL: /models/Qwen3-4B-Instruct-2507
+      TOKENIZERS_PARALLELISM: "false"
+    volumes:
+      - /opt/voicescreen/models/voicescreen:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18765/health', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 180s
+
+  tts-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.tts
+      args:
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    image: voicescreen/qwen-tts-service:2026.08.25.1
+    container_name: voicescreen-tts-service
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    shm_size: 4gb
+    environment:
+      VOICESCREEN_TTS_PORT: "18766"
+      VOICESCREEN_API_TOKEN: ${VOICESCREEN_API_TOKEN:?set VOICESCREEN_API_TOKEN in .env}
+      VOICESCREEN_TTS_MODEL: /models/Qwen3-TTS-12Hz-0.6B-Base
+      VOICESCREEN_VOICE_ID: my-voice
+      VOICESCREEN_VOICE_REFERENCE: /profiles/my-voice-reference.wav
+      VOICESCREEN_VOICE_REFERENCE_TEXT: "Hello. This is my natural speaking voice. Today, I'm testing a real-time translation system."
+      VOICESCREEN_VOICE_PROMPT: /profiles/my-voice.pt
+    volumes:
+      - /opt/voicescreen/models/voicescreen:/models:ro
+      - /opt/voicescreen/models/voicescreen/voice-profiles:/profiles
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18766/health', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 180s

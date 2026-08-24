@@ -8,8 +8,8 @@ using VoiceScreen.Core;
 namespace VoiceScreen.App.Services;
 
 /// <summary>
-/// 双向本地语音翻译：faster-whisper CPU INT8 识别 + OPUS-MT CPU INT8 专用翻译模型。
-/// 所有网络请求仅发往 127.0.0.1，不依赖任何云端 API。
+/// 双向语音翻译模型客户端：可连接 Spark 上的 Qwen 模型服务，也可启动本机
+/// faster-whisper + OPUS-MT 备用服务。
 /// </summary>
 public sealed class LocalOutgoingService : IAsyncDisposable
 {
@@ -25,13 +25,20 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private readonly ChildProcessJob? _processJob = ChildProcessJob.TryCreate();
     private readonly string _asrEngine;
     private readonly string _asrDevice;
+    private readonly bool _remoteMode;
     private Process? _asrProcess;
     private bool _ownsAsr;
+    private bool _qwenStreamingAvailable;
 
-    public LocalOutgoingService(string asrEngine = "whisper", string asrDevice = "auto")
+    public LocalOutgoingService(
+        string asrEngine = "whisper",
+        string asrDevice = "auto",
+        string? modelServiceUrl = null,
+        string? modelServiceToken = null)
     {
         _asrEngine = NormalizeAsrEngine(asrEngine);
         _asrDevice = NormalizeAsrDevice(asrDevice);
+        _remoteMode = _asrEngine == "qwen3-asr";
 
         // 低延迟模式每 600ms 就要发一次识别请求，中间还夹着翻译请求。默认的
         // HttpClient 会周期性回收连接，每次回收都让下一个快照多付一次 TCP 握手。
@@ -47,13 +54,22 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             AllowAutoRedirect = false,
             ConnectTimeout = TimeSpan.FromSeconds(5)
         };
+        var baseAddress = _remoteMode
+            ? ValidateServiceUrl(modelServiceUrl)
+            : new Uri($"http://127.0.0.1:{ServicePort}/");
         _asr = new HttpClient(handler)
         {
-            BaseAddress = new Uri($"http://127.0.0.1:{ServicePort}/"),
+            BaseAddress = baseAddress,
             Timeout = TimeSpan.FromSeconds(120),
             DefaultRequestVersion = System.Net.HttpVersion.Version11,
             DefaultVersionPolicy = System.Net.Http.HttpVersionPolicy.RequestVersionOrLower
         };
+        if (_remoteMode)
+        {
+            if (string.IsNullOrWhiteSpace(modelServiceToken))
+                throw new InvalidOperationException("Spark 模型服务访问令牌为空，请在主界面填写访问令牌。");
+            _asr.DefaultRequestHeaders.TryAddWithoutValidation("X-VoiceScreen-Token", modelServiceToken.Trim());
+        }
     }
 
     /// <summary>
@@ -65,12 +81,19 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         await EnsureAsrAsync(cancellationToken).ConfigureAwait(false);
+        _qwenStreamingAvailable = await ReadQwenStreamingAvailabilityAsync(cancellationToken).ConfigureAwait(false);
         ActiveAsrDevice = await ReadActiveAsrDeviceAsync(cancellationToken).ConfigureAwait(false);
-        var asrModelLabel = _asrEngine == "sherpa"
+        var asrModelLabel = _asrEngine == "qwen3-asr"
+            ? _qwenStreamingAvailable
+                ? $"Qwen3-ASR-1.7B realtime on {ActiveAsrDevice.ToUpperInvariant()}"
+                : $"Qwen3-ASR-1.7B offline fallback on {ActiveAsrDevice.ToUpperInvariant()}"
+            : _asrEngine == "sherpa"
             ? "Sherpa-ONNX Zipformer (streaming)"
             : $"faster-whisper (base/small) on {ActiveAsrDevice.ToUpperInvariant()}";
         VoiceScreenLog.Info(
-            $"Local models ready on {ServicePort}: {asrModelLabel} + OPUS-MT zh-en/en-zh/th-en CPU INT8");
+            $"Model service ready at {_asr.BaseAddress}: {asrModelLabel} + translation");
+        if (_remoteMode && !_qwenStreamingAvailable)
+            VoiceScreenLog.Warn("Spark service does not advertise Qwen streaming; using stateless ASR fallback");
     }
 
     private async Task<string> ReadActiveAsrDeviceAsync(CancellationToken cancellationToken)
@@ -108,19 +131,34 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     public async Task<LocalTranscription> TranscribeIncomingSpeechAsync(ReadOnlyMemory<byte> pcm16Mono16Khz,
         TranscriptionRequest request, CancellationToken cancellationToken)
     {
+        // Spark 接收链路服务于英文视频/语音。短促的 "uh huh" 在仅有一秒上下文时偶尔会
+        // 被自动语言识别判成中文“嗯”；给 Qwen 明确 English 提示可消除这次无谓回退。
+        // 麦克风发送方向走 TranscribeChineseSpeechAsync，仍然固定为 Chinese。
+        var languageHint = _asrEngine == "qwen3-asr" ? SpokenLanguage.English : SpokenLanguage.Unknown;
         var transcription = await TranscribeWithGateAsync(pcm16Mono16Khz,
-            request with { Language = SpokenLanguage.Unknown }, cancellationToken).ConfigureAwait(false);
-        VoiceScreenLog.Info($"Incoming ASR language={transcription.Language} text={LogExcerpt(transcription.Text)}");
+            request with { Language = languageHint }, cancellationToken).ConfigureAwait(false);
+        // 正常日志不记录用户听到的原始语音内容；冒烟模式会在自己的事件处理器里记录测试文本。
+        VoiceScreenLog.Info(
+            $"Incoming ASR language={transcription.Language} chars={transcription.Text.Length} words={transcription.Words?.Count ?? 0}");
         return transcription;
     }
 
     /// <summary>识别引擎是否天然按增量音频工作。</summary>
     /// <remarks>
-    /// Sherpa 的 OnlineRecognizer 把解码状态留在服务端会话里，客户端每次只送新到的
+    /// Sherpa 和 Spark Qwen 会话都把解码状态留在服务端，客户端每次只送新到的
     /// 那几百毫秒；Whisper 无状态，只能每次重送整个滚动窗口，靠词级时间戳裁掉已确认
     /// 的部分来控制窗口长度。两条路的音频送法完全相反，调用方必须能区分。
     /// </remarks>
-    public bool UsesStreamingSessions => _asrEngine == "sherpa";
+    public bool UsesStreamingSessions => _asrEngine == "sherpa" || _qwenStreamingAvailable;
+
+    /// <summary>
+    /// 无状态滚动窗口只有拿到词级时间戳才能安全提交文本并裁掉对应音频。
+    /// 当前本机 Whisper 服务支持；Spark 上的 Qwen3-ASR 只返回整段文本。
+    /// </summary>
+    public bool SupportsWordTimestamps => _asrEngine == "whisper";
+
+    /// <summary>Spark 的常驻 Qwen3-4B 可做受约束的字幕边界判断，无需再下载模型。</summary>
+    public bool SupportsSemanticSegmentation => _remoteMode;
 
     /// <summary>
     /// 临时字幕用的束宽。临时结果注定会被下一次识别覆盖，为它跑四路束搜索是纯浪费；
@@ -143,7 +181,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             return new LocalIncomingTranslation(string.Empty, string.Empty, detectedLanguage);
         if (TranscriptSanitizer.IsPathologicalRepetition(text))
         {
-            VoiceScreenLog.Warn($"Incoming ASR repetition discarded: {LogExcerpt(text)}");
+            VoiceScreenLog.Warn($"Incoming ASR repetition discarded: chars={text.Length}");
             return EmptyIncoming(detectedLanguage);
         }
 
@@ -166,7 +204,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             .ConfigureAwait(false);
         if (TranscriptSanitizer.IsUnsafeTranslation(text, chinese))
         {
-            VoiceScreenLog.Warn($"Pathological {language} translation discarded: {LogExcerpt(chinese)}");
+            VoiceScreenLog.Warn($"Pathological {language} translation discarded: chars={chinese.Length}");
             return EmptyIncoming(language);
         }
 
@@ -183,6 +221,29 @@ public sealed class LocalOutgoingService : IAsyncDisposable
             throw new ArgumentException("请输入要测试的中文。", nameof(chineseText));
         return await TranslateThroughModelPairAsync(chineseText.Trim(), TranslationDirection.ChineseToEnglish,
             beamSize, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<bool> ShouldBreakSubtitleAsync(string text, CancellationToken cancellationToken)
+    {
+        if (!SupportsSemanticSegmentation || string.IsNullOrWhiteSpace(text)) return false;
+        await _translationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var requestJson = JsonSerializer.Serialize(new { text = text.Trim() }, JsonOptions);
+            using var response = await PostJsonWithRetryAsync("segment", requestJson, cancellationToken)
+                .ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                VoiceScreenLog.Warn($"Semantic segmenter unavailable: status={(int)response.StatusCode}");
+                return false;
+            }
+            return JsonSerializer.Deserialize<SegmentResponse>(body, JsonOptions)?.Break == true;
+        }
+        finally
+        {
+            _translationGate.Release();
+        }
     }
 
     /// <summary>
@@ -202,12 +263,6 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
     private static LocalIncomingTranslation EmptyIncoming(string language)
         => new(string.Empty, string.Empty, language);
-
-    private static string LogExcerpt(string text)
-    {
-        var normalized = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
-        return normalized.Length <= 120 ? normalized : normalized[..120] + "…";
-    }
 
     private async Task<LocalTranscription> TranscribeWithGateAsync(ReadOnlyMemory<byte> pcm16Mono16Khz,
         TranscriptionRequest request, CancellationToken cancellationToken)
@@ -282,7 +337,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         var translationBody = await translationResponse.Content.ReadAsStringAsync(cancellationToken)
             .ConfigureAwait(false);
         if (!translationResponse.IsSuccessStatusCode)
-            throw new InvalidOperationException($"本地 OPUS-MT 翻译失败：{ReadError(translationBody)}");
+            throw new InvalidOperationException($"模型服务翻译失败：{ReadError(translationBody)}");
         var translated = JsonSerializer.Deserialize<TranslationResponse>(translationBody, JsonOptions)?.Text?.Trim();
         if (string.IsNullOrWhiteSpace(translated))
             throw new InvalidOperationException("本地翻译没有返回结果。");
@@ -329,6 +384,9 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private async Task EnsureAsrAsync(CancellationToken cancellationToken)
     {
         if (await IsHealthyAsync(_asr, "health", cancellationToken).ConfigureAwait(false)) return;
+        if (_remoteMode)
+            throw new InvalidOperationException(
+                $"Spark 模型服务不可用：{_asr.BaseAddress}。请确认 spark-host.local 已开机且 VoiceScreen 模型服务健康。");
         var script = Path.Combine(AppContext.BaseDirectory, "LocalService", "local_outgoing_service.py");
         if (!File.Exists(script)) throw new FileNotFoundException("缺少本地语音识别服务脚本。", script);
         var arguments = $"\"{script}\" --port {ServicePort} --asr-engine {_asrEngine} --asr-device {_asrDevice}";
@@ -420,9 +478,39 @@ public sealed class LocalOutgoingService : IAsyncDisposable
 
     private static string NormalizeAsrEngine(string asrEngine) => asrEngine switch
     {
+        "qwen" or "qwen3" or "qwen3-asr" => "qwen3-asr",
         "sherpa" or "sherpa-onnx" or "zipformer" => "sherpa",
         _ => "whisper"
     };
+
+    private static Uri ValidateServiceUrl(string? value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            throw new InvalidOperationException("Spark 模型服务地址无效，请填写完整的 http:// 或 https:// 地址。");
+        var normalized = uri.AbsoluteUri.EndsWith('/') ? uri : new Uri(uri.AbsoluteUri + "/");
+        return normalized;
+    }
+
+    private async Task<bool> ReadQwenStreamingAvailabilityAsync(CancellationToken cancellationToken)
+    {
+        if (!_remoteMode) return false;
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(3));
+            using var response = await _asr.GetAsync("health", timeout.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode) return false;
+            var json = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
+            using var document = JsonDocument.Parse(json);
+            return document.RootElement.TryGetProperty("asrStreaming", out var value)
+                   && value.ValueKind == JsonValueKind.True;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>auto 表示有 CUDA 就用；显卡忙或驱动不全时 Python 侧会自己退回 CPU。</summary>
     private static string NormalizeAsrDevice(string asrDevice) => asrDevice?.Trim().ToLowerInvariant() switch
@@ -439,7 +527,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         try
         {
             using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(500));
+            requestTimeout.CancelAfter(TimeSpan.FromSeconds(2));
             using var response = await client.GetAsync(path, requestTimeout.Token).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode) return false;
             var json = await response.Content.ReadAsStringAsync(requestTimeout.Token).ConfigureAwait(false);
@@ -489,13 +577,14 @@ public sealed class LocalOutgoingService : IAsyncDisposable
     private sealed record WordResponse(string? T, double S, double E);
 
     private sealed record TranslationResponse(string Text);
+    private sealed record SegmentResponse(bool Break);
 }
 
 /// <summary>一次识别请求的全部可选项。</summary>
 /// <param name="Language">送给模型的语种提示；<c>auto</c> 表示让模型自己判断。</param>
 /// <param name="Preview">true 走 base 临时模型，false 走 small 定稿模型。</param>
 /// <param name="WantWords">是否要词级时间戳。只有需要裁剪滚动窗口的临时快照才要。</param>
-/// <param name="Session">流式识别会话 id；仅 Sherpa 引擎有效，Whisper 会忽略。</param>
+/// <param name="Session">流式识别会话 id；Sherpa 与 Qwen realtime 使用，Whisper 会忽略。</param>
 /// <param name="ResetSession">true 表示丢弃同名旧会话，用于一句话的第一个快照。</param>
 public sealed record TranscriptionRequest
 {

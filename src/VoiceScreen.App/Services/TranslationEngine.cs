@@ -12,13 +12,17 @@ public sealed class TranslationEngine : IAsyncDisposable
     private readonly MicrophoneCableRouter _router = new();
     private readonly DuplexStateMachine _state = new();
     private readonly EchoSuppressor _echo = new();
+    private readonly ProcessTargetService _processTargets = new();
     private readonly CancellationTokenSource _lifetime = new();
-    private IDisposable? _discordCapture;
+    private ResilientProcessLoopbackCapture? _incomingCapture;
+    private ProcessAudioTarget? _activeIncomingTarget;
     private LocalOutgoingService? _localOutgoing;
+    private SparkVoiceCloneService? _clonedVoice;
     private OnlineApiService? _remote;
     private IIncomingAudioProcessor? _incoming;
     private OutgoingClauseStreamer? _clauseStreamer;
     private int _processingOutgoing;
+    private bool _outgoingAvailable;
 
     public TranslationEngine(AppSettings settings)
     {
@@ -32,15 +36,57 @@ public sealed class TranslationEngine : IAsyncDisposable
     public event EventHandler<string>? Error;
     public bool IsRunning { get; private set; }
     public bool PassThroughEnabled => _router.IsPassThroughEnabled;
+    public bool OutgoingAvailable => _outgoingAvailable;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        NormalizeAudioRoutingDevices();
-        ValidateSettings();
-        _router.Start(_settings.MicrophoneDeviceId, _settings.CableRenderDeviceId, _settings.MonitorRenderDeviceId);
+        ValidateIncomingSettings();
+        _outgoingAvailable = false;
+        if (_settings.EnableOutgoingTranslation)
+        {
+            try
+            {
+                NormalizeAudioRoutingDevices();
+                ValidateOutgoingSettings();
+                _router.Start(_settings.MicrophoneDeviceId, _settings.CableRenderDeviceId,
+                    _settings.MonitorRenderDeviceId);
+                _outgoingAvailable = true;
+            }
+            catch (Exception ex)
+            {
+                // 字幕接收不依赖麦克风/VB-CABLE。发送链路坏了也要让用户先看见字幕，
+                // 否则一个可选功能会让整个应用完全无法启动。
+                VoiceScreenLog.Warn($"Outgoing audio unavailable; continuing in captions-only mode: {ex.Message}");
+                StatusChanged?.Invoke(this, $"发送语音不可用，已继续启动仅字幕模式：{ex.Message}");
+            }
+        }
         StatusChanged?.Invoke(this, $"正在加载本机 {AsrEngineDisplayName()} 与本地翻译备用模型……");
-        _localOutgoing = new LocalOutgoingService(asrEngine: _settings.AsrEngine, asrDevice: _settings.AsrDevice);
+        _localOutgoing = new LocalOutgoingService(
+            asrEngine: _settings.AsrEngine,
+            asrDevice: _settings.AsrDevice,
+            modelServiceUrl: _settings.ModelServiceUrl,
+            modelServiceToken: _settings.ModelServiceToken);
         await _localOutgoing.StartAsync(cancellationToken).ConfigureAwait(false);
+        if (!_settings.UseApiTts && SparkVoiceCloneService.IsVoiceId(_settings.EnglishVoiceName))
+        {
+            try
+            {
+                _clonedVoice = new SparkVoiceCloneService(
+                    _settings.ModelServiceUrl, _settings.ModelServiceToken);
+                if (!await _clonedVoice.IsHealthyAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    _clonedVoice.Dispose();
+                    _clonedVoice = null;
+                    VoiceScreenLog.Warn("Spark cloned voice is unavailable; Windows voice fallback will be used");
+                }
+            }
+            catch (Exception ex)
+            {
+                _clonedVoice?.Dispose();
+                _clonedVoice = null;
+                VoiceScreenLog.Warn($"Spark cloned voice initialization failed; using Windows fallback: {ex.Message}");
+            }
+        }
         _remote = new OnlineApiService(_settings.ApiEnglishVoice);
         if (_settings.UseApiTranslation || _settings.UseApiTts)
             await _remote.CheckHealthAsync(cancellationToken).ConfigureAwait(false);
@@ -48,15 +94,17 @@ public sealed class TranslationEngine : IAsyncDisposable
             TranslateIncomingSelectedAsync);
         SubscribeIncoming(_incoming);
         await _incoming.StartAsync(cancellationToken).ConfigureAwait(false);
-        _discordCapture = CreateIncomingCapture();
+        _incomingCapture = CreateIncomingCapture();
         IsRunning = true;
-        VoiceScreenLog.Info($"TranslationEngine started. ASR=local translation={ProviderName(_settings.UseApiTranslation)} tts={ProviderName(_settings.UseApiTts)} lowLatency={_settings.LowLatencyIncoming} clauseStreaming={_settings.OutgoingClauseStreaming}");
+        VoiceScreenLog.Info($"TranslationEngine started. ASR=local translation={ProviderName(_settings.UseApiTranslation)} tts={ProviderName(_settings.UseApiTts)} lowLatency={_settings.LowLatencyIncoming} clauseStreaming={_settings.OutgoingClauseStreaming} outgoingAvailable={_outgoingAvailable}");
         StatusChanged?.Invoke(this,
-            $"运行中 · ASR={AsrEngineDisplayName()} · 翻译={ProviderName(_settings.UseApiTranslation)} · TTS={ProviderName(_settings.UseApiTts)} · 只监听 Discord");
+            $"运行中 · ASR={AsrEngineDisplayName()} · 翻译={ProviderName(_settings.UseApiTranslation)} · TTS={ProviderName(_settings.UseApiTts)} · 监听={_activeIncomingTarget?.ProcessName} (PID {_activeIncomingTarget?.ProcessId}) · 发送={(_outgoingAvailable ? "已启用" : "仅字幕")}");
     }
 
     private string AsrEngineDisplayName()
     {
+        if (string.Equals(_settings.AsrEngine, "qwen3-asr", StringComparison.OrdinalIgnoreCase))
+            return "Spark/Qwen3-ASR-1.7B";
         if (string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase))
             return "Sherpa-ONNX Zipformer";
         // 请求的是 auto 时，显卡到底能不能用只有服务起来之后才知道，界面要显示真实结果。
@@ -73,6 +121,11 @@ public sealed class TranslationEngine : IAsyncDisposable
 
     public void BeginLocalCapture()
     {
+        if (!_outgoingAvailable)
+        {
+            StatusChanged?.Invoke(this, "当前为仅字幕模式；请检查麦克风和 VB-CABLE 后重新启动发送功能。");
+            return;
+        }
         if (!IsRunning || !_state.TryBeginLocalCapture()) return;
         try
         {
@@ -125,15 +178,31 @@ public sealed class TranslationEngine : IAsyncDisposable
             : (_localOutgoing ?? throw new InvalidOperationException("本地翻译尚未就绪。"))
                 .TranslateChineseTextAsync(chinese, cancellationToken);
 
-    private Task<byte[]> SynthesizeEnglishSelectedAsync(string english, bool useApi,
+    private async Task<byte[]> SynthesizeEnglishSelectedAsync(string english, bool useApi,
         CancellationToken cancellationToken)
-        => useApi
-            ? (_remote ?? throw new InvalidOperationException("Edge TTS 尚未就绪。"))
-                .SynthesizeEnglishAsync(english, cancellationToken)
-            : OfflineSpeech.SynthesizeEnglishAsync(english, cancellationToken, _settings.EnglishVoiceName);
+    {
+        if (useApi)
+            return await (_remote ?? throw new InvalidOperationException("Edge TTS 尚未就绪。"))
+                .SynthesizeEnglishAsync(english, cancellationToken).ConfigureAwait(false);
+        if (SparkVoiceCloneService.IsVoiceId(_settings.EnglishVoiceName) && _clonedVoice is not null)
+        {
+            try
+            {
+                return await _clonedVoice.SynthesizeEnglishAsync(english, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                VoiceScreenLog.Warn($"Spark cloned voice failed; using Windows fallback: {ex.Message}");
+            }
+        }
+        return await OfflineSpeech.SynthesizeEnglishAsync(english, cancellationToken,
+            SparkVoiceCloneService.IsVoiceId(_settings.EnglishVoiceName) ? null : _settings.EnglishVoiceName)
+            .ConfigureAwait(false);
+    }
 
     public async Task EndLocalCaptureAsync()
     {
+        if (!_outgoingAvailable) return;
         if (!IsRunning || Interlocked.Exchange(ref _processingOutgoing, 1) != 0) return;
         var stage = "准备";
         var streamer = Interlocked.Exchange(ref _clauseStreamer, null);
@@ -200,11 +269,8 @@ public sealed class TranslationEngine : IAsyncDisposable
             using var playbackTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
             playbackTimeout.CancelAfter(TimeSpan.FromSeconds(60));
             var playbackToken = playbackTimeout.Token;
-            var tts = useApiTts
-                ? await (_remote ?? throw new InvalidOperationException("Edge TTS 尚未就绪。"))
-                    .SynthesizeEnglishAsync(translation.TranslatedText, playbackToken).ConfigureAwait(false)
-                : await OfflineSpeech.SynthesizeEnglishAsync(translation.TranslatedText, playbackToken,
-                    _settings.EnglishVoiceName).ConfigureAwait(false);
+            var tts = await SynthesizeEnglishSelectedAsync(
+                translation.TranslatedText, useApiTts, playbackToken).ConfigureAwait(false);
             if (alreadySpoken > 0)
             {
                 // 抢跑的短句可能还在播。这里必须追加而不是替换，否则会把还没播完的
@@ -267,6 +333,8 @@ public sealed class TranslationEngine : IAsyncDisposable
     public async Task TranslateAndPreviewAsync(string chineseText, CancellationToken cancellationToken)
     {
         if (!IsRunning) throw new InvalidOperationException("请先启动程序。");
+        if (!_outgoingAvailable)
+            throw new InvalidOperationException("当前为仅字幕模式，麦克风或 VB-CABLE 发送链路不可用。");
         if (string.IsNullOrWhiteSpace(chineseText)) throw new InvalidOperationException("请输入要测试的中文。");
         if (Interlocked.Exchange(ref _processingOutgoing, 1) != 0)
             throw new InvalidOperationException("当前正在处理另一条语音。");
@@ -287,11 +355,8 @@ public sealed class TranslationEngine : IAsyncDisposable
             SubtitleProduced?.Invoke(this, ("mine", $"测试中文：{chineseText.Trim()}"));
             SubtitleProduced?.Invoke(this, ("sent", $"试听英文：{english}"));
             _state.TryBeginTts();
-            var audio = useApiTts
-                ? await (_remote ?? throw new InvalidOperationException("Edge TTS 尚未就绪。"))
-                    .SynthesizeEnglishAsync(english, timeout.Token).ConfigureAwait(false)
-                : await OfflineSpeech.SynthesizeEnglishAsync(english, timeout.Token,
-                    _settings.EnglishVoiceName).ConfigureAwait(false);
+            var audio = await SynthesizeEnglishSelectedAsync(english, useApiTts, timeout.Token)
+                .ConfigureAwait(false);
             await _router.PlayMonitorTtsAsync(audio, timeout.Token).ConfigureAwait(false);
             _state.TryBeginCooldown();
         }
@@ -320,27 +385,32 @@ public sealed class TranslationEngine : IAsyncDisposable
 
     private void OnIncomingError(object? sender, string message) => Error?.Invoke(this, message);
 
-    /// <summary>只捕获 Discord 进程树；失败时不允许回退到整张声卡，避免游戏声音进入字幕。</summary>
-    private IDisposable CreateIncomingCapture()
+    /// <summary>只捕获所选进程树；失败时不回退到整张声卡，避免其他应用声音进入字幕。</summary>
+    private ResilientProcessLoopbackCapture CreateIncomingCapture()
     {
-        var pid = DiscordProcessLocator.FindMainProcessId()
-            ?? throw new InvalidOperationException("没有找到 Discord 桌面客户端。请先启动 Discord，再启动 VoiceScreen。");
-        VoiceScreenLog.Info($"Discord root process located. pid={pid}");
-
-        var capture = new DiscordProcessLoopbackCapture();
+        // 旧设置没有目标字段，保持原有 Discord 行为；新设置由界面写入任意应用的稳定标识。
+        var processName = string.IsNullOrWhiteSpace(_settings.IncomingProcessName)
+            ? "Discord"
+            : _settings.IncomingProcessName;
+        var capture = new ResilientProcessLoopbackCapture(
+            _processTargets, processName, _settings.IncomingProcessPath, _settings.IncomingProcessId);
         capture.FrameReady += SendIncomingFrameAsync;
+        capture.StatusChanged += OnIncomingCaptureStatus;
         try
         {
-            capture.Start(pid);
+            _activeIncomingTarget = capture.Start();
             return capture;
         }
         catch
         {
             capture.FrameReady -= SendIncomingFrameAsync;
+            capture.StatusChanged -= OnIncomingCaptureStatus;
             capture.Dispose();
             throw;
         }
     }
+
+    private void OnIncomingCaptureStatus(object? sender, string message) => StatusChanged?.Invoke(this, message);
 
     private void OnIncomingTranslation(object? sender, LocalIncomingTranslation result)
     {
@@ -378,7 +448,13 @@ public sealed class TranslationEngine : IAsyncDisposable
 
     private void OnIncomingStatus(object? sender, string message) => StatusChanged?.Invoke(this, message);
 
-    private void ValidateSettings()
+    private void ValidateIncomingSettings()
+    {
+        if (string.IsNullOrWhiteSpace(_settings.IncomingProcessName))
+            throw new InvalidOperationException("请选择要监听的应用进程。");
+    }
+
+    private void ValidateOutgoingSettings()
     {
         if (string.IsNullOrWhiteSpace(_settings.MicrophoneDeviceId)) throw new InvalidOperationException("请选择实体麦克风。");
         if (string.IsNullOrWhiteSpace(_settings.CableRenderDeviceId)) throw new InvalidOperationException("请选择 CABLE Input 虚拟播放设备。");
@@ -404,18 +480,19 @@ public sealed class TranslationEngine : IAsyncDisposable
             VoiceScreenLog.Info($"Audio routing corrected automatically: virtual output={cable.Name}");
         }
         var configuredMonitor = renderDevices.FirstOrDefault(device => device.Id == _settings.MonitorRenderDeviceId);
-        if (configuredMonitor is null || AudioDeviceService.IsVirtualCableInput(configuredMonitor))
+        if (configuredMonitor is null || AudioDeviceService.IsVirtualAudioDevice(configuredMonitor))
         {
-            var monitor = AudioDeviceService.FindBest(renderDevices.Where(device => !AudioDeviceService.IsVirtualCableInput(device)),
+            var monitor = AudioDeviceService.FindBest(renderDevices.Where(device => !AudioDeviceService.IsVirtualAudioDevice(device)),
                 string.Empty, "HyperX", "耳机", "Headphones")
                 ?? throw new InvalidOperationException("没有找到可用于英文试听的实体耳机。");
             _settings.MonitorRenderDeviceId = monitor.Id;
             VoiceScreenLog.Info($"Audio monitor selected automatically: output={monitor.Name}");
         }
         var voices = OfflineSpeech.GetInstalledEnglishVoices();
-        if (voices.Count == 0)
+        if (voices.Count == 0 && !SparkVoiceCloneService.IsVoiceId(_settings.EnglishVoiceName))
             throw new InvalidOperationException("没有检测到 Windows 英文语音，请在 Windows 语音设置中安装英文男声或女声。");
-        if (!voices.Any(voice => voice.Id == _settings.EnglishVoiceName))
+        if (!SparkVoiceCloneService.IsVoiceId(_settings.EnglishVoiceName)
+            && !voices.Any(voice => voice.Id == _settings.EnglishVoiceName))
         {
             _settings.EnglishVoiceName = voices[0].Id;
             VoiceScreenLog.Info($"English TTS voice selected automatically: voice={voices[0].Name}");
@@ -460,19 +537,20 @@ public sealed class TranslationEngine : IAsyncDisposable
         }
         _router.RestorePassThrough();
         _router.Dispose();
-        if (_discordCapture is not null)
+        if (_incomingCapture is not null)
         {
             try
             {
-                if (_discordCapture is IAsyncDisposable asyncDisposable)
-                    await asyncDisposable.DisposeAsync().ConfigureAwait(false);
-                else
-                    _discordCapture.Dispose();
+                _incomingCapture.FrameReady -= SendIncomingFrameAsync;
+                _incomingCapture.StatusChanged -= OnIncomingCaptureStatus;
+                await _incomingCapture.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 VoiceScreenLog.Warn($"incoming capture dispose error: {ex.Message}");
             }
+            _incomingCapture = null;
+            _activeIncomingTarget = null;
         }
         if (_incoming is not null)
         {
@@ -495,6 +573,8 @@ public sealed class TranslationEngine : IAsyncDisposable
             _remote.Dispose();
             _remote = null;
         }
+        _clonedVoice?.Dispose();
+        _clonedVoice = null;
         _lifetime.Dispose();
         VoiceScreenLog.Info("TranslationEngine disposed");
     }

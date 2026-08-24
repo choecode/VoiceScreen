@@ -9,8 +9,8 @@ using VoiceScreen.Core;
 namespace VoiceScreen.App.Services;
 
 /// <summary>
-/// 将 Discord 40ms PCM 帧切成语音会话。稳定模式在句末处理一次；低延迟模式会产生音频快照，
-/// ASR 与 OPUS 分别在独立流水线上运行，只保留有价值的最新临时结果，最终句永不丢弃。
+/// 将所选进程的 40ms PCM 帧切成语音会话。稳定模式在句末处理一次；低延迟模式会产生音频快照，
+/// ASR 与翻译分别在独立流水线上运行，只保留有价值的最新临时结果，最终句永不丢弃。
 ///
 /// 滚动窗口：Whisper 是无状态的，每次临时识别都要重送一段音频。如果每次都从句首重送，
 /// 计算量随句子长度平方增长——说到第 10 秒时每次都在重算那 10 秒。因此每当
@@ -43,6 +43,21 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private const int MaximumWindowFrames = 500; // 20s
 
     /// <summary>
+    /// Qwen 官方的流式算法每一轮仍会重读本句全部音频，因此一句话越长，最新单词的识别
+    /// 延迟就越高。语义模型仍是正常分段的第一选择；8 秒仅作为连续讲话、语义模型始终
+    /// 返回 CONTINUE 时的延迟保险，并用边界预滚避免截掉单词。
+    /// </summary>
+    private const int MaximumStreamingWindowFrames = 200; // 8s latency guard
+
+    /// <summary>
+    /// Qwen3-ASR 当前没有词级时间戳，客户端不能安全裁掉已确认的前缀。连续讲话若仍沿用
+    /// 20 秒窗口，最终定稿要等整段音频结束后才开始，实际会出现二十多秒的历史字幕延迟。
+    /// 正常收尾由 Qwen3-4B 语义判断与短暂停顿共同决定；12 秒只是模型异常或持续无停顿时
+    /// 的安全上限，并在强制分段时给下一段保留 320ms 边界音频。
+    /// </summary>
+    private const int MaximumUntimestampedWindowFrames = 300; // 12s safety limit
+
+    /// <summary>
     /// 一句话的绝对时长上限。有了裁剪，连续说话不再拖慢识别，所以这个上限可以比
     /// 窗口上限宽得多，长段独白不会每 20 秒被硬切一刀。
     /// </summary>
@@ -53,6 +68,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private readonly LocalOutgoingService _localService;
     private readonly bool _lowLatency;
     private readonly bool _streamingSessions;
+    private readonly bool _supportsWordTimestamps;
     private readonly Func<string, string, int, CancellationToken, Task<LocalIncomingTranslation>>? _translateOverride;
 
     // 预滚环形缓冲：数组只在首次用到时分配一次，之后按帧覆盖写入。
@@ -71,7 +87,6 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private readonly Channel<TranslationSnapshot> _translationSnapshots = Channel.CreateUnbounded<TranslationSnapshot>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
     private readonly ConcurrentDictionary<long, int> _latestAudioRevision = new();
-    private readonly ConcurrentDictionary<long, int> _latestTranslationRevision = new();
     private readonly ConcurrentDictionary<long, int> _finalAudioRevision = new();
     private readonly ConcurrentDictionary<long, int> _finalTranslationRevision = new();
     private readonly ConcurrentDictionary<long, string> _previousHypotheses = new();
@@ -93,6 +108,12 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private int _silenceFrames;
     private int _voicedFrames;
     private int _totalFrames;
+    private long _lastBoundaryUtteranceId;
+    private string _lastBoundarySource = string.Empty;
+    private bool _semanticBoundaryReady;
+    private int _semanticBoundaryFrame;
+    private int _lastSemanticDecisionFrame;
+    private bool _semanticDecisionInFlight;
 
     /// <summary>已确认并已从音频缓冲里裁掉的那段文本。窗口识别结果要接在它后面才是完整一句。</summary>
     private string _committedText = string.Empty;
@@ -116,6 +137,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         _localService = localService;
         _lowLatency = lowLatency;
         _streamingSessions = localService.UsesStreamingSessions;
+        _supportsWordTimestamps = localService.SupportsWordTimestamps;
         _translateOverride = translateOverride;
         _asrWorker = Task.Run(ProcessAudioSnapshotsAsync);
         _translationWorker = Task.Run(ProcessTranslationSnapshotsAsync);
@@ -170,10 +192,22 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
                 QueueSnapshotNoLock(isFinal: false);
 
             var endSilenceFrames = _lowLatency ? RealtimeEndSilenceFrames : StableEndSilenceFrames;
-            if (_silenceFrames >= endSilenceFrames
-                || _totalFrames >= MaximumUtteranceFrames
-                || WindowFramesNoLock() >= MaximumWindowFrames)
-                CompleteUtteranceNoLock();
+            var semanticPause = SubtitleBoundaryPolicy.ShouldCompleteAtSemanticPause(
+                _semanticBoundaryReady, _silenceFrames, _totalFrames, _semanticBoundaryFrame);
+            if (semanticPause || _silenceFrames >= endSilenceFrames)
+            {
+                CompleteUtteranceNoLock(preserveBoundaryTail: false);
+            }
+            else
+            {
+                var maximumWindowFrames = _streamingSessions
+                    ? MaximumStreamingWindowFrames
+                    : !_supportsWordTimestamps
+                        ? MaximumUntimestampedWindowFrames
+                        : MaximumWindowFrames;
+                if (_totalFrames >= MaximumUtteranceFrames || WindowFramesNoLock() >= maximumWindowFrames)
+                    CompleteUtteranceNoLock(preserveBoundaryTail: true);
+            }
         }
         return ValueTask.CompletedTask;
     }
@@ -210,13 +244,38 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         _snapshotInFlight = false;
         _finalQueued = false;
         _streamedBytes = 0;
+        _semanticBoundaryReady = false;
+        _semanticBoundaryFrame = 0;
+        _lastSemanticDecisionFrame = 0;
+        _semanticDecisionInFlight = false;
     }
 
-    private void CompleteUtteranceNoLock()
+    private void CompleteUtteranceNoLock(bool preserveBoundaryTail)
     {
         if (_utteranceActive && _voicedFrames >= MinimumVoicedFrames)
-            QueueSnapshotNoLock(isFinal: true);
+            QueueSnapshotNoLock(isFinal: true, preservesBoundaryTail: preserveBoundaryTail);
+
+        // 强制分段可能正好落在一个单词中间。把分界前的少量原始声音带到下一段，
+        // 让 ASR 至少还能看到完整起始辅音；自然静音收尾时则不需要重叠。
+        var tailCount = preserveBoundaryTail ? Math.Min(PreRollFrames, WindowFramesNoLock()) : 0;
+        if (tailCount > 0)
+        {
+            var source = _utterance.GetBuffer();
+            var sourceOffset = (int)_utterance.Length - tailCount * FrameBytes;
+            for (var index = 0; index < tailCount; index++)
+            {
+                _preRollFrames[index] ??= new byte[FrameBytes];
+                Buffer.BlockCopy(source, sourceOffset + index * FrameBytes,
+                    _preRollFrames[index], 0, FrameBytes);
+            }
+        }
+
         ResetNoLock(clearPreview: false);
+        if (tailCount > 0)
+        {
+            _preRollCount = tailCount;
+            _preRollHead = 0;
+        }
     }
 
     /// <summary>
@@ -225,7 +284,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     ///
     /// 流式模式只拷走上次之后新增的那一段；Whisper 模式拷走整个滚动窗口。
     /// </summary>
-    private void QueueSnapshotNoLock(bool isFinal)
+    private void QueueSnapshotNoLock(bool isFinal, bool preservesBoundaryTail = false)
     {
         if (!_utteranceActive || _utterance.Length == 0) return;
         var start = _streamingSessions ? _streamedBytes : 0;
@@ -242,7 +301,8 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         Buffer.BlockCopy(_utterance.GetBuffer(), start, rented, 0, length);
 
         var snapshot = new AudioSnapshot(_utteranceId, revision, rented, length, isFinal, _utteranceStartTimestamp,
-            _committedText, IsFirstSnapshot: revision == 1);
+            _committedText, IsFirstSnapshot: revision == 1, PreservesBoundaryTail: preservesBoundaryTail,
+            TotalFrames: _totalFrames);
         _latestAudioRevision[_utteranceId] = revision;
         if (isFinal) _finalAudioRevision[_utteranceId] = revision;
         if (!_audioSnapshots.Writer.TryWrite(snapshot))
@@ -261,6 +321,9 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     /// </returns>
     private bool TryCommitWindow(long utteranceId, string stableText, double committedEndSeconds)
     {
+        // 提交文本和裁剪音频必须是同一个原子动作。没有时间戳时提交文本却保留音频，
+        // 下一次整窗识别会把同一段话再次拼到已提交前缀后面。
+        if (committedEndSeconds <= 0) return false;
         lock (_gate)
         {
             if (!_utteranceActive || _utteranceId != utteranceId || _finalQueued) return false;
@@ -312,6 +375,10 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         _snapshotInFlight = false;
         _finalQueued = false;
         _streamedBytes = 0;
+        _semanticBoundaryReady = false;
+        _semanticBoundaryFrame = 0;
+        _lastSemanticDecisionFrame = 0;
+        _semanticDecisionInFlight = false;
         if (clearPreview) ClearPreview();
     }
 
@@ -382,7 +449,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         {
             Preview = !snapshot.IsFinal,
             // 词级时间戳只用来定位裁剪点：最终快照不再裁剪，流式模式不需要裁剪。
-            WantWords = !snapshot.IsFinal && !_streamingSessions,
+            WantWords = !snapshot.IsFinal && !_streamingSessions && _supportsWordTimestamps,
             Session = _streamingSessions ? snapshot.UtteranceId.ToString() : null,
             ResetSession = snapshot.IsFirstSnapshot
         };
@@ -400,6 +467,29 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
             return;
         }
 
+        if (snapshot.IsFinal)
+        {
+            var previousBoundarySource = _lastBoundaryUtteranceId == snapshot.UtteranceId - 1
+                ? _lastBoundarySource
+                : string.Empty;
+            fullText = TranscriptWindow.RemoveBoundaryWordOverlap(previousBoundarySource, fullText);
+            if (snapshot.PreservesBoundaryTail)
+            {
+                _lastBoundaryUtteranceId = snapshot.UtteranceId;
+                _lastBoundarySource = fullText;
+            }
+            else
+            {
+                _lastBoundaryUtteranceId = 0;
+                _lastBoundarySource = string.Empty;
+            }
+            if (string.IsNullOrWhiteSpace(fullText))
+            {
+                FinishUtterance(snapshot.UtteranceId);
+                return;
+            }
+        }
+
         var language = SpokenLanguage.Detect(fullText, transcription.Language);
         var committedTranslation = _committedTranslations.GetValueOrDefault(snapshot.UtteranceId, string.Empty);
         SetPreview(snapshot.UtteranceId, new LocalIncomingTranslation(fullText, committedTranslation, language));
@@ -411,6 +501,19 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
             QueueTranslation(snapshot, fullText, fullText, transcription.Language, LocalOutgoingService.FinalBeamSize);
             return;
         }
+
+        // Qwen 没有词级时间戳，但无论离线还是流式都可以让 4B 模型判断自然边界。
+        // 流式路径随后还会做稳定前缀翻译；离线整窗路径只能替换英文预览，不能在没有
+        // 同步裁音频的情况下累计文本，否则最终会重复。
+        if (!_supportsWordTimestamps && TryReserveSemanticDecision(snapshot, fullText))
+        {
+            // 断句模型和翻译共用 Spark 上的 4B 模型。这里若 await，断句排队的时间会
+            // 直接阻塞后续 ASR 快照，连续讲话时延迟会逐秒累积。后台判断只负责更新门控，
+            // 音频识别流水线必须立刻继续。
+            _ = EvaluateSemanticBoundaryAsync(snapshot.UtteranceId, fullText, snapshot.TotalFrames);
+        }
+        if (!_streamingSessions && !_supportsWordTimestamps)
+            return;
 
         var stable = SelectStableSource(snapshot, transcription.Text, transcription.Language);
         if (string.IsNullOrWhiteSpace(stable)) return;
@@ -428,7 +531,8 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
             // Whisper 侧窗口每次提交后都会被裁掉，稳定前缀天然就是增量。
             // 只有真正把这段音频裁掉了才算已确认；提交失败（这一句已经收尾）时
             // 连翻译也不要发，交给最终定稿统一处理。
-            var trimSeconds = TranscriptWindow.CommittedEndSeconds(transcription.Words, stable);
+            if (!TranscriptWindow.TryGetCommittedEndSeconds(transcription.Words, stable, out var trimSeconds))
+                return;
             if (!TryCommitWindow(snapshot.UtteranceId, stable, trimSeconds)) return;
             _previousHypotheses[snapshot.UtteranceId] =
                 TranscriptWindow.RebasePreviousHypothesis(transcription.Text, stable);
@@ -445,10 +549,10 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private void QueueTranslation(AudioSnapshot snapshot, string displaySource, string sourceForTranslation,
         string language, int beamSize)
     {
-        _latestTranslationRevision[snapshot.UtteranceId] = snapshot.Revision;
         if (snapshot.IsFinal) _finalTranslationRevision[snapshot.UtteranceId] = snapshot.Revision;
         _translationSnapshots.Writer.TryWrite(new TranslationSnapshot(snapshot.UtteranceId, snapshot.Revision,
-            displaySource, sourceForTranslation, language, snapshot.IsFinal, snapshot.StartTimestamp, beamSize));
+            displaySource, sourceForTranslation, language, snapshot.IsFinal, snapshot.StartTimestamp,
+            Stopwatch.GetTimestamp(), beamSize));
     }
 
     /// <summary>停止时把还排在队里的快照全部归还给池。</summary>
@@ -462,11 +566,50 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     {
         try
         {
-            await foreach (var snapshot in _translationSnapshots.Reader.ReadAllAsync(_lifetime.Token)
-                               .ConfigureAwait(false))
+            TranslationSnapshot? deferred = null;
+            while (!_lifetime.IsCancellationRequested)
             {
-                if (IsStale(snapshot.UtteranceId, snapshot.Revision, snapshot.IsFinal,
-                        _latestTranslationRevision))
+                TranslationSnapshot snapshot;
+                if (deferred is not null)
+                {
+                    snapshot = deferred;
+                    deferred = null;
+                }
+                else
+                {
+                    if (!await _translationSnapshots.Reader.WaitToReadAsync(_lifetime.Token)
+                            .ConfigureAwait(false))
+                        break;
+                    if (!_translationSnapshots.Reader.TryRead(out snapshot!)) continue;
+                }
+
+                // 翻译速度偶尔低于 600ms 快照频率时，把尚未处理的相邻增量合成一次请求。
+                // 文本一个字也不丢，但队列不会永远追赶几秒前的碎片。
+                while (_translationSnapshots.Reader.TryRead(out var next))
+                {
+                    if (next.UtteranceId != snapshot.UtteranceId)
+                    {
+                        deferred = next;
+                        break;
+                    }
+
+                    if (next.IsFinal)
+                    {
+                        snapshot = next; // 最终快照会整句重翻，直接取代所有待处理临时片段。
+                        continue;
+                    }
+
+                    if (!snapshot.IsFinal)
+                    {
+                        snapshot = next with
+                        {
+                            SourceForTranslation = TranscriptWindow.Join(
+                                snapshot.SourceForTranslation, next.SourceForTranslation)
+                        };
+                    }
+                }
+
+                if (IsSupersededByFinal(snapshot.UtteranceId, snapshot.IsFinal, _finalTranslationRevision))
                     continue;
                 try
                 {
@@ -491,7 +634,9 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
                             translated.Language);
                         TranslationReady?.Invoke(this, display);
                         FinishUtterance(snapshot.UtteranceId);
-                        VoiceScreenLog.Info($"Realtime final subtitle latency={ElapsedMilliseconds(snapshot.StartTimestamp)}ms");
+                        VoiceScreenLog.Info(
+                            $"Realtime final subtitle end-to-end={ElapsedMilliseconds(snapshot.UtteranceStartTimestamp)}ms; " +
+                            $"translation={ElapsedMilliseconds(snapshot.TranslationQueuedTimestamp)}ms");
                     }
                     else
                     {
@@ -503,7 +648,8 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
                         _committedTranslations[snapshot.UtteranceId] = accumulated;
                         SetPreview(snapshot.UtteranceId, new LocalIncomingTranslation(snapshot.DisplaySource,
                             accumulated, translated.Language));
-                        VoiceScreenLog.Info($"Realtime partial subtitle latency={ElapsedMilliseconds(snapshot.StartTimestamp)}ms");
+                        VoiceScreenLog.Info(
+                            $"Realtime partial translation latency={ElapsedMilliseconds(snapshot.TranslationQueuedTimestamp)}ms");
                     }
                 }
                 catch (Exception ex) when (HandleWorkerException(ex, snapshot.IsFinal, "translation"))
@@ -542,15 +688,71 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
 
     /// <summary>
     /// 流式模式下从累计稳定前缀里取出还没翻译过的那一段。
-    /// 识别结果回退（新前缀不再以旧前缀开头）时整段重来，宁可重复一次也不要漏字。
+    /// ASR 会回头修订旧标点或个别词，增量计算必须容忍这些修订；无法可靠对齐时
+    /// 暂缓这一帧，最终整句翻译会补齐，不能把整段旧文本再次追加到实时译文。
     /// </summary>
     private string NewlyStableChunk(long utteranceId, string stable)
     {
         var already = _committedSources.GetValueOrDefault(utteranceId, string.Empty);
         _committedSources[utteranceId] = stable;
-        return already.Length > 0 && stable.StartsWith(already, StringComparison.OrdinalIgnoreCase)
-            ? stable[already.Length..].Trim()
-            : stable;
+        return IncrementalTranscript.NewlyStableSuffix(already, stable);
+    }
+
+    private bool TryReserveSemanticDecision(AudioSnapshot snapshot, string text)
+    {
+        if (!_localService.SupportsSemanticSegmentation) return false;
+        lock (_gate)
+        {
+            if (!_utteranceActive || _utteranceId != snapshot.UtteranceId || _finalQueued
+                || _semanticDecisionInFlight)
+                return false;
+            if (!SubtitleBoundaryPolicy.ShouldRequestSemanticDecision(
+                    text, snapshot.TotalFrames, _lastSemanticDecisionFrame)) return false;
+            _lastSemanticDecisionFrame = snapshot.TotalFrames;
+            _semanticDecisionInFlight = true;
+            return true;
+        }
+    }
+
+    private async Task EvaluateSemanticBoundaryAsync(long utteranceId, string text, int decisionFrame)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(8));
+            var shouldBreak = await _localService.ShouldBreakSubtitleAsync(text, timeout.Token)
+                .ConfigureAwait(false);
+            VoiceScreenLog.Info(
+                $"Semantic subtitle boundary decision={(shouldBreak ? "BREAK" : "CONTINUE")}; " +
+                $"chars={text.Length}; frames={decisionFrame}");
+            UpdateSemanticBoundary(utteranceId, shouldBreak, decisionFrame);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            // 正常停止。
+        }
+        catch (Exception ex)
+        {
+            VoiceScreenLog.Warn($"Semantic subtitle boundary skipped: {ex.Message}");
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (_utteranceId == utteranceId) _semanticDecisionInFlight = false;
+            }
+        }
+    }
+
+    private void UpdateSemanticBoundary(long utteranceId, bool shouldBreak, int decisionFrame)
+    {
+        lock (_gate)
+        {
+            if (!_utteranceActive || _utteranceId != utteranceId || _finalQueued) return;
+            _semanticBoundaryReady = shouldBreak;
+            _semanticBoundaryFrame = shouldBreak ? decisionFrame : 0;
+        }
+        if (shouldBreak) VoiceScreenLog.Info("Semantic subtitle boundary accepted by Spark/Qwen3-4B");
     }
 
     private static bool IsStale(long utteranceId, int revision, bool isFinal,
@@ -567,7 +769,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         if (ex is OperationCanceledException)
         {
             VoiceScreenLog.Warn($"Local incoming realtime {stage} timed out; snapshot skipped");
-            if (isFinal) Status?.Invoke(this, "本地模型繁忙，本句已跳过，后续 Discord 字幕会自动继续");
+            if (isFinal) Status?.Invoke(this, "模型服务繁忙，本句已跳过，后续所选应用字幕会自动继续");
             return true;
         }
         VoiceScreenLog.Error($"Local incoming realtime {stage} failed", ex);
@@ -582,7 +784,6 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     {
         SetPreview(utteranceId, null);
         _latestAudioRevision.TryRemove(utteranceId, out _);
-        _latestTranslationRevision.TryRemove(utteranceId, out _);
         _finalAudioRevision.TryRemove(utteranceId, out _);
         _finalTranslationRevision.TryRemove(utteranceId, out _);
         _previousHypotheses.TryRemove(utteranceId, out _);
@@ -650,8 +851,10 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     /// <paramref name="CommittedText"/> 是这段音频出发时已确认的前缀，识别结果要接在它后面。
     /// </summary>
     private sealed record AudioSnapshot(long UtteranceId, int Revision, byte[] Buffer, int Length, bool IsFinal,
-        long StartTimestamp, string CommittedText, bool IsFirstSnapshot);
+        long StartTimestamp, string CommittedText, bool IsFirstSnapshot, bool PreservesBoundaryTail,
+        int TotalFrames);
 
     private sealed record TranslationSnapshot(long UtteranceId, int Revision, string DisplaySource,
-        string SourceForTranslation, string Language, bool IsFinal, long StartTimestamp, int BeamSize);
+        string SourceForTranslation, string Language, bool IsFinal, long UtteranceStartTimestamp,
+        long TranslationQueuedTimestamp, int BeamSize);
 }

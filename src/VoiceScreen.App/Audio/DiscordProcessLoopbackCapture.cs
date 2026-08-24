@@ -6,8 +6,8 @@ using static VoiceScreen.App.Audio.Win32.ProcessLoopbackNative;
 
 namespace VoiceScreen.App.Audio;
 
-/// <summary>只捕获指定 Discord 进程树产生的播放音频。</summary>
-public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposable
+/// <summary>只捕获指定进程及其子进程产生的播放音频。</summary>
+public sealed class ProcessLoopbackCapture : IAsyncDisposable, IDisposable
 {
     private const int InputSampleRate = 44100;
     private const short InputChannels = 2;
@@ -22,11 +22,13 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
     private AutoResetEvent? _sampleReady;
 
     public event Func<byte[], CancellationToken, ValueTask>? FrameReady;
+    public event EventHandler<string>? Faulted;
+    public event EventHandler<string>? StatusChanged;
 
     public void Start(int targetProcessId)
     {
         if (targetProcessId <= 0) throw new ArgumentOutOfRangeException(nameof(targetProcessId));
-        if (_audioClient != IntPtr.Zero) throw new InvalidOperationException("Discord 音频捕获已经启动。");
+        if (_audioClient != IntPtr.Zero) throw new InvalidOperationException("进程音频捕获已经启动。");
 
         try
         {
@@ -41,10 +43,11 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
             _captureThread = new Thread(() => CaptureLoop(_cts.Token))
             {
                 IsBackground = true,
-                Name = "VoiceScreen.DiscordProcessLoopback"
+                Name = "VoiceScreen.ProcessLoopback"
             };
             _captureThread.Start();
-            VoiceScreenLog.Info($"Discord-only process loopback started. rootPid={targetProcessId}");
+            VoiceScreenLog.Info($"Process-tree loopback started. rootPid={targetProcessId}");
+            AudioSessionDiagnostics.LogForProcessName(targetProcessId);
         }
         catch
         {
@@ -72,12 +75,12 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
             ThrowIfFailed(result, "ActivateAudioInterfaceAsync");
 
             if (!handler.Wait(TimeSpan.FromSeconds(10)))
-                throw new TimeoutException("等待 Windows 激活 Discord 进程音频接口超时。");
+                throw new TimeoutException("等待 Windows 激活所选进程音频接口超时。");
 
-            ThrowIfFailed(handler.ActivationResult, "激活 Discord 进程音频接口");
+            ThrowIfFailed(handler.ActivationResult, "激活所选进程音频接口");
             _audioClient = handler.ActivatedInterface;
             if (_audioClient == IntPtr.Zero)
-                throw new InvalidOperationException("Windows 返回了空的 Discord 音频接口。");
+                throw new InvalidOperationException("Windows 返回了空的所选进程音频接口。");
         }
         finally
         {
@@ -134,6 +137,11 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
     private void CaptureLoop(CancellationToken token)
     {
         var comInitialized = CoInitializeEx(IntPtr.Zero, CoInitMultithreaded) >= 0;
+        var nextMetricsLog = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        long packetCount = 0;
+        long capturedBytes = 0;
+        var peak = 0;
+        var noAudioReported = false;
         try
         {
             var vtable = Marshal.ReadIntPtr(_captureClient);
@@ -144,14 +152,32 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
 
             while (!token.IsCancellationRequested)
             {
-                if (_sampleReady?.WaitOne(100) != true) continue;
+                var sampleReady = _sampleReady?.WaitOne(100) == true;
+                if (DateTime.UtcNow >= nextMetricsLog)
+                {
+                    VoiceScreenLog.Info(
+                        $"Process loopback metrics: packets={packetCount} bytes={capturedBytes} peakPcm16={peak}");
+                    if (packetCount > 0 && peak <= 1 && !noAudioReported)
+                    {
+                        noAudioReported = true;
+                        StatusChanged?.Invoke(this,
+                            "已连接所选进程，但 5 秒内没有检测到可捕获声音；请确认它正在播放且未静音。");
+                    }
+                    else if (noAudioReported && peak > 1)
+                    {
+                        noAudioReported = false;
+                        StatusChanged?.Invoke(this, "已检测到所选进程的播放声音，字幕识别正在恢复。");
+                    }
+                    nextMetricsLog = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+                }
+                if (!sampleReady) continue;
 
                 while (!token.IsCancellationRequested)
                 {
                     var result = getNextPacketSize(_captureClient, out var framesInPacket);
                     if (result < 0)
                     {
-                        VoiceScreenLog.Warn($"Discord process loopback GetNextPacketSize failed: 0x{result:X8}");
+                        VoiceScreenLog.Warn($"Process loopback GetNextPacketSize failed: 0x{result:X8}");
                         break;
                     }
                     if (framesInPacket == 0) break;
@@ -159,7 +185,7 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
                     result = getBuffer(_captureClient, out var data, out var frames, out var flags, out _, out _);
                     if (result < 0)
                     {
-                        VoiceScreenLog.Warn($"Discord process loopback GetBuffer failed: 0x{result:X8}");
+                        VoiceScreenLog.Warn($"Process loopback GetBuffer failed: 0x{result:X8}");
                         break;
                     }
 
@@ -170,7 +196,12 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
                         if ((flags & AudclntBufferflagsSilent) != 0 || data == IntPtr.Zero)
                             Array.Clear(buffer, 0, byteCount);
                         else
+                        {
                             Marshal.Copy(data, buffer, 0, byteCount);
+                            peak = Math.Max(peak, CalculatePeakPcm16(buffer, byteCount));
+                        }
+                        packetCount++;
+                        capturedBytes += byteCount;
                         _pump?.AddSamples(buffer, byteCount);
                     }
                     finally
@@ -182,12 +213,24 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
         }
         catch (Exception ex)
         {
-            VoiceScreenLog.Error("Discord process loopback capture thread stopped unexpectedly", ex);
+            VoiceScreenLog.Error("Process loopback capture thread stopped unexpectedly", ex);
+            Faulted?.Invoke(this, ex.Message);
         }
         finally
         {
             if (comInitialized) CoUninitialize();
         }
+    }
+
+    private static int CalculatePeakPcm16(byte[] buffer, int count)
+    {
+        var peak = 0;
+        for (var index = 0; index + 1 < count; index += 2)
+        {
+            var sample = (short)(buffer[index] | buffer[index + 1] << 8);
+            peak = Math.Max(peak, Math.Abs((int)sample));
+        }
+        return peak;
     }
 
     private ValueTask ForwardFrameAsync(byte[] frame, CancellationToken cancellationToken)
@@ -231,7 +274,7 @@ public sealed class DiscordProcessLoopbackCapture : IAsyncDisposable, IDisposabl
         }
         catch (Exception ex)
         {
-            VoiceScreenLog.Warn($"Stopping Discord process loopback failed: {ex.Message}");
+            VoiceScreenLog.Warn($"Stopping process loopback failed: {ex.Message}");
         }
     }
 

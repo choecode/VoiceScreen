@@ -14,7 +14,9 @@ namespace VoiceScreen.App;
 
 public partial class MainWindow : Window
 {
+    private const double FixedSubtitleFontSize = 14;
     private readonly AudioDeviceService _devices = new();
+    private readonly ProcessTargetService _processTargets = new();
     private readonly SettingsStore _settingsStore = new();
     private readonly RightAltHoldHook _hook = new();
     private AppSettings _settings;
@@ -74,14 +76,28 @@ public partial class MainWindow : Window
             _settings.UseApiTranslation = true;
             _settings.UseApiTts = true;
         }
-        AsrProviderCombo.SelectedIndex = string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        if (_settings.PrivateVoiceProfileVersion < 1)
+        {
+            _settings.EnglishVoiceName = SparkVoiceCloneService.VoiceId;
+            _settings.PrivateVoiceProfileVersion = 1;
+            _settingsStore.Save(_settings);
+            VoiceScreenLog.Info("Private Spark voice profile installed and selected for the first time");
+        }
+        AsrProviderCombo.SelectedIndex = string.Equals(_settings.AsrEngine, "qwen3-asr", StringComparison.OrdinalIgnoreCase)
+            ? 2
+            : string.Equals(_settings.AsrEngine, "sherpa", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
         AsrDeviceCombo.SelectedIndex = AsrDeviceIndex(_settings.AsrDevice);
         TranslationProviderCombo.SelectedIndex = _settings.UseApiTranslation ? 1 : 0;
         TtsProviderCombo.SelectedIndex = _settings.UseApiTts ? 1 : 0;
         LowLatencyIncomingCheckBox.IsChecked = _settings.LowLatencyIncoming;
+        EnableOutgoingTranslationCheckBox.IsChecked = _settings.EnableOutgoingTranslation;
         OutgoingClauseStreamingCheckBox.IsChecked = _settings.OutgoingClauseStreaming;
+        ModelServiceUrlTextBox.Text = string.IsNullOrWhiteSpace(_settings.ModelServiceUrl)
+            ? "http://spark-host.local:18765/"
+            : _settings.ModelServiceUrl;
+        ModelServiceTokenBox.Password = _settings.ModelServiceToken ?? string.Empty;
         MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;
-        SubtitleFontSizeSlider.Value = Math.Clamp(_settings.SubtitleFontSize, 14, 42);
+        _settings.SubtitleFontSize = FixedSubtitleFontSize;
         UseProcessLoopbackCheckBox.IsChecked = true;
         var savedApiVoice = string.IsNullOrWhiteSpace(_settings.ApiEnglishVoice)
             ? "en-US-JennyNeural"
@@ -95,9 +111,10 @@ public partial class MainWindow : Window
             .FirstOrDefault(voice => voice.Id == savedApiVoice) ?? ApiEnglishVoiceCombo.Items[0];
         var elevated = IsElevated();
         RestartElevatedButton.IsEnabled = !elevated;
-        RestartElevatedButton.Content = elevated ? "已是管理员模式" : "以管理员重启（战地）";
+        RestartElevatedButton.Content = elevated ? "已是管理员模式" : "以管理员重启";
         VoiceScreenLog.Info($"Process integrity: elevated={elevated}");
         RefreshDevices();
+        UpdateOutgoingControls();
     }
 
     /// <summary>
@@ -114,19 +131,18 @@ public partial class MainWindow : Window
     {
         var captures = _devices.GetCaptureDevices();
         var renders = _devices.GetRenderDevices();
-        var voices = OfflineSpeech.GetInstalledEnglishVoices();
-        var physicalMicrophones = captures
-            .Where(device => !device.Name.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase))
+        var voices = new[] { SparkVoiceCloneService.VoiceOption }
+            .Concat(OfflineSpeech.GetInstalledEnglishVoices())
             .ToArray();
-        var automaticDiscordCapture = new[]
-        {
-            new AudioDeviceOption(string.Empty, "自动：仅捕获 Discord 进程（无需选择）")
-        };
+        var physicalMicrophones = captures
+            .Where(device => !AudioDeviceService.IsVirtualAudioDevice(device))
+            .ToArray();
+        var processTargets = _processTargets.GetRunningTargets();
         MicrophoneCombo.ItemsSource = physicalMicrophones;
-        var physicalOutputs = renders.Where(device => !AudioDeviceService.IsVirtualCableInput(device)).ToArray();
+        var physicalOutputs = renders.Where(device => !AudioDeviceService.IsVirtualAudioDevice(device)).ToArray();
         MonitorOutputCombo.ItemsSource = physicalOutputs;
         EnglishVoiceCombo.ItemsSource = voices;
-        DiscordOutputCombo.ItemsSource = automaticDiscordCapture;
+        IncomingProcessCombo.ItemsSource = processTargets;
         var cableInputs = renders.Where(AudioDeviceService.IsVirtualCableInput).ToArray();
         CableRenderCombo.ItemsSource = cableInputs;
         MicrophoneCombo.SelectedItem = AudioDeviceService.FindBest(physicalMicrophones, _settings.MicrophoneDeviceId, "HyperX", "麦克风", "Microphone");
@@ -134,13 +150,17 @@ public partial class MainWindow : Window
             "HyperX", "耳机", "Headphones");
         EnglishVoiceCombo.SelectedItem = voices.FirstOrDefault(voice => voice.Id == _settings.EnglishVoiceName)
             ?? voices.FirstOrDefault();
-        DiscordOutputCombo.SelectedIndex = 0;
+        IncomingProcessCombo.SelectedItem = ProcessTargetService.FindBest(
+            processTargets, _settings.IncomingProcessName, _settings.IncomingProcessPath,
+            _settings.IncomingProcessId);
         CableRenderCombo.SelectedItem = AudioDeviceService.FindVirtualCableInput(renders);
-        StatusText.Text = cableInputs.Length == 0
+        StatusText.Text = processTargets.Count == 0
+            ? "错误：没有找到可监听的桌面应用。请先启动浏览器、Discord 或播放器，再刷新列表。"
+            : _settings.EnableOutgoingTranslation && cableInputs.Length == 0
             ? "错误：没有检测到 CABLE Input (VB-Audio Virtual Cable)，请先安装或启用 VB-CABLE。"
-            : voices.Count == 0
+            : _settings.EnableOutgoingTranslation && voices.Length == 0
                 ? "错误：没有检测到 Windows 英文语音，请先安装英文男声或女声。"
-                : "设备已自动配置：HyperX 麦克风 → CABLE Input；接收只监听 Discord。";
+                : $"设备就绪；接收只监听 {(IncomingProcessCombo.SelectedItem as ProcessAudioTarget)?.DisplayName}；发送={(_settings.EnableOutgoingTranslation ? "已启用" : "仅字幕")}。";
     }
 
     private AppSettings ReadSettings()
@@ -151,13 +171,19 @@ public partial class MainWindow : Window
             CloudMode = false,
             AsrEngine = AsrProviderFromSelection(),
             AsrDevice = AsrDeviceFromSelection(),
+            ModelServiceUrl = ModelServiceUrlTextBox.Text.Trim(),
+            ModelServiceToken = ModelServiceTokenBox.Password,
             UseApiTranslation = TranslationProviderCombo.SelectedIndex == 1,
             UseApiTts = TtsProviderCombo.SelectedIndex == 1,
             LowLatencyIncoming = LowLatencyIncomingCheckBox.IsChecked == true,
+            EnableOutgoingTranslation = EnableOutgoingTranslationCheckBox.IsChecked == true,
             OutgoingClauseStreaming = OutgoingClauseStreamingCheckBox.IsChecked == true,
             UseProcessLoopback = true,
             MicrophoneDeviceId = (MicrophoneCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
-            DiscordOutputDeviceId = (DiscordOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
+            DiscordOutputDeviceId = string.Empty,
+            IncomingProcessName = (IncomingProcessCombo.SelectedItem as ProcessAudioTarget)?.ProcessName ?? string.Empty,
+            IncomingProcessPath = (IncomingProcessCombo.SelectedItem as ProcessAudioTarget)?.ExecutablePath ?? string.Empty,
+            IncomingProcessId = (IncomingProcessCombo.SelectedItem as ProcessAudioTarget)?.ProcessId ?? 0,
             CableRenderDeviceId = (CableRenderCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             MonitorRenderDeviceId = (MonitorOutputCombo.SelectedItem as AudioDeviceOption)?.Id ?? string.Empty,
             MonitorTranslatedSpeech = MonitorTranslatedSpeechCheckBox.IsChecked == true,
@@ -169,7 +195,7 @@ public partial class MainWindow : Window
             OverlayTop = _settings.OverlayTop,
             OverlayWidth = _settings.OverlayWidth,
             OverlayHeight = _settings.OverlayHeight,
-            SubtitleFontSize = SubtitleFontSizeSlider.Value
+            SubtitleFontSize = FixedSubtitleFontSize
         };
     }
 
@@ -191,10 +217,13 @@ public partial class MainWindow : Window
             _hook.Start(_windowHandle);
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = true;
-            TestTranslationButton.IsEnabled = !_settings.DemoMode;
+            TestTranslationButton.IsEnabled = !_settings.DemoMode && _engine.OutgoingAvailable;
             AdjustOverlayButton.IsEnabled = true;
             TestCloudApiButton.IsEnabled = false;
-            _overlay.SetStatus("运行中 · 原声麦克风直通", ok: true);
+            UpdateStatusBadge("运行中");
+            _overlay.SetStatus(_engine.OutgoingAvailable
+                ? "运行中 · 原声麦克风直通"
+                : "运行中 · 仅字幕模式", ok: true);
         }
         catch (Exception ex)
         {
@@ -236,7 +265,8 @@ public partial class MainWindow : Window
             var settings = ReadSettings();
             _settingsStore.Save(settings);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
-            await using var localAsr = new LocalOutgoingService();
+            await using var localAsr = new LocalOutgoingService(
+                settings.AsrEngine, settings.AsrDevice, settings.ModelServiceUrl, settings.ModelServiceToken);
             await localAsr.StartAsync(timeout.Token);
             using var cloud = new OnlineApiService(settings.ApiEnglishVoice);
             StatusText.Text = "正在测试 MyMemory 翻译与 Edge TTS……";
@@ -267,15 +297,27 @@ public partial class MainWindow : Window
         _engine?.UpdateProviders(_settings.UseApiTranslation, _settings.UseApiTts);
         if (_engine is not null)
             StatusText.Text =
-                $"已切换：ASR={(_settings.AsrEngine == "sherpa" ? "Sherpa-ONNX" : "Whisper")}，翻译={(_settings.UseApiTranslation ? "API" : "本地")}，TTS={(_settings.UseApiTts ? "API" : "本地")}；重启会话后生效。";
+                $"已切换：ASR={AsrProviderDisplayName(_settings.AsrEngine)}，翻译={(_settings.UseApiTranslation ? "API" : "模型服务")}，TTS={(_settings.UseApiTts ? "API" : "本地")}；重启会话后生效。";
     }
 
     private string AsrProviderFromSelection()
     {
         var selected = AsrProviderCombo.SelectedItem as ComboBoxItem;
         var tag = selected?.Tag?.ToString()?.Trim().ToLowerInvariant();
-        return tag == "sherpa" ? "sherpa" : "whisper";
+        return tag switch
+        {
+            "qwen3-asr" => "qwen3-asr",
+            "sherpa" => "sherpa",
+            _ => "whisper"
+        };
     }
+
+    private static string AsrProviderDisplayName(string engine) => engine switch
+    {
+        "qwen3-asr" => "Spark Qwen3-ASR",
+        "sherpa" => "Sherpa-ONNX",
+        _ => "Whisper"
+    };
 
     private string AsrDeviceFromSelection()
     {
@@ -309,21 +351,33 @@ public partial class MainWindow : Window
                 : "分句抢跑已关闭：恢复为松手后整句发送。";
     }
 
-    private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();
-
-    private void SubtitleFontSizeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    private void EnableOutgoingTranslationCheckBox_Click(object sender, RoutedEventArgs e)
     {
-        if (_settings is null) return;
-        _settings.SubtitleFontSize = e.NewValue;
-        _overlay?.SetFontSize(e.NewValue);
-        if (IsLoaded) _settingsStore.Save(_settings);
+        _settings.EnableOutgoingTranslation = EnableOutgoingTranslationCheckBox.IsChecked == true;
+        _settingsStore.Save(_settings);
+        UpdateOutgoingControls();
+        RefreshDevices();
     }
+
+    private void UpdateOutgoingControls()
+    {
+        var enabled = EnableOutgoingTranslationCheckBox.IsChecked == true;
+        MicrophoneCombo.IsEnabled = enabled;
+        MonitorOutputCombo.IsEnabled = enabled;
+        MonitorTranslatedSpeechCheckBox.IsEnabled = enabled;
+        CableRenderCombo.Opacity = enabled ? 1 : 0.55;
+        EnglishVoiceCombo.IsEnabled = enabled;
+        OutgoingClauseStreamingCheckBox.IsEnabled = enabled;
+        TestChineseTextBox.IsEnabled = enabled;
+    }
+
+    private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e) => RefreshDevices();
 
     private void AdjustOverlayButton_Click(object sender, RoutedEventArgs e)
     {
         if (_overlay is null) return;
         _overlay.SetInteractive(!_overlay.IsInteractive);
-        AdjustOverlayButton.Content = _overlay.IsInteractive ? "② 完成并锁定" : "① 解锁移动/缩放";
+        AdjustOverlayButton.Content = _overlay.IsInteractive ? "锁定字幕窗" : "调整字幕窗";
         if (!_overlay.IsInteractive) SaveOverlayBounds();
     }
 
@@ -363,13 +417,21 @@ public partial class MainWindow : Window
     private void OnSubtitlePreviewChanged(object? sender, string? text) => _overlay?.SetPreview(text);
     private void OnStatusChanged(object? sender, string text)
     {
-        Dispatcher.Invoke(() => StatusText.Text = text);
+        Dispatcher.Invoke(() =>
+        {
+            StatusText.Text = text;
+            UpdateStatusBadge(text);
+        });
         _overlay?.SetStatus(text, ok: !text.Contains("错误"));
     }
     private void OnError(object? sender, string text)
     {
         VoiceScreenLog.Error($"engine reported: {text}");
-        Dispatcher.Invoke(() => StatusText.Text = "错误：" + text);
+        Dispatcher.Invoke(() =>
+        {
+            StatusText.Text = "错误：" + text;
+            UpdateStatusBadge("错误：" + text);
+        });
         _overlay?.AddLine("status", "错误：" + text);
         _overlay?.SetStatus(text, error: true);
     }
@@ -389,13 +451,33 @@ public partial class MainWindow : Window
         }
         _overlay?.Close();
         _overlay = null;
-        AdjustOverlayButton.Content = "① 解锁移动/缩放";
+        AdjustOverlayButton.Content = "调整字幕窗";
         AdjustOverlayButton.IsEnabled = false;
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
         TestTranslationButton.IsEnabled = false;
         TestCloudApiButton.IsEnabled = true;
         StatusText.Text = "已停止";
+        UpdateStatusBadge("已停止");
+    }
+
+    private void UpdateStatusBadge(string status)
+    {
+        var isError = status.Contains("错误", StringComparison.OrdinalIgnoreCase)
+                      || status.Contains("失败", StringComparison.OrdinalIgnoreCase);
+        var isRunning = !isError && (_engine is not null || status.StartsWith("运行中", StringComparison.Ordinal));
+        StatusBadgeText.Text = isError
+            ? "错误"
+            : isRunning
+                ? "运行中"
+                : status.Contains("正在", StringComparison.Ordinal)
+                    ? "启动中"
+                    : status.Contains("停止", StringComparison.Ordinal)
+                        ? "已停止"
+                        : "就绪";
+        StatusBadgeDot.Fill = (System.Windows.Media.Brush)FindResource(
+            isError ? "WarnBrush" : isRunning ? "AccentBrush" : "MutedBrush");
+        StatusBadgeText.Foreground = StatusBadgeDot.Fill;
     }
 
     private bool _shutdownComplete;

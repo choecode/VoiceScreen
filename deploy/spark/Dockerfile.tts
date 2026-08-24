@@ -1,0 +1,23 @@
+FROM nvcr.io/nvidia/pytorch:26.02-py3
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/voicescreen/compat \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+# qwen-tts and qwen-asr pin different Transformers patch releases. Keep cloned
+# voice synthesis in its own image so upgrading either side cannot break ASR.
+RUN python -m pip install --no-cache-dir \
+    "qwen-tts==0.1.1" \
+    "flask==3.1.2" \
+    "gunicorn==23.0.0"
+
+WORKDIR /opt/voicescreen
+COPY torchaudio_compat /opt/voicescreen/compat/torchaudio
+COPY voicescreen_tts_service.py /opt/voicescreen/voicescreen_tts_service.py
+
+EXPOSE 18766
+ENTRYPOINT ["gunicorn", "--workers", "1", "--threads", "2", "--timeout", "300", "--graceful-timeout", "60", "--bind", "0.0.0.0:18766", "voicescreen_tts_service:create_app()"]

@@ -1,6 +1,8 @@
 using VoiceScreen.App.Audio;
 using VoiceScreen.App.Models;
 using VoiceScreen.App.Services;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 if (args.Any(arg => arg.Equals("--online-api", StringComparison.OrdinalIgnoreCase)
@@ -13,6 +15,155 @@ if (args.Any(arg => arg.Equals("--online-api", StringComparison.OrdinalIgnoreCas
     await localAsr.StartAsync(timeout.Token);
     using var remote = new OnlineApiService(apiSettings.ApiEnglishVoice);
     Console.WriteLine(await remote.TestAsync(timeout.Token));
+    return;
+}
+
+if (args.Any(arg => arg.Equals("--speech", StringComparison.OrdinalIgnoreCase)))
+{
+    Console.WriteLine("VoiceScreen Windows Speech API 自检");
+    var allWindowsVoices = Windows.Media.SpeechSynthesis.SpeechSynthesizer.AllVoices;
+    var windowsEnglishVoices = allWindowsVoices.Count(voice =>
+        voice.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase));
+    Console.WriteLine($"Windows 新版 API 已连接：系统音色={allWindowsVoices.Count}，英文音色={windowsEnglishVoices}");
+    var speechVoices = OfflineSpeech.GetInstalledEnglishVoices();
+    if (speechVoices.Count == 0)
+        throw new InvalidOperationException("没有找到 Windows 英文语音。");
+
+    foreach (var voice in speechVoices)
+    {
+        var pcm = await OfflineSpeech.SynthesizeEnglishAsync(
+            "Voice Screen Windows speech test.", CancellationToken.None, voice.Id);
+        if (pcm.Length < 3200 || pcm.Length % 2 != 0)
+            throw new InvalidOperationException($"音色没有生成有效的 16 位 PCM：{voice.Name}，bytes={pcm.Length}");
+        Console.WriteLine($"PASS：{voice.Name}，PCM={pcm.Length} bytes");
+    }
+
+    Console.WriteLine($"PASS：{speechVoices.Count} 个英文音色已完成实际合成。");
+    return;
+}
+
+if (args.Any(arg => arg.Equals("--spark-streaming", StringComparison.OrdinalIgnoreCase)))
+{
+    Console.WriteLine("VoiceScreen Spark Qwen realtime 自检");
+    var sparkSettings = new SettingsStore().Load();
+    if (string.IsNullOrWhiteSpace(sparkSettings.ModelServiceToken))
+        throw new InvalidOperationException("VoiceScreen 设置中没有 Spark 模型服务令牌。");
+
+    await using var local = new LocalOutgoingService(
+        "qwen3-asr", sparkSettings.AsrDevice, sparkSettings.ModelServiceUrl, sparkSettings.ModelServiceToken);
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+    await local.StartAsync(timeout.Token);
+    if (!local.UsesStreamingSessions)
+        throw new InvalidOperationException("18766 realtime 服务未启用，客户端回退到了离线整窗 ASR。");
+
+    const string phrase = "The quick brown fox jumps over the lazy dog, and then runs toward the river.";
+    var pcm = await OfflineSpeech.SynthesizeEnglishAsync(phrase, timeout.Token);
+    await using var processor = new LocalIncomingAudioProcessor(local, lowLatency: true);
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    var firstEnglish = new TaskCompletionSource<(LocalIncomingTranslation Value, long Milliseconds)>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var finalSubtitle = new TaskCompletionSource<LocalIncomingTranslation>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    processor.PreviewChanged += (_, value) =>
+    {
+        if (!string.IsNullOrWhiteSpace(value?.SourceText))
+            firstEnglish.TrySetResult((value, clock.ElapsedMilliseconds));
+    };
+    processor.TranslationReady += (_, value) => finalSubtitle.TrySetResult(value);
+    processor.Error += (_, error) => finalSubtitle.TrySetException(new InvalidOperationException(error));
+
+    var feeder = Task.Run(async () =>
+    {
+        for (var offset = 0; offset < pcm.Length; offset += 1280)
+        {
+            var frame = new byte[1280];
+            Buffer.BlockCopy(pcm, offset, frame, 0, Math.Min(frame.Length, pcm.Length - offset));
+            await processor.AddFrameAsync(frame, true, timeout.Token);
+            await Task.Delay(40, timeout.Token);
+        }
+        for (var index = 0; index < 17; index++)
+        {
+            await processor.AddFrameAsync(new byte[1280], true, timeout.Token);
+            await Task.Delay(40, timeout.Token);
+        }
+    }, timeout.Token);
+
+    var first = await firstEnglish.Task.WaitAsync(TimeSpan.FromSeconds(8), timeout.Token);
+    await feeder;
+    var final = await finalSubtitle.Task.WaitAsync(TimeSpan.FromSeconds(30), timeout.Token);
+    Console.WriteLine($"PASS：首个英文 {first.Milliseconds} ms，EN={first.Value.SourceText}");
+    Console.WriteLine($"PASS：最终 EN={final.SourceText}，中={final.TranslatedText}");
+    if (first.Milliseconds > 3000)
+        throw new InvalidOperationException($"首个实时英文仍然过慢：{first.Milliseconds} ms");
+    if (!final.SourceText.Contains("fox", StringComparison.OrdinalIgnoreCase)
+        || !final.SourceText.Contains("river", StringComparison.OrdinalIgnoreCase)
+        || string.IsNullOrWhiteSpace(final.TranslatedText))
+        throw new InvalidOperationException("流式最终字幕缺词或没有中文翻译。");
+    return;
+}
+
+if (args.Any(arg => arg.Equals("--cable-end-to-end", StringComparison.OrdinalIgnoreCase)))
+{
+    Console.WriteLine("VoiceScreen VB-CABLE 端到端回录自检");
+    var audioDevices = new AudioDeviceService();
+    var captureDevices = audioDevices.GetCaptureDevices();
+    var renderDevices = audioDevices.GetRenderDevices();
+    var cableTestMicrophone = captureDevices.FirstOrDefault(device =>
+                         !AudioDeviceService.IsVirtualAudioDevice(device)
+                         && device.Name.Contains("HyperX", StringComparison.OrdinalIgnoreCase))
+                     ?? captureDevices.FirstOrDefault(device => !AudioDeviceService.IsVirtualAudioDevice(device))
+                     ?? throw new InvalidOperationException("没有找到实体麦克风。");
+    var cableInput = AudioDeviceService.FindVirtualCableInput(renderDevices)
+                     ?? throw new InvalidOperationException("没有找到 CABLE Input。");
+    var cableOutput = captureDevices.FirstOrDefault(device =>
+                          device.Name.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase))
+                      ?? throw new InvalidOperationException("没有找到 CABLE Output 虚拟麦克风。");
+
+    using var enumerator = new MMDeviceEnumerator();
+    using var cableCaptureDevice = enumerator.GetDevice(cableOutput.Id);
+    using var cableCapture = new WasapiCapture(cableCaptureDevice, true, 40);
+    using var received = new MemoryStream();
+    var receiveGate = new object();
+    cableCapture.DataAvailable += (_, eventArgs) =>
+    {
+        lock (receiveGate) received.Write(eventArgs.Buffer, 0, eventArgs.BytesRecorded);
+    };
+
+    const string phrase =
+        "Please wait near the second floor stairs. I will meet you there after checking the left side. " +
+        "The final verification words are silver river.";
+    var expectedPcm = await OfflineSpeech.SynthesizeEnglishAsync(phrase, CancellationToken.None);
+    using var router = new MicrophoneCableRouter();
+    router.Start(cableTestMicrophone.Id, cableInput.Id);
+    router.BeginTranslationCapture();
+    cableCapture.StartRecording();
+    await Task.Delay(300);
+    await router.PlayTtsAsync(expectedPcm, CancellationToken.None, playOnMonitor: false);
+    await Task.Delay(900);
+    cableCapture.StopRecording();
+    router.RestorePassThrough();
+
+    byte[] rawCapture;
+    lock (receiveGate) rawCapture = received.ToArray();
+    var duration = TimeSpan.FromSeconds((double)rawCapture.Length / cableCapture.WaveFormat.AverageBytesPerSecond);
+    var cablePcm = AudioTranscoder.ToPcm16Mono16Khz(
+        new CapturedAudio(rawCapture, cableCapture.WaveFormat, duration));
+    Console.WriteLine($"发送 PCM={expectedPcm.Length} bytes，CABLE 回录={cablePcm.Length} bytes，{duration.TotalSeconds:F2}s");
+    if (cablePcm.Length < expectedPcm.Length * 0.85)
+        throw new InvalidOperationException("CABLE Output 回录明显短于发送语音，虚拟线路发生截断。");
+
+    var cableTestSettings = new SettingsStore().Load();
+    await using var asr = new LocalOutgoingService(
+        "qwen3-asr", cableTestSettings.AsrDevice, cableTestSettings.ModelServiceUrl,
+        cableTestSettings.ModelServiceToken);
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+    await asr.StartAsync(timeout.Token);
+    var heard = await asr.TranscribeIncomingSpeechAsync(cablePcm,
+        new TranscriptionRequest(), timeout.Token);
+    Console.WriteLine($"CABLE 回录识别：{heard.Text}");
+    if (!heard.Text.Contains("silver river", StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException("CABLE 回录没有包含句尾 silver river，发送链路确实截断了尾部。");
+    Console.WriteLine("PASS：完整英文（包括最后的 silver river）已进入 CABLE Output；若通话对方仍只听到开头，截断发生在语音应用的输入处理层。");
     return;
 }
 

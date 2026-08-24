@@ -1,13 +1,16 @@
 using NAudio.CoreAudioApi;
 using VoiceScreen.App.Models;
+using VoiceScreen.Core;
 
 namespace VoiceScreen.App.Services;
 
 public sealed class AudioDeviceService
 {
     public static bool IsVirtualCableInput(AudioDeviceOption device)
-        => device.Name.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase)
-           && device.Name.Contains("VB-Audio", StringComparison.OrdinalIgnoreCase);
+        => AudioDeviceClassifier.IsVirtualCableSendEndpoint(device.Name);
+
+    public static bool IsVirtualAudioDevice(AudioDeviceOption device)
+        => AudioDeviceClassifier.IsVirtualAudioDevice(device.Name);
 
     public IReadOnlyList<AudioDeviceOption> GetCaptureDevices()
     {

@@ -1,4 +1,5 @@
 using System.Windows;
+using VoiceScreen.App.Audio;
 using VoiceScreen.App.Diagnostics;
 using VoiceScreen.App.Models;
 using VoiceScreen.App.Services;
@@ -10,7 +11,24 @@ public partial class App : Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
-        VoiceScreenLog.Info($"=== VoiceScreen.App process started. pid={Environment.ProcessId} args=[{string.Join(' ', e.Args)}]");
+        VoiceScreenLog.Info($"=== VoiceScreen.App process started. pid={Environment.ProcessId} args=[{SafeArgumentsForLog(e.Args)}]");
+
+        var configureIndex = Array.FindIndex(e.Args,
+            argument => string.Equals(argument, "--configure-model-service", StringComparison.OrdinalIgnoreCase));
+        if (configureIndex >= 0)
+        {
+            if (configureIndex + 2 >= e.Args.Length)
+                throw new ArgumentException("--configure-model-service requires URL and token arguments.");
+            var store = new SettingsStore();
+            var configured = store.Load();
+            configured.AsrEngine = "qwen3-asr";
+            configured.ModelServiceUrl = e.Args[configureIndex + 1];
+            configured.ModelServiceToken = e.Args[configureIndex + 2];
+            store.Save(configured);
+            VoiceScreenLog.Info("Spark model service configuration saved with DPAPI encryption.");
+            Shutdown(0);
+            return;
+        }
 
         var isSmoke = e.Args.Any(a => string.Equals(a, "--smoke", StringComparison.OrdinalIgnoreCase));
         var autoStart = e.Args.Any(a => string.Equals(a, "--auto-start", StringComparison.OrdinalIgnoreCase));
@@ -33,6 +51,16 @@ public partial class App : Application
         }
     }
 
+    private static string SafeArgumentsForLog(string[] arguments)
+    {
+        var safe = arguments.ToArray();
+        var configureIndex = Array.FindIndex(safe,
+            argument => string.Equals(argument, "--configure-model-service", StringComparison.OrdinalIgnoreCase));
+        if (configureIndex >= 0 && configureIndex + 2 < safe.Length)
+            safe[configureIndex + 2] = "<redacted>";
+        return string.Join(' ', safe);
+    }
+
     /// <summary>
     /// --auto-start 配套：等 UI 完全就绪后，自动点"启动"，跑 5 秒，然后自动点"停止"再退出。
     /// 用来在没有 UI 自动化时验证完整的 UI 模式 + 引擎生命周期。
@@ -53,29 +81,78 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// 无 UI 的端到端冒烟测试：构造引擎 → StartAsync → 等 5 秒让 Discord 音频流进来 →
+    /// 无 UI 的端到端冒烟测试：构造引擎 → StartAsync → 等 5 秒让所选进程音频流进来 →
     /// DisposeAsync → 退出。专门用来在没有 UI 自动化时验证整条链路。
     /// </summary>
     private async Task RunSmokeAsync(string[] args)
     {
         VoiceScreenLog.Info("[smoke] starting smoke test");
+        var exitCode = 0;
         try
         {
             var settings = new SettingsStore().Load();
             settings.UseProcessLoopback = true;
+            if (args.Any(argument => string.Equals(argument, "--captions-only",
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                settings.EnableOutgoingTranslation = false;
+                // 冒烟测试刻意清空发送设备，证明监听字幕不会偷偷依赖麦克风/VB-CABLE。
+                settings.MicrophoneDeviceId = string.Empty;
+                settings.CableRenderDeviceId = string.Empty;
+                settings.MonitorRenderDeviceId = string.Empty;
+                settings.EnglishVoiceName = string.Empty;
+            }
+            var requestedProcess = ReadOption(args, "--target-process");
+            var preferredProcessId = int.TryParse(ReadOption(args, "--target-pid"), out var requestedPid)
+                ? Math.Max(0, requestedPid)
+                : 0;
+            var targets = new ProcessTargetService();
+            var target = !string.IsNullOrWhiteSpace(requestedProcess)
+                // 显式指定的冒烟目标可以是无窗口测试进程；正式 UI 列表仍只展示交互应用。
+                ? targets.Resolve(requestedProcess, string.Empty, preferredProcessId)
+                : targets.Resolve(settings.IncomingProcessName, settings.IncomingProcessPath,
+                      preferredProcessId > 0 ? preferredProcessId : settings.IncomingProcessId)
+                  ?? targets.GetRunningTargets().FirstOrDefault();
+            if (target is null)
+                throw new InvalidOperationException("[smoke] 没有找到可监听的桌面进程。");
+            settings.IncomingProcessName = target.ProcessName;
+            settings.IncomingProcessPath = target.ExecutablePath;
+            settings.IncomingProcessId = target.ProcessId;
+
+            var durationSeconds = int.TryParse(ReadOption(args, "--smoke-seconds"), out var requestedSeconds)
+                ? Math.Clamp(requestedSeconds, 1, 300)
+                : 5;
+            var subtitleCount = 0;
 
             await using var engine = new TranslationEngine(settings);
             engine.StatusChanged += (_, msg) => VoiceScreenLog.Info($"[smoke] status: {msg}");
             engine.Error += (_, msg) => VoiceScreenLog.Error($"[smoke] engine error: {msg}");
+            engine.SubtitleProduced += (_, item) =>
+            {
+                Interlocked.Increment(ref subtitleCount);
+                VoiceScreenLog.Info($"[smoke] subtitle kind={item.Kind} text={item.Text.Replace('\n', ' ')}");
+            };
+            engine.SubtitlePreviewChanged += (_, text) =>
+            {
+                if (!string.IsNullOrWhiteSpace(text))
+                    VoiceScreenLog.Info($"[smoke] preview: {text.Replace('\n', ' ')}");
+            };
 
             try
             {
                 await engine.StartAsync(CancellationToken.None);
-                VoiceScreenLog.Info("[smoke] engine started, sleeping 5s to let audio flow");
-                await Task.Delay(TimeSpan.FromSeconds(5));
+                VoiceScreenLog.Info(
+                    $"[smoke] engine started, target={target.ProcessName} pid={target.ProcessId}, observing {durationSeconds}s");
+                await Task.Delay(TimeSpan.FromSeconds(durationSeconds));
+                if (subtitleCount == 0)
+                {
+                    exitCode = 4;
+                    VoiceScreenLog.Error("[smoke] no finalized subtitles were produced during the observation window");
+                }
             }
             catch (Exception ex)
             {
+                exitCode = 2;
                 VoiceScreenLog.Error("[smoke] engine.StartAsync threw", ex);
             }
 
@@ -83,13 +160,21 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
+            exitCode = 3;
             VoiceScreenLog.Error("[smoke] outer failure", ex);
         }
         finally
         {
             VoiceScreenLog.Info("[smoke] smoke test finished, exiting process");
             await Task.Delay(200);
-            Shutdown(0);
+            Shutdown(exitCode);
         }
+    }
+
+    private static string? ReadOption(string[] arguments, string name)
+    {
+        var index = Array.FindIndex(arguments,
+            argument => string.Equals(argument, name, StringComparison.OrdinalIgnoreCase));
+        return index >= 0 && index + 1 < arguments.Length ? arguments[index + 1] : null;
     }
 }

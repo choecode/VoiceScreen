@@ -1,7 +1,10 @@
 using System.IO;
+using System.Runtime.InteropServices;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
+using VoiceScreen.App.Diagnostics;
+using VoiceScreen.Core;
 
 namespace VoiceScreen.App.Audio;
 
@@ -38,16 +41,18 @@ public sealed class MicrophoneCableRouter : IDisposable
 
         // 安全底线：如果把输出选成实体耳机，程序会把用户麦克风实时回放给自己，产生明显回声。
         // 宁可拒绝启动，也不能把任意播放设备当成虚拟麦克风线路。
-        if (!cable.FriendlyName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase)
-            || !cable.FriendlyName.Contains("VB-Audio", StringComparison.OrdinalIgnoreCase))
+        if (!AudioDeviceClassifier.IsVirtualCableSendEndpoint(cable.FriendlyName))
         {
             throw new InvalidOperationException(
                 "发送设备必须是 CABLE Input (VB-Audio Virtual Cable)。已阻止向实体耳机回放麦克风，以免产生回声。");
         }
-        if (microphone.FriendlyName.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("实体麦克风不能选择 CABLE Output，请选择 HyperX 麦克风。");
-        if (monitor is not null && monitor.FriendlyName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("英文试听设备必须是实体耳机，不能选择 CABLE Input。");
+        if (AudioDeviceClassifier.IsVirtualAudioDevice(microphone.FriendlyName))
+            throw new InvalidOperationException("实体麦克风不能选择虚拟音频线，请选择真实麦克风。");
+        if (monitor is not null && AudioDeviceClassifier.IsVirtualAudioDevice(monitor.FriendlyName))
+            throw new InvalidOperationException("英文试听设备必须是实体耳机，不能选择 VB-Audio 虚拟音频端点。");
+
+        VoiceScreenLog.Info(
+            $"Audio router opening. microphone={microphone.FriendlyName} cable={cable.FriendlyName} monitor={monitor?.FriendlyName ?? "disabled"}");
 
         _capture = new WasapiCapture(microphone, true, 40);
         _microphoneBuffer = new BufferedWaveProvider(_capture.WaveFormat)
@@ -75,8 +80,15 @@ public sealed class MicrophoneCableRouter : IDisposable
             _monitorTtsBuffer = CreateTtsBuffer();
             var monitorStereo = new MonoToStereoSampleProvider(_monitorTtsBuffer.ToSampleProvider());
             var monitor48k = new WdlResamplingSampleProvider(monitorStereo, 48000);
-            _monitorOutput = new WasapiOut(monitor, AudioClientShareMode.Shared, true, 80);
-            _monitorOutput.Init(monitor48k);
+            try
+            {
+                _monitorOutput = new WasapiOut(monitor, AudioClientShareMode.Shared, true, 80);
+                _monitorOutput.Init(monitor48k);
+            }
+            catch (COMException ex)
+            {
+                throw DescribeAudioOpenFailure("本地监听输出", monitor.FriendlyName, ex);
+            }
         }
 
         var mixer = new MixingSampleProvider(new ISampleProvider[] { _microphoneVolume, tts48k })
@@ -84,14 +96,39 @@ public sealed class MicrophoneCableRouter : IDisposable
             ReadFully = true
         };
 
-        _output = new WasapiOut(cable, AudioClientShareMode.Shared, true, 80);
-        _output.Init(mixer);
+        try
+        {
+            _output = new WasapiOut(cable, AudioClientShareMode.Shared, true, 80);
+            _output.Init(mixer);
+        }
+        catch (COMException ex)
+        {
+            throw DescribeAudioOpenFailure("VB-CABLE 发送输出", cable.FriendlyName, ex);
+        }
 
         _capture.DataAvailable += OnMicrophoneData;
         _capture.RecordingStopped += OnRecordingStopped;
-        _output.Play();
-        _monitorOutput?.Play();
-        _capture.StartRecording();
+        try
+        {
+            _output.Play();
+            _monitorOutput?.Play();
+            _capture.StartRecording();
+        }
+        catch (COMException ex)
+        {
+            throw DescribeAudioOpenFailure("麦克风采集", microphone.FriendlyName, ex);
+        }
+        VoiceScreenLog.Info("Audio router started in WASAPI shared mode.");
+    }
+
+    private static InvalidOperationException DescribeAudioOpenFailure(string role, string device, COMException error)
+    {
+        const int AudclntDeviceInUse = unchecked((int)0x8889000A);
+        var reason = error.HResult == AudclntDeviceInUse
+            ? "设备正被其他程序以独占模式占用。请关闭该程序的独占音频或换一个实体耳机后重试。"
+            : $"Windows 音频接口返回 0x{error.HResult:X8}。";
+        VoiceScreenLog.Error($"Opening audio endpoint failed. role={role} device={device}", error);
+        return new InvalidOperationException($"无法打开{role}“{device}”：{reason}", error);
     }
 
     public void BeginTranslationCapture()
