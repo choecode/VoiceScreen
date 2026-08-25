@@ -1,306 +1,299 @@
 # VoiceScreen 项目说明
 
-> 当前客户端不依赖任何局域网服务器。ASR 始终使用本机 Whisper；翻译与英文 TTS 可分别在本地实现和免费 API 之间切换。
+本文描述 2026-08-25 的当前实现。历史上 VoiceScreen 曾以“Windows 本机 Whisper + OPUS-MT”为唯一架构；现在它仍是回退方案，生产默认已经升级为 **Windows 客户端 + DGX Spark/Qwen**。
 
-VoiceScreen 是一款面向 Windows 11 和 Discord 桌面客户端的本地双向语音翻译工具。它解决的核心问题是：玩游戏并加入 Discord 语音频道时，让中文用户看懂外国玩家的发言，同时把自己说的中文转换成英文语音发送给对方。
+## 1. 产品定位
 
-项目不依赖讯飞或付费 API。默认可使用纯本地 CPU INT8 推理；也可按需启用 MyMemory 翻译或 Edge TTS，且语音识别仍留在本机。
+VoiceScreen 解决两个相互独立的问题：
 
-![VoiceScreen 实机运行界面](docs/images/voicescreen-running.png)
+1. **听懂对方**：只捕获用户选中的桌面应用，在悬浮窗显示实时原文和中文翻译。
+2. **让对方听懂自己**：平时发送真实麦克风原声；按住右 Alt 说中文时，改为发送英文翻译语音。
 
-## 1. 主要功能
+发送链路可以关闭。即使没有 VB-CABLE、麦克风或英文 TTS，用户仍可使用完整的实时字幕功能。
 
-- 只捕获 Discord 桌面客户端及其子进程声音，不识别游戏、浏览器、音乐或整个系统的混合声音。
-- Discord 对方说英语时，在悬浮窗显示英文原文和中文译文。
-- Discord 对方说泰语时，经本地 `泰语 → 英语 → 中文` 模型桥接翻译。
-- 检测到中文时直接显示原文，不执行无意义的中文翻译。
-- 低延迟模式下边说边显示临时字幕，停顿后再用更准确的模型定稿。
-- 平时将实体麦克风原声直通 Discord；按住右 Alt 说中文、松开后发送英文语音。
-- 悬浮窗同步显示“我说”的中文和实际发送的英文，方便核对翻译内容。
-- 支持 Windows 已安装的英文男声、女声音色。
-- 支持仅在耳机中试听翻译结果，不发送给 Discord。
-- 支持字幕历史、`PgUp`/`PgDn` 翻页、字号调整、窗口移动和缩放。
-- 对重复字符、周期短语和异常膨胀译文进行过滤，减少 Whisper 幻觉污染字幕。
-- 合成英文播放期间暂停接收识别并隔离麦克风直通，防止程序听见自己后无限翻译。
+## 2. 设计原则
 
-## 2. 双向工作流程
+- **捕获范围明确**：只捕获选定根进程及其子进程，不在失败时偷偷改成整机声音。
+- **临时结果与历史分离**：实时尾部可以修改，定稿历史不能反复覆盖或重复追加。
+- **音频线程不等待模型**：捕获、ASR、翻译、UI、TTS 各自排队，慢请求不能阻塞音频采集。
+- **长句先播后算**：私人音色按自然语义分块，第一块可播放后立即入队。
+- **发送失败不拖垮字幕**：VB-CABLE 或麦克风异常只关闭发送功能。
+- **生产与实验隔离**：CosyVoice 只属于 Compose `experiments` profile，不会随生产服务启动。
+- **模型服务有边界**：局域网服务必须使用令牌，端口不能直接暴露公网。
 
-### 2.1 对方说话：英语或泰语转中文字幕
+## 3. 接收链路：应用语音到中文字幕
 
 ```text
-Discord 进程音频
-    ↓
-Windows Process Loopback（只捕获 Discord）
-    ↓
-faster-whisper base（临时识别）
-    ↓
-OPUS-MT（增量翻译）
-    ↓
-悬浮窗临时原文与中文
-    ↓
-faster-whisper small（停顿后最终定稿）
-    ↓
-悬浮窗历史字幕
+选定根进程及其子进程
+  → Windows Process Loopback Capture
+  → 自动重建捕获会话（进程或音频会话变化时）
+  → PCM 16 kHz / mono / s16le
+  → Silero VAD 流式窗口
+  → 预滚缓冲 + 当前语句缓冲
+  → Qwen3-ASR 流式会话
+  → 临时转写 / 稳定前缀
+  → 语义边界策略 + Qwen3-4B BREAK/CONTINUE
+  → 增量翻译
+  → 临时字幕原地更新
+  → 最终定稿进入历史
 ```
 
-低延迟字幕默认开启。临时结果采用灰色独立区域原地更新，不写入历史；最终结果才进入字幕历史。若更重视完整性而不是速度，可以关闭“游戏低延迟字幕”，回到整段语音完成后再识别的稳定模式。
+### 3.1 进程音频捕获
 
-### 2.2 我方说话：中文转英文语音
+用户可以选择 Discord、Chrome、播放器或其他有窗口/音频能力的桌面进程。`ProcessTargetService` 保存进程名、可执行路径和本次 PID；应用重启导致 PID 改变后，会按名称和路径重新定位。
+
+`ResilientProcessLoopbackCapture` 捕获完整进程树，并监控目标进程与音频会话变化。捕获初始化失败会给出明确错误，不会降级为系统混音，因此不会意外把游戏、浏览器或 TTS 输出送去识别。
+
+### 3.2 Silero VAD
+
+客户端内置 `silero_vad_16k_op15.onnx`：
+
+- 输入为 16 kHz 单声道 PCM；
+- 每 512 个新采样执行一次推理，并携带 64 个上下文采样与循环状态；
+- 使用 `0.50` 开启、`0.35` 关闭的滞回阈值，减少边界抖动；
+- ONNX Runtime CPU 推理，不占 Spark GPU；
+- 模型缺失或推理异常时 fail-open 回退到原有 RMS 门限，监听会话不会因此终止。
+
+这一步解决了“音乐或稳定噪声响度很高，被 RMS 当成人声”的主要问题。
+
+### 3.3 流式 ASR 与最终定稿
+
+推荐的 Qwen3-ASR 服务以会话 ID 保存当前语句状态：
+
+- 客户端只发送上次之后新增的 PCM；
+- 服务每累计约 1 秒音频更新一次流式预览；
+- 未稳定尾部保留回滚空间，避免每次结果都从头覆盖；
+- 单会话最多 60 秒，空闲 120 秒清理，最多 32 个会话；
+- 语句结束时再用完整上下文执行一次最终识别，然后释放服务端会话。
+
+本机 Whisper 回退采用滚动窗口：base 提供预览、small 负责定稿；Sherpa-ONNX 回退则维持真正的流式解码状态。
+
+### 3.4 自然断句
+
+VoiceScreen 不再只用“固定秒数”决定字幕边界。当前策略组合以下信号：
+
+- VAD 静音长度；
+- 临时文本是否稳定；
+- 标点、长度和最大语句时长；
+- Qwen3-4B `/segment` 返回的受限 `BREAK` / `CONTINUE` 判断。
+
+模型只有明确回复 `BREAK` 才会接受边界；任何解释性或异常输出都按 `CONTINUE` 处理。这样能避免上一条字幕停在冠词、介词、连词或未完成从句上。
+
+### 3.5 增量翻译与去重
+
+ASR 和翻译分别使用工作队列：
+
+- 临时版本只保留最新快照；
+- 已确认的最终语句不会被临时任务覆盖；
+- 新译文只替换实时预览，不进入永久历史；
+- 最终结果经过周期短语、重复膨胀和源译长度异常检测；
+- 中文字符分布优先于 ASR 的语言标签，减少短句误标；
+- 检测到中文时直接显示，不再做中文到中文翻译。
+
+## 4. 发送链路：中文到英文语音
+
+### 4.1 普通状态
 
 ```text
-普通状态：实体麦克风 → VoiceScreen → VB-CABLE → Discord（中文原声）
-
-按住右 Alt：停止原声直通 → 录制中文
-松开右 Alt：中文识别 → 中译英 → Windows 英文语音
-                            ↓
-                    VB-CABLE → Discord
-                            ↓（可选）
-                         实体耳机
+实体麦克风 → VoiceScreen WASAPI Router → CABLE Input → CABLE Output → 语音应用
 ```
 
-右 Alt 是全局按住说话键。程序同时使用 Raw Input、低级键盘钩子和异步键状态轮询，并对重复事件去重，以提高全屏游戏和部分带反作弊游戏中的兼容性。程序不会向游戏注入代码，也不会读取游戏内存。
+VoiceScreen 必须始终参与麦克风直通；Discord 的输入设备因此固定选择 `CABLE Output`。
 
-## 3. 音频设备关系
-
-VoiceScreen 需要 [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) 为翻译后的英文提供一条独立的虚拟麦克风通道。
-
-| 设置位置 | 正确选择 |
-|---|---|
-| VoiceScreen 实体麦克风 | HyperX 或其他真实麦克风 |
-| VoiceScreen 英文试听耳机 | HyperX 或其他实体耳机 |
-| VoiceScreen 发送给 Discord | `CABLE Input (VB-Audio Virtual Cable)` |
-| Discord 输入设备 | `CABLE Output (VB-Audio Virtual Cable)` |
-| Discord 输出设备 | HyperX 或其他实体耳机 |
-
-不要把 Discord 输出设备设置成 `CABLE Input`，也不要在 Windows 中启用 CABLE Output 的“侦听此设备”。这两种设置都会导致回声、自我复读或听不到对方。
-
-## 4. 界面说明
-
-### 4.1 处理引擎
-
-- **语音识别**：固定使用本机 Whisper，不上传 Discord 或麦克风音频。
-- **文本翻译**：可选本地 OPUS-MT 或 MyMemory API。
-- **英文 TTS**：可选本地 Windows Speech 或 Edge TTS API。
-- 翻译和 TTS 可独立组合；运行中切换会从下一句话开始生效。
-- **游戏低延迟字幕**：启用临时识别和增量翻译；停顿约 0.6 秒后开始最终定稿。
-
-### 4.2 音频设备
-
-- **实体麦克风**：平时用于原声直通，按住右 Alt 时用于中文录音。
-- **英文试听耳机**：测试翻译或启用“复读已发送英文”时播放英文。
-- **Discord 声音捕获**：固定自动跟踪 Discord 进程，无须选择系统扬声器。
-- **发送给 Discord**：固定使用 VB-CABLE 播放端。
-- **复读已发送英文**：决定自己是否也在耳机里听见发送给对方的英文。
-
-### 4.3 悬浮字幕
-
-| 样式 | 含义 |
-|---|---|
-| `EN:` | Discord 对方的英文原文 |
-| `TH:` | Discord 对方的泰语原文 |
-| `中:` | 中文译文或检测到的中文原文 |
-| `我说:` | 本机识别到的中文 |
-| `已发送:` | 实际合成并发送给 Discord 的英文 |
-| 灰色临时区域 | 尚未定稿的实时识别与翻译 |
-| 黄色错误信息 | 超时、设备或模型异常 |
-
-点击“① 解锁移动/缩放”后，可拖动悬浮窗顶部移动位置，并拖动右下角改变尺寸；完成后点击“② 完成并锁定”，悬浮窗重新启用鼠标穿透。位置、尺寸和字幕字号会自动保存。
-
-## 5. 本地模型与技术栈
-
-| 能力 | 实现 |
-|---|---|
-| 临时语音识别 | faster-whisper `base`，CPU INT8 |
-| 最终语音识别 | faster-whisper `small`，CPU INT8 |
-| 中文 → 英文 | Helsinki-NLP OPUS-MT `zh-en` |
-| 英文 → 中文 | Helsinki-NLP OPUS-MT `en-zh` |
-| 泰语 → 中文 | OPUS-MT `th-en` 再接 `en-zh` |
-| 英文语音合成 | Windows Speech，完全离线 |
-| Discord 单独捕获 | Windows Process Loopback |
-| 桌面程序 | .NET 8 / WPF |
-| 本地模型服务 | Python / HTTP `127.0.0.1:18765` |
-
-模型首次下载需要联网。准备完成后，运行期间只访问本机回环地址，不上传录音、字幕或密钥。模型来源和许可证见 [第三方模型说明](THIRD_PARTY_MODELS.md)。
-
-## 6. 快速安装
-
-完整的新电脑部署步骤见 [完整部署教程](DEPLOYMENT.md)，下面只列最短流程。
-
-1. 安装 .NET 8 Desktop Runtime。
-2. 安装 Python 3.11 x64，并确认 `python --version` 可用。
-3. 安装 VB-Audio Virtual Cable，重启 Windows。
-4. 在仓库根目录准备模型：
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1
-   ```
-
-5. 编译发布：
-
-   ```powershell
-   dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
-     -c Release -r win-x64 --self-contained false `
-     -o dist\VoiceScreen-local-offline
-   ```
-
-6. 先启动 Discord，再运行：
-
-   ```text
-   dist\VoiceScreen-local-offline\VoiceScreen.App.exe
-   ```
-
-## 7. 日常使用
-
-1. 先打开 Discord 桌面客户端并加入语音频道。
-2. 打开 VoiceScreen，检查实体麦克风和试听耳机。
-3. 取消模拟模式，点击“启动”。
-4. 等待状态显示本地模型就绪和原声麦克风直通。
-5. 对方说英语或泰语时，查看左上角悬浮字幕。
-6. 正常说话时，对方听见你的中文原声。
-7. 需要发送英文时，按住右 Alt 说完整中文，松开后等待英文发送。
-8. 用 `PgUp`/`PgDn` 查看历史，用主界面调整字号、位置和大小。
-
-建议首次使用时在 Discord“麦克风测试”中完成一次中文原声和英文翻译测试，再进入真实频道。
-
-## 8. 防回声和防死循环
-
-程序从音频路由和运行状态两层避免循环：
-
-- Discord 输出始终进入实体耳机，不进入 VB-CABLE。
-- VB-CABLE 只承担发送给 Discord 的输入通道。
-- 播放英文 TTS 时，暂时停止原声麦克风直通。
-- 播放期间暂停 Discord 接收识别，并清空相关缓冲。
-- 播放结束后才恢复接收识别和原声麦克风。
-- 可选耳机复读写入实体耳机，不会送回识别链路。
-
-如果仍出现回声，优先检查 Discord 输入/输出设备和 Windows“侦听此设备”，而不是调整模型。
-
-## 9. 数据、日志和隐私
-
-- 默认不保存原始录音。
-- 字幕只保存在当前进程内存中，关闭程序后不保留历史。
-- 设置使用 Windows 当前账户加密后写入 `%LOCALAPPDATA%\VoiceScreen`。
-- 运行日志位于 `%LOCALAPPDATA%\VoiceScreen\voicescreen.log`。
-- 程序不注入 Discord 或游戏，不读取聊天网络数据和游戏内存。
-- 仓库不包含本地模型权重，模型由安装脚本从官方仓库下载。
-
-## 10. 当前限制
-
-- Discord Process Loopback 得到的是频道混合音轨，当前不能显示真实说话人用户名。
-- 多个人同时说话时，识别质量会下降，也无法可靠区分说话人。
-- 当前重点支持英语、泰语和中文；其他语言可能显示原文，但不保证翻译。
-- 临时字幕为了速度使用较小模型，可能短暂出现错误；最终字幕由 small 模型重新定稿。
-- 纯本地 CPU 推理延迟取决于处理器负载、语句长度和说话停顿。
-- OPUS-MT 是专用机器翻译模型，游戏术语、姓名和俚语仍可能翻错。
-- 游戏若以管理员权限或更高权限运行，VoiceScreen 也可能需要同等权限才能收到全局热键。
-
-## 11. 常见问题
-
-### 对方听不见翻译后的英文
-
-确认 Discord 输入设备是 `CABLE Output`，VoiceScreen“发送给 Discord”是 `CABLE Input`。不要在 Discord 中选择实体麦克风作为输入。
-
-### 我听不见对方或出现回声
-
-Discord 输出设备必须是实体耳机。关闭 Windows CABLE Output 属性中的“侦听此设备”，不要使用音箱外放。
-
-### 游戏声音也进入字幕
-
-当前版本固定捕获 Discord 进程树。请使用 Discord 桌面客户端，并在启动 VoiceScreen 前先打开 Discord。浏览器版 Discord 不在支持范围内。
-
-### 出现同一句话无限重复
-
-程序已经过滤重复字符、重复单词和中文周期短语。如果仍出现新的模式，请保留截图和 `%LOCALAPPDATA%\VoiceScreen\voicescreen.log` 的对应时间段。
-
-### 右 Alt 在游戏中无效
-
-先让 VoiceScreen 与游戏以相同权限运行。部分游戏会屏蔽后台键盘读取；程序不使用注入方式绕过反作弊限制。
-
-### 第一次启动很慢
-
-正式模式需要加载两套 Whisper 和三套 OPUS-MT 模型。冷启动可能需要数秒到几十秒，游戏占用 CPU 或磁盘时会更久。
-
-### 退出后仍有 python.exe 占着内存
-
-VoiceScreen 会在关闭时结束自己启动的本地推理服务，并且把该进程放进 Windows Job Object，
-即使主程序崩溃或被强杀，系统也会连带回收它。如果仍看到残留进程，多半是手工用命令行
-单独启动过 `local_outgoing_service.py`，那种情况下的进程不归程序管：
-
-```powershell
-Get-Process python -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -like '*local_outgoing_service*' }
-```
-
-### 启动时提示找不到 VoiceScreen.Core
-
-说明启动的那个 exe 旁边缺少 `VoiceScreen.Core.dll`，通常是单独复制了 exe，
-或者点开了残留的旧发布目录。处理办法见 [部署教程 9.13](DEPLOYMENT.md)。
-
-## 12. 开发与验证
-
-一条命令跑完全部测试（C# 68 个 + Python 30 个）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
-```
-
-C# 和 Python 两套测试对工作目录的要求不同（Python 用例通过 `sys.path` 直接引入
-`LocalService` 里的模块，必须在 `tests/python` 下 discover），脚本已经把差异封装掉，
-本地和 CI 用的是同一个入口。
-
-源码编码检查：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\check_encoding.ps1
-```
-
-需要真实模型的端到端自检：
-
-```powershell
-dotnet run --project tools\VoiceScreen.SelfTest\VoiceScreen.SelfTest.csproj `
-  -c Release -- --local-models
-```
-
-`.github/workflows/ci.yml` 在 push 和 PR 上依次跑「编码检查 → 构建 → 全部测试」。
-Python 用例使用桩模块，CI 不需要安装 ctranslate2 / transformers / faster-whisper。
-
-自动验证范围及当前结果见 [测试报告](TEST_REPORT.md)。低延迟增量字幕的后续优化计划见 [实时化路线](REALTIME_ROADMAP.md)。
-
-## 13. 项目目录
+### 4.2 按住右 Alt
 
 ```text
-VOICE_SCREEN/
-├─ src/VoiceScreen.App/            WPF 主程序、悬浮窗、音频和翻译编排
-│  └─ LocalService/                Python 推理服务与浏览器评测台
-├─ src/VoiceScreen.Core/           与平台无关的纯逻辑，全部有测试覆盖
-├─ tests/VoiceScreen.Tests/        xUnit 单元测试
-├─ tests/python/                   本地服务与 HTTP 契约的 unittest 用例
-├─ tools/run_tests.ps1             两套测试的统一入口
-├─ tools/check_encoding.ps1        源码 UTF-8 / PowerShell BOM 检查
-├─ tools/VoiceScreen.SelfTest/     音频设备和本地模型端到端自检
-├─ tools/setup_local_models.ps1    本地依赖、模型下载和转换脚本
-├─ .github/workflows/ci.yml        编码检查 + 构建 + 测试
-├─ docs/images/                    文档截图
-├─ DEPLOYMENT.md                   完整部署教程
-├─ TEST_REPORT.md                  验证结果
-└─ THIRD_PARTY_MODELS.md           第三方模型与许可
+按下右 Alt
+  → 暂停中文原声直通
+  → 录制实体麦克风
+  → 可选：自然短句抢跑
+
+松开右 Alt
+  → Qwen3-ASR 中文定稿
+  → Qwen3-4B 中译英
+  → Qwen3-TTS 私人音色 / Windows Speech / Edge TTS
+  → VB-CABLE
+  → 可选同步到本地耳机
+  → 排空队列和尾部静音
+  → 恢复原声直通
 ```
 
-### 13.1 Core 里放什么
+全局热键同时使用 Raw Input、低级键盘钩子和异步按键状态轮询，并对三路事件去重。程序不向目标应用注入代码。
 
-`VoiceScreen.Core` 收敛的是「不依赖 WPF、音频设备和网络，因此可以被单元测试直接覆盖」
-的逻辑。这些代码原先散在 WPF 项目里，无法测试，阈值只能靠肉眼调：
+### 4.3 自然短句抢跑
+
+“中文讲话时按自然短句提前发送”默认关闭。开启后，`OutgoingClauseStreamer` 会在按键尚未松开时观察稳定中文前缀，在自然边界处提前识别、翻译并将 TTS 放入播放队列。
+
+松手后的最终识别会用内容对齐找出尚未发送的剩余部分，而不是按字符数硬切，因此不会把已经播放的开头重复发送。风险是已播出的英文无法撤回，所以用户需要主动开启。
+
+### 4.4 私人音色长句分块
+
+Qwen3-TTS 对长文本整段生成时，等待时间会随英文长度增长。`SpeechChunker` 采用以下顺序找切点：
+
+1. 句号、问号、感叹号；
+2. 逗号、分号、冒号等短语边界；
+3. 安全的单词空格；
+4. 极端情况下才按最大长度硬切。
+
+默认优先约 60 字符、最多 80 字符。切点会避开 `and`、`because`、`whether`、`don't`、`to`、`of` 等悬空连接词。第一块合成后立即播放，生成第二块时第一块已经在 VB-CABLE 中播放。
+
+### 4.5 半双工与防循环
+
+核心状态为：
+
+```text
+Listening
+  → CapturingChinese
+  → Translating
+  → SpeakingEnglish
+  → Cooldown
+  → Listening
+```
+
+播放合成英文期间，麦克风直通和接收 ASR 都会暂停；播放、耳机监听和尾部静音排空后才恢复。发送与接收使用不同的音频端点，再加上状态门控和最近发送文本记忆，避免程序识别自己的 TTS 并无限翻译。
+
+## 5. 模型与 Provider 组合
+
+### 5.1 ASR
+
+| 界面选项 | 行为 | 适用情况 |
+|---|---|---|
+| Spark Qwen3-ASR 1.7B | 连接配置的 `18765`，使用流式会话 | 当前推荐生产方案 |
+| 本地 Whisper | 自动启动本机 Python 服务，base 预览、small 定稿 | 无 Spark、需要中英泰离线回退 |
+| 本地 Sherpa-ONNX Zipformer | 本机流式中英双语识别 | 低资源回退，不支持泰语 |
+
+### 5.2 翻译
+
+| 界面选项 | 行为 |
+|---|---|
+| Spark Qwen3-4B | Qwen ASR 模式下连接局域网服务；本机 ASR 模式下由本机 OPUS-MT 备用服务处理 |
+| 云端 MyMemory | 只发送识别后的文本，不上传原始音频 |
+
+### 5.3 TTS 与音色
+
+“语音合成”与“本地英文音色”共同决定实际路径：
+
+- 语音合成为本地，音色选择私人音色：连接同一 Spark 主机的 `18766`；
+- 语音合成为本地，选择 Windows 音色：调用 Windows Speech / SAPI；
+- 语音合成为云端：调用 Edge TTS，并使用单独的 Edge 音色选项。
+
+Spark 私人音色不可用时会记录警告，并回退到 Windows 英文音色；不会让整条发送链路失效。
+
+ASR 后端和服务地址需要停止会话后修改并重新开始。翻译/TTS Provider 的切换以新语句为边界；为避免同一句前后使用不同模型，正在处理的语句会冻结开始时的选择。
+
+## 6. Windows 客户端界面
+
+### 6.1 主区
+
+- **监听应用**：当前要捕获的进程；显示应用名、PID 和窗口标题。
+- **刷新列表**：目标应用启动或重启后重新枚举。
+- **同时把麦克风中文翻译成英文并发送**：关闭后不要求 VB-CABLE，应用以仅字幕模式运行。
+- **开始监听 / 停止**：建立或释放模型、音频和热键会话。
+- **调整字幕窗**：解锁位置和尺寸；锁定后恢复鼠标穿透。
+
+### 6.2 高级设置
+
+- ASR、推理设备、翻译、TTS；
+- 低延迟实时字幕；
+- Spark 服务地址与加密保存的访问令牌；
+- 实体麦克风、本地监听输出、VB-CABLE、音色；
+- 自然短句提前发送；
+- 在线服务测试与中文翻译测试；
+- 因权限无法捕获目标时，以管理员身份重启。
+
+### 6.3 悬浮字幕
+
+| 前缀 | 含义 |
+|---|---|
+| `EN:` | 对方英文原文 |
+| `TH:` | 对方泰语原文 |
+| `中:` | 中文译文或中文原文 |
+| `我说:` | 麦克风识别到的中文 |
+| `已发送:` | 实际进入 TTS 的英文 |
+| 实时区域 | 尚可修改的当前识别和译文 |
+
+字幕固定为 14 号。历史上限默认 200 条，退出后不保存。正常位于底部时自动跟随；用户滚轮或使用 `PgUp` 浏览旧内容后暂停自动跟随，回到底部或按 `PgDn` 到最新位置后恢复。
+
+## 7. Spark 服务
+
+### 7.1 生产服务
+
+| 容器 | 端口 | 模型 | 作用 |
+|---|---:|---|---|
+| `voicescreen-model-service` | `18765` | Qwen3-ASR-1.7B + Qwen3-4B-Instruct-2507 | ASR、翻译、语义断句 |
+| `voicescreen-tts-service` | `18766` | Qwen3-TTS-12Hz-0.6B-Base | 私人英文音色 |
+
+两者使用 NVIDIA GPU、主机网络和本地只读模型卷。健康检查无需令牌；业务 POST 接口必须提供 `X-VoiceScreen-Token`。
+
+### 7.2 CosyVoice 实验服务
+
+`voicescreen-cosyvoice-service` 位于 `experiments` profile，端口 `18767`。它实现完整 WAV 和真实流式 PCM 两个接口，只用于可复现 A/B。
+
+实测中 CosyVoice 的首音频比 Qwen 整句方案快，但没有胜过客户端完成自然分块后的 Qwen 路线；总实时率也略低，因此当前不进入生产启动集合。
+
+## 8. 异常处理与背压
+
+- 音频捕获线程只写入缓冲，不直接等待 HTTP。
+- ASR 临时任务积压时丢弃过期快照，只保留最新预览。
+- 翻译队列对最终结果和临时结果分别处理，最终结果优先。
+- 单次中文识别与翻译最长 35 秒；TTS 与完整播放最长 60 秒。
+- 已播放的 TTS 块无法撤回；后续块失败时先排空已入队音频，再恢复中文原声。
+- Spark 私人音色失败可回退 Windows Speech；Silero 失败可回退 RMS；发送设备失败可回退仅字幕。
+- 模型服务、子进程和监听对象在停止时显式释放；本机 Python 服务加入 Windows Job Object，主程序异常退出时由系统回收。
+
+## 9. 项目结构
+
+```text
+VoiceScreen/
+├─ src/
+│  ├─ VoiceScreen.App/                 WPF、音频、模型客户端、Silero ONNX
+│  └─ VoiceScreen.Core/                可测试的纯逻辑
+├─ deploy/spark/                       Spark Docker 服务
+├─ tests/
+│  ├─ VoiceScreen.Tests/               xUnit
+│  └─ python/                          Python 服务契约
+├─ tools/
+│  ├─ VoiceScreen.SelfTest/            真实设备和模型自检
+│  ├─ benchmark_asr.py                 ASR 噪声基准
+│  ├─ benchmark_silero_vad.py          VAD 信号基准
+│  ├─ benchmark_spark_pipeline.py      Qwen/CosyVoice 延迟基准
+│  └─ setup_local_models.ps1           Windows 本机回退模型准备
+├─ DEPLOYMENT.md
+├─ TEST_REPORT.md
+├─ THIRD_PARTY_MODELS.md
+└─ THIRD_PARTY_NOTICES.md
+```
+
+`VoiceScreen.Core` 主要包含：
 
 | 类型 | 职责 |
 |---|---|
-| `DuplexStateMachine` | 收发双向状态流转 |
-| `EchoSuppressor` | 防止程序听见自己刚发出的英文 |
-| `TranslationDirection` / `TranslationDirections` | 用户方向与 OPUS-MT 模型对的唯一定义，泰语桥接路径 |
-| `SpokenLanguage` | 中/英/泰语种判定，文本字符优先于 ASR 标签 |
-| `TranscriptSanitizer` | 病态重复与译文异常膨胀的检测阈值 |
-| `IncrementalTranscript` | 低延迟字幕的稳定前缀提取与词边界回退 |
-| `PcmLevel` | 语音活动检测用的 RMS 电平 |
+| `IncrementalTranscript` | 稳定前缀提取和词边界回退 |
+| `TranscriptWindow` | 滚动窗口时间戳裁剪 |
+| `TranscriptSanitizer` | 周期重复、异常膨胀和幻觉过滤 |
+| `SubtitleBoundaryPolicy` | 本地边界信号组合 |
+| `ClauseSegmenter` | 中文抢跑后的内容对齐与剩余部分计算 |
+| `SpeechChunker` | 英文 TTS 自然分块与悬空词规避 |
+| `SpokenLanguage` | 基于字符分布的中英泰语种判断 |
+| `TranslationDirection` | 用户翻译方向与实际模型对映射 |
+| `AudioDeviceClassifier` | 实体设备和虚拟音频线分类 |
 
-**方向与语种各只有一处定义。** 之前 C# 侧、Python 的 `translate_text`、Python 的
-`evaluate_translation` 各维护一份方向列表且已经不一致（`th-en` / `th-zh` 混用），
-中/泰 Unicode 区间判定则被复制了四份。加一门语言原本要改四处，现在改一处。
+## 10. 数据与安全边界
+
+- 默认不把录音或字幕写入磁盘；日志只记录状态、长度、延迟和错误，不应记录访问令牌。
+- Windows 设置保存在 `%LOCALAPPDATA%\VoiceScreen\settings.dat`，访问令牌通过当前用户的 Windows 数据保护加密。
+- Spark 模式会将 PCM 和文本发送到用户配置的局域网地址。
+- MyMemory 与 Edge TTS 是显式选择的在线备用；启用后文本会离开本地网络。
+- 私人参考音频与 `my-voice.pt` 声纹缓存仅保存在 Spark 主机，不应进入源码仓库或发布包。
+- 业务端口不提供 TLS；安全依赖可信局域网、主机防火墙和随机令牌。跨网段或公网使用时必须另加 VPN 或 TLS 反向代理。
+
+## 11. 已知限制
+
+- Process Loopback 无法从 Discord 混合音轨恢复真实说话人用户名。
+- 重叠说话和强背景音乐仍会降低识别准确率。
+- 语义边界模型能减少机械截断，但不能保证每个口语停顿都符合书面断句。
+- 长中文首音频仍受翻译长度和首个 TTS 分块长度影响，当前不是亚秒级端到端同传。
+- Qwen TTS 服务按请求串行生成，多个客户端同时使用会排队。
+- Windows 安全中心可能对未签名发布包给出警告；正式对外分发需要代码签名。
+
+部署、验证和故障排查见 [DEPLOYMENT.md](DEPLOYMENT.md)，当前实测数据见 [TEST_REPORT.md](TEST_REPORT.md)。

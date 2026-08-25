@@ -1,103 +1,232 @@
 # VoiceScreen 测试报告
 
-> 2026-08-04 当前版已移除局域网服务器依赖。ASR 固定使用本机 Whisper；本地 OPUS-MT 与 Windows Speech 始终可作为备用，文本翻译和英文 TTS 可在运行中分别切到 MyMemory 与 Edge TTS。在线完整短句实测约 6.8 秒，免费公共接口没有 SLA，延迟会随线路波动。
+当前基线日期：**2026-08-25**。本报告对应 `main` 分支提交 `aec620e` 及其之前的完整功能链。
 
-测试环境：Windows 11 x64，Release / win-x64。最近验证日期：2026-08-05。
+## 1. 测试环境
 
-一条命令复现全部自动化验证：
+### Windows 客户端
+
+- Windows 11 x64；
+- .NET SDK 8.0.424；
+- Release / win-x64 自包含发布；
+- Windows Process Loopback；
+- VB-Audio Virtual Cable；
+- Silero VAD v6.2 ONNX / ONNX Runtime 1.29.0。
+
+### 模型服务器
+
+- NVIDIA DGX Spark，ARM64，128 GB 统一内存；
+- `Qwen3-ASR-1.7B`；
+- `Qwen3-4B-Instruct-2507`；
+- `Qwen3-TTS-12Hz-0.6B-Base`；
+- 生产端口 `18765`、`18766`；
+- CosyVoice 实验端口 `18767`，测试后已停止。
+
+## 2. 自动化验证
+
+统一入口：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
 ```
 
-## 自动验证结果
+当前结果：
 
 | 项目 | 结果 |
 |---|---|
-| 源码 UTF-8 / PowerShell BOM 检查 | 通过 |
-| Release 全解决方案编译 | 通过，0 警告、0 错误 |
-| xUnit 单元测试 | 68/68 通过 |
-| Python 服务与 provider 合约测试 | 30/30 通过 |
-| 翻译方向契约（C# ↔ Python） | 通过，用户方向与模型对分离，泰语桥接路径锁定 |
-| 语种判定一致性 | 通过，文本字符优先于 ASR 标签，中/英/泰三语覆盖 |
-| 泰语术语表标记回归 | 通过，`glossaryAvailable` 改为基于桥接英文判定，不再恒为 False |
-| 病态重复检测阈值 | 通过，单字符/周期短语/重复词被拦，正常口语强调放行 |
-| 增量字幕稳定前缀 | 通过，英文回退到词边界，无边界时整体放弃 |
-| RMS 电平与 VAD 门限 | 通过，静音、负幅度、缓冲切片均正确 |
-| 三节点组合配置 | ASR 本地；翻译本地/API、TTS 本地/API 可独立组合并热切换 |
-| MyMemory + Edge TTS 在线短句 | 通过，当前网络完整链路约 6.3 秒 |
-| WPF 主程序启动与释放 | 通过 |
-| Discord 根进程及 Electron 进程树捕获 | 通过 |
-| HyperX 麦克风与耳机枚举 | 通过 |
-| VB-CABLE 播放端枚举和写入 | 通过 |
-| 本地英文识别与英译中直连 | 通过 |
-| 本地泰语经 th-en → en-zh 桥接翻译 | 通过 |
-| Whisper 误标语言时按泰文字母兜底路由 | 通过，`ja` 标签的泰文仍译为中文 |
-| 本地模型服务并发请求稳定性 | 通过，12 路请求全部返回、无断连 |
-| ASR/翻译重复幻觉过滤 | 通过，`GG` 及异常膨胀译文被丢弃，正常口语重复保留 |
-| 中文周期短语幻觉过滤 | 通过，`我去哪了` 连续循环 20 次会被丢弃，正常中文仍直接显示 |
-| 低延迟增量字幕回放 | 通过，40ms 实时喂流下临时中英文约 1.7 秒出现，最终由 small 定稿 |
-| 一期稳定模式回退 | 通过，关闭低延迟后仍按完整语音段处理 |
-| 本地 VAD 分句后英译中 | 通过 |
-| 20 秒容量的 Discord 英文长句及句尾完整性 | 通过 |
-| 悬浮窗真实鼠标拖动和右下角缩放 | 通过，680×300 → 760×348 |
-| 悬浮窗解锁/锁定时 Windows 鼠标穿透切换 | 通过 |
-| `PgUp/PgDn` 历史翻页 | 通过，最新 7 条 → 历史 2/7 → 最新 7 条 |
-| 字幕字号 14–42 即时调整与加密配置保存 | 通过 |
-| 我方发送分阶段超时 | 识别+翻译 35 秒；TTS+完整播放 60 秒 |
-| 全局热键三通道 | Raw Input 后台接收 + 低级键盘钩子 + 12ms 异步键状态轮询，事件去重 |
-| 中文识别、中译英和离线英文 TTS | 通过 |
-| 中文测试文本中译英 | 通过 |
-| 英文同时发送至 VB-CABLE 并在实体耳机试听 | 通过 |
-| 发送结束后恢复原声麦克风 | 通过 |
-| 关闭窗口时等待引擎收尾完成 | 通过，本地 Python 服务被结束，不再残留 |
-| 本地服务进程挂入 Job Object | 通过，主程序被强杀时子进程由内核连带回收 |
+| Release 解决方案构建 | 通过，0 警告、0 错误 |
+| xUnit | `134/134` 通过 |
+| Python unittest | `52/52` 通过 |
+| 总自动测试 | `186/186` 通过 |
+| Python 基准脚本语法 | `py_compile` 通过 |
+| Git 补丁空白检查 | `git diff --check` 通过 |
 
-本地接收测试结果：
+主要覆盖范围：
 
-```text
-Enemies are on the second floor. Let's move to the left.
-→ 敌人在二楼。让我们向左移动。
+- 中英泰语种判断和翻译方向契约；
+- Whisper/Sherpa/Qwen ASR 选项和流式会话契约；
+- Qwen 语义断句接口只接受 `BREAK` / `CONTINUE`；
+- 稳定前缀、词边界回退、滚动窗口和最终定稿；
+- 周期短语、重复字符和异常膨胀译文过滤；
+- 中文短句抢跑后的已发送前缀对齐；
+- 英文 TTS 自然分块、最大长度和悬空连接词规避；
+- PCM 电平、音频设备分类和回退逻辑；
+- 翻译与 TTS Provider 独立组合；
+- 本机 Python 服务健康、评测台、安全响应头和路径白名单；
+- 本地子进程生命周期与接口兼容性。
+
+## 3. Spark 生产服务验证
+
+健康检查实测：
+
+```json
+{
+  "asr": "qwen3-asr-1.7b",
+  "asrDevice": "spark-gpu",
+  "asrStreaming": true,
+  "asrStreamingChunkMs": 1000,
+  "ready": true,
+  "segmentation": "qwen3-4b-instruct-2507",
+  "translation": "qwen3-4b-instruct-2507"
+}
 ```
 
-VAD 分句测试结果：
-
-```text
-Enemies are on the second floor.
-→ 敌人在二楼。
+```json
+{
+  "device": "spark-gpu",
+  "ready": true,
+  "sampleRate": 24000,
+  "tts": "qwen3-tts-12hz-0.6b-base",
+  "voiceId": "my-voice"
+}
 ```
 
-长句测试会检查句尾 `don't attack until I get there` 确实进入识别结果。Discord 切句目前等待约 2 秒连续静音，单段最多 20 秒；Whisper 不再对已经切好的音频进行第二次 VAD 裁剪。入站本地推理允许最多 90 秒，瞬时 HTTP 断线自动重试一次。暂时失败只更新顶部状态，不写入永久字幕历史。
+Docker 状态：
 
-## 网络边界
+- `voicescreen-model-service`：healthy；
+- `voicescreen-tts-service`：healthy；
+- `voicescreen-cosyvoice-service`：完成 A/B 后停止，不占用生产 GPU 资源。
 
-本地模型进程仅监听：
+## 4. Windows 真实启动冒烟测试
 
-- `http://127.0.0.1:18765`：应用自动启动的本地 faster-whisper + OPUS-MT 服务。
+发布目录：`dist/VoiceScreen-release-final`。
 
-不再连接 `192.168.0.119` 或任何局域网服务，也没有讯飞 APPID、APIKey、Secret。选择纯本地组合时，运行中不依赖外部 API；选择在线翻译或 TTS 时，识别文字会分别发送到 MyMemory 或 Microsoft Edge TTS，语音识别始终在本机完成。
+已验证：
 
-专业翻译模型回归结果：
+- `VoiceScreen.App.exe` 成功启动且窗口响应；
+- 用户选择 Discord 进程并点击“开始监听”；
+- 顶部状态进入“运行中”；
+- Spark 模型服务连接成功；
+- 音频路由以 WASAPI shared mode 建立；
+- Process Loopback 成功绑定选定 Discord 根进程；
+- 日志明确记录 `Silero VAD enabled for selected-process audio (16kHz ONNX)`；
+- Discord 当时没有播放声音，状态栏正确显示“5 秒内未检测到声音”，而不是把静音误判为启动失败；
+- 应用持续响应，无启动异常或服务重连循环。
 
-```text
-我的英语很差啊，请不要介意啊。
-→ My English is bad. Please don't mind.
+这次冒烟测试证明启动、连接、路由和 VAD 装载链路可用；它不等同于一次真实远端 Discord 用户的主观通话验收。
 
-敌人可能在三楼右边，先别冲。
-→ The enemy could be on the third floor on the right. Don't attack for now.
+## 5. Silero VAD 对比
+
+基准脚本：
+
+```powershell
+python .\tools\benchmark_silero_vad.py
 ```
 
-检测到 Discord 中文时直接显示识别原文，OPUS-MT 调用被跳过。
+输入包括用户的 Spark 私人音色参考语音，以及相近响度的纯音、白噪声和静音。结果：
 
-## 仍需用户在真实通话中确认
+| 信号 | Silero 判定为语音 | 旧 RMS 判定为语音 | Silero 概率中位数 |
+|---|---:|---:|---:|
+| 参考语音 | 86.7% | 74.9% | 0.999 |
+| 纯音 | 0% | 100% | 接近 0 |
+| 白噪声 | 0% | 100% | 接近 0 |
+| 静音 | 0% | 0% | 接近 0 |
 
-自动测试无法代替真实 Discord 语音频道中的主观听感。请重点确认：
+CPU ONNX 推理耗时：
 
-1. 对方连续说英语时，悬浮窗的英文原文和中文译文是否完整、延迟是否可接受。
-2. 按住右 Alt 说中文、松开后，对方能否听见完整英文，特别是句尾单词。
-3. 普通说话时，对方能否听见中文原声，且没有回声。
-4. “翻译并试听（仅耳机）”是否只在耳机播放，不会进入 Discord。
-5. Discord 的自动增益、回声消除和噪声抑制是否裁掉合成语音开头。
-6. 游戏全屏时悬浮窗的位置、字号和换行是否合适。
+- 中位数约 `0.076 ms / 512 samples`；
+- P95 约 `0.079 ms / 512 samples`。
 
-若出现回声，首先确认 Discord 扬声器是实体耳机而不是 `CABLE Input`；Discord 麦克风必须是 `CABLE Output`。
+结论：Silero 能显著减少音乐和稳定噪声导致的假语音段，计算成本相对 32 ms 音频窗口可以忽略。RMS 保留为模型缺失或运行异常时的兼容回退，而不是主判据。
+
+## 6. Qwen 与 CosyVoice TTS A/B
+
+基准脚本：
+
+```bash
+VOICESCREEN_API_TOKEN='***' \
+python tools/benchmark_spark_pipeline.py --host http://127.0.0.1
+```
+
+测试使用三段固定中文，先由同一 Qwen3-4B 翻译为英文，再比较 Qwen 私人音色、CosyVoice 完整生成和 CosyVoice 真流式输出。
+
+### 6.1 未分块的原始模型结果
+
+| 中文 | 翻译 | Qwen 整句生成 | Qwen 音频时长 | Qwen RTF | Cosy 流式首音频 | Cosy 总生成 | Cosy RTF |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 31 字 | 1.72 s | 5.77 s | 8.40 s | 0.686 | 4.74 s | 6.01 s | 0.699 |
+| 67 字 | 2.23 s | 9.62 s | 14.96 s | 0.643 | 4.74 s | 12.47 s | 0.690 |
+| 124 字 | 4.28 s | 18.57 s | 28.88 s | 0.643 | 4.72 s | 22.68 s | 0.688 |
+
+如果客户端等待 Qwen 整句 WAV，124 字中文从开始翻译到音频可用约需 `22.85 s`，不可接受。CosyVoice 真流式将该场景的首音频降到约 `8.99 s`，但总生成速度没有胜过 Qwen。
+
+### 6.2 客户端自然分块后的生产结果
+
+当前 `SpeechChunker` 把英文按约 60、最多 80 字符切块，第一块生成后立即送入播放队列：
+
+| 中文 | 翻译后英文 | 分块数 | 第一块长度 | 翻译开始到第一块可播放 |
+|---:|---:|---:|---:|---:|
+| 31 字 | 97 字符 | 2 | 76 字符 | 约 5.62 s |
+| 67 字 | 219 字符 | 4 | 41 字符 | 约 4.33 s |
+| 124 字 | 446 字符 | 8 | 79 字符 | 约 8.03 s |
+
+与同一组三种长度的 CosyVoice 端到端首音频约 `6.47 s / 6.98 s / 8.99 s` 相比，Qwen 自然分块在当前 Spark 上三组都更快，而且依赖更少、总 RTF 更好。
+
+结论：
+
+- 生产继续使用 Qwen3-TTS + 客户端自然分块；
+- CosyVoice 保留为可复现实验，不默认启动；
+- 分块必须避免停在 `and`、`because`、`whether`、`don't` 等连接词，相关回归测试已经加入 xUnit。
+
+## 7. 延迟如何解读
+
+“实时翻译延迟”不是单一数字，应分开记录：
+
+1. 捕获到 VAD 确认语音；
+2. ASR 临时文本出现；
+3. ASR 最终文本确认；
+4. 翻译完成；
+5. 第一段 TTS 入队；
+6. 最后一段 TTS 播放完成。
+
+本报告表格中的“第一块可播放”是第 4 与第 5 阶段的组合，不包含用户说完整段话所花时间，也不包含整段英文最终播放完毕的时长。不同说话停顿、翻译后长度和局域网负载会改变结果。
+
+## 8. 发布包检查
+
+自包含 win-x64 发布已确认包含：
+
+- VoiceScreen 客户端及 .NET 运行时；
+- `VoiceScreen.Core.dll`；
+- ONNX Runtime 原生库；
+- `Models/silero_vad_16k_op15.onnx`；
+- `THIRD_PARTY_NOTICES.md`；
+- 本机回退 Python 服务文件和浏览器评测台资源。
+
+旧发布目录未被覆盖，新的真实运行验证使用独立发布目录完成。
+
+## 9. 尚需持续做的人工验收
+
+自动测试和模型基准不能代替真实通话。每次发布仍应确认：
+
+1. Discord、Chrome 和播放器分别作为目标时，能否捕获正确进程而不混入其他系统声音。
+2. 对方连续英语、多人轮流说话和背景音乐场景下，字幕边界是否自然且无重复。
+3. 用户手动浏览历史时，新字幕是否继续写入但不抢走滚动位置。
+4. 按住右 Alt 说长中文时，对方是否能听见完整英文开头、分块连接和最后一个单词。
+5. Discord Krisp、自动增益和输入灵敏度是否裁掉 TTS 开头。
+6. Spark 重启、TTS 临时失败和 VB-CABLE 缺失时，回退提示是否清楚。
+7. 私人音色是否经本人授权；更换录音后 prompt 是否正确重建。
+
+## 10. 复现命令
+
+```powershell
+# C# + Python
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
+
+# 仅 C#
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1 -DotnetOnly
+
+# 仅 Python
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1 -PythonOnly
+
+# 源码编码
+powershell -ExecutionPolicy Bypass -File .\tools\check_encoding.ps1
+```
+
+```bash
+# Spark 健康
+curl -fsS http://127.0.0.1:18765/health
+curl -fsS http://127.0.0.1:18766/health
+
+# 容器状态
+docker ps --filter name=voicescreen
+```

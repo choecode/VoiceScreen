@@ -1,586 +1,511 @@
-# VoiceScreen 完整部署教程（Windows 11）
+# VoiceScreen 部署与运维指南
 
-> 客户端不依赖局域网服务器。ASR 固定在本机运行；翻译与英文 TTS 可分别选择本地或免费 API，并能在运行中切换。
+本文以当前推荐架构为主：
 
-本文从一台尚未安装任何依赖的 Windows 11 x64 电脑开始，完成 VoiceScreen 的安装、模型准备、Discord 音频配置、首次验证、离线使用和故障排查。
+- Windows 11 x64 运行 VoiceScreen 客户端；
+- 28 号 NVIDIA DGX Spark 运行 Qwen ASR、翻译和私人音色 TTS；
+- Windows Process Loopback 只捕获选定应用；
+- VB-CABLE 只在需要向 Discord 发送英文语音时使用。
 
-## 1. 部署结果与工作方式
+当前验证日期：**2026-08-25**。
 
-部署完成后：
+## 1. 先选择部署模式
 
-- Discord 对方说英语或泰语时，VoiceScreen 只捕获 Discord 进程声音，在悬浮窗显示原文与中文译文。
-- 你平时说话时，实体麦克风的中文原声会通过 VoiceScreen 转发给 Discord。
-- 按住右 Alt 说中文、松开后，VoiceScreen 在本地生成英文字幕和英文语音，并通过虚拟麦克风发给 Discord。
-- 实际发送的英文可以同步在实体耳机试听；中文测试框也能只在耳机试听翻译效果，不会把测试音发给 Discord。
-- Whisper base（实时预览）、Whisper small（最终定稿）、三个 OPUS-MT 专用翻译模型和英文语音合成都在本机运行。泰语通过 th-en → en-zh 桥接翻译；模型首次下载需要联网，之后可以断网使用。
+| 模式 | Windows 需要 | 模型位置 | 适用情况 |
+|---|---|---|---|
+| Spark 推荐模式 | VoiceScreen；发送语音时另装 VB-CABLE | DGX Spark | 当前质量和可用性最佳 |
+| 仅字幕模式 | VoiceScreen | Spark 或本机 | 不需要麦克风、Windows 英文音色和 VB-CABLE |
+| Windows 本机回退 | VoiceScreen、Python 3.11、本机模型 | Windows | Spark 不可用时离线应急 |
+| 在线备用 | VoiceScreen、互联网 | MyMemory / Edge TTS | 只用于临时对照，不是生产 SLA |
 
-音频路由关系如下：
+只需要看 YouTube、浏览器、Discord 或播放器字幕时，建议先关闭“同时把麦克风中文翻译成英文并发送到语音应用”。这样 VB-CABLE 缺失也不会影响启动。
+
+## 2. 网络与安全前提
+
+Windows 客户端必须能够访问 Spark：
+
+```powershell
+Test-NetConnection spark-host.local -Port 18765
+Test-NetConnection spark-host.local -Port 18766
+```
+
+两个命令的 `TcpTestSucceeded` 都应为 `True`。
+
+端口用途：
+
+| 端口 | 用途 | 是否生产默认 |
+|---:|---|---|
+| `18765/tcp` | Qwen3-ASR、Qwen3-4B 翻译和语义断句 | 是 |
+| `18766/tcp` | Qwen3-TTS 私人音色 | 是 |
+| `18767/tcp` | CosyVoice A/B 实验 | 否 |
+
+服务接口没有内建 TLS。只允许可信局域网访问，并配置随机令牌；不要在路由器上做公网端口转发。跨网络使用时应先建立 VPN，或在前面部署带 TLS 和访问控制的反向代理。
+
+## 3. Spark 主机要求
+
+当前实机：
+
+- NVIDIA DGX Spark，`aarch64`；
+- 128 GB 统一内存；
+- 支持 GPU 的 Docker 与 Docker Compose v2；
+- 模型根目录 `/opt/voicescreen/models/voicescreen`；
+- 生产容器使用 NGC ARM64 CUDA/PyTorch 基础镜像。
+
+模型目录及当前磁盘占用约为：
 
 ```text
-对方 → Discord 扬声器流 → VoiceScreen → 英文识别/英译中 → 悬浮字幕
-
-你的 HyperX 麦克风 → VoiceScreen → CABLE Input → CABLE Output → Discord 麦克风
-                                  ↑
-                         英文合成语音也从这里发送
-
-Discord 扬声器 → HyperX 实体耳机
+/opt/voicescreen/models/voicescreen/Qwen3-ASR-1.7B             4.4 GB
+/opt/voicescreen/models/voicescreen/Qwen3-4B-Instruct-2507    7.6 GB
+/opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base  2.4 GB
+/opt/voicescreen/models/voicescreen/voice-profiles             私人录音与 prompt
 ```
 
-## 2. 部署前检查
+至少预留 25 GB 磁盘，给模型、Docker 构建层和升级期间的旧镜像留出余量。
 
-### 2.1 系统要求
+## 4. 在 Spark 准备模型
 
-- Windows 11 x64；Windows 10 22H2 或更新版本理论上也可运行，但当前项目主要在 Windows 11 验证。
-- Discord 桌面客户端。浏览器版 Discord 不在支持范围内。
-- x64 CPU，建议至少 16 GB 内存。
-- 建议预留 8 GB 以上磁盘空间，用于 Whisper、OPUS-MT、一次性模型转换依赖和缓存。
-- 一副耳机和实体麦克风。使用扬声器外放会产生真实的声学回声。
-- 安装依赖和模型时需要联网；正式翻译时不需要公网。
+中国大陆网络优先使用 ModelScope。开始大文件下载前，先确认到镜像的连通性，并避免流量意外走海外代理：
 
-### 2.2 PowerShell
-
-后续命令请在普通 PowerShell 中运行。只有安装 VB-CABLE 驱动时需要管理员权限。
-
-先检查 Windows Package Manager：
-
-```powershell
-winget --version
+```bash
+curl -I --max-time 10 https://modelscope.cn
+env | grep -i proxy
 ```
 
-如果没有 `winget`，可从 Microsoft Store 安装或更新“应用安装程序”，也可以使用后文给出的官方下载页面手动安装各项依赖。
+如环境中存在并非你有意设置的 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`，先在当前下载终端取消。已经开始的可续传下载不要仅为了切换镜像而重来。
 
-## 3. 安装运行依赖
+安装 ModelScope 下载工具：
 
-### 3.1 安装 .NET 8 Desktop Runtime
-
-运行发布版只需要 Desktop Runtime：
-
-```powershell
-winget install --id Microsoft.DotNet.DesktopRuntime.8 -e --accept-package-agreements --accept-source-agreements
+```bash
+python3 -m venv /opt/voicescreen/venvs/voicescreen-download
+source /opt/voicescreen/venvs/voicescreen-download/bin/activate
+python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -U modelscope
 ```
 
-验证：
+下载三个生产模型：
 
-```powershell
-dotnet --list-runtimes
+```bash
+mkdir -p /opt/voicescreen/models/voicescreen
+
+modelscope download --model Qwen/Qwen3-ASR-1.7B \
+  --local_dir /opt/voicescreen/models/voicescreen/Qwen3-ASR-1.7B
+
+modelscope download --model Qwen/Qwen3-4B-Instruct-2507 \
+  --local_dir /opt/voicescreen/models/voicescreen/Qwen3-4B-Instruct-2507
+
+modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --local_dir /opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base
 ```
 
-输出中应包含类似：
+下载后检查目录，不要只相信命令退出码：
+
+```bash
+du -sh /opt/voicescreen/models/voicescreen/Qwen3-*
+find /opt/voicescreen/models/voicescreen/Qwen3-ASR-1.7B -name '*.safetensors' -type f
+find /opt/voicescreen/models/voicescreen/Qwen3-4B-Instruct-2507 -name '*.safetensors' -type f
+find /opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base -name '*.safetensors' -type f
+```
+
+只有 ModelScope 缺少对应文件、镜像版本不完整或校验失败时，才改用 Hugging Face 上游，并记录原因。
+
+## 5. 准备私人音色
+
+### 5.1 参考录音要求
+
+- 一个人说话；
+- 5–20 秒为宜；
+- 无背景音乐、混响和明显底噪；
+- 正常音量、自然语速；
+- 参考文本必须与录音逐字一致；
+- 当前服务合成英文，所以推荐使用清晰英文参考录音。
+
+把 M4A 转成 24 kHz 单声道 WAV：
+
+```bash
+mkdir -p /opt/voicescreen/models/voicescreen/voice-profiles
+ffmpeg -i Recording.m4a -ar 24000 -ac 1 -c:a pcm_s16le \
+  /opt/voicescreen/models/voicescreen/voice-profiles/my-voice-reference.wav
+```
+
+当前 Compose 中的参考文本是：
 
 ```text
-Microsoft.WindowsDesktop.App 8.0.x
+Hello. This is my natural speaking voice. Today, I'm testing a real-time translation system.
 ```
 
-如果要从源码编译，请改装 .NET 8 SDK；SDK 已包含运行时：
+如果录音内容不同，必须同步修改 `VOICESCREEN_VOICE_REFERENCE_TEXT`。不要用近似文本，否则音色、韵律和清晰度都会下降。
 
-```powershell
-winget install --id Microsoft.DotNet.SDK.8 -e --accept-package-agreements --accept-source-agreements
-dotnet --list-sdks
-```
-
-### 3.2 安装 Python 3.11 x64
-
-```powershell
-winget install --id Python.Python.3.11 -e --accept-package-agreements --accept-source-agreements
-```
-
-关闭当前 PowerShell，重新打开一个窗口，再验证：
-
-```powershell
-python --version
-where.exe python
-```
-
-必须能看到 Python 3.11，并且 `python` 指向真实安装目录。VoiceScreen 启动本地识别服务时调用的是 `python`，不是 `py`。
-
-如果 `python` 打开 Microsoft Store，进入“设置 → 应用 → 高级应用设置 → 应用执行别名”，关闭冲突的 `python.exe` / `python3.exe` 商店别名，然后重新打开 PowerShell。
-
-### 3.3 一键安装本地模型
-
-在 VoiceScreen 源码根目录运行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1
-```
-
-如果使用发布目录，则脚本就在 EXE 旁边：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
-```
-
-脚本会自动完成：
-
-1. 安装 faster-whisper、CTranslate2、Transformers、SentencePiece 和安全版本的 CPU PyTorch。
-2. 下载 Whisper base 与 small；base 用于低延迟临时字幕，small 用于最终定稿。
-3. 从 Helsinki-NLP 官方仓库下载 `opus-mt-zh-en` 与 `opus-mt-en-zh`。
-4. 把中译英、英译中、泰译英三个翻译模型转换为 CTranslate2 CPU INT8。
-
-模型目录：
+服务首次启动时会生成：
 
 ```text
-%LOCALAPPDATA%\VoiceScreen\Models\
+/opt/voicescreen/models/voicescreen/voice-profiles/my-voice.pt
 ```
 
-脚本最后出现 `All VoiceScreen local models are ready.` 才算完成。运行时只使用 CTranslate2 INT8，不使用 PyTorch 推理，也不会占用游戏显卡。
+更换录音或参考文本后，需要先停止 TTS 服务，删除旧的 `my-voice.pt`，再启动服务重新生成。这个文件和参考录音都属于私人数据，不应提交到 Git 或放入 Windows 发布包。
 
-OPUS-MT 是专用机器翻译模型，不是聊天模型。中译英模型采用 CC-BY-4.0，英译中和泰译英模型采用 Apache-2.0；分发程序时应保留模型来源与许可说明。
+## 6. 部署 Spark 服务
 
-上面这条命令**不包含** Sherpa-ONNX Zipformer。默认 ASR 是 Whisper，装到这里就够用了。
+在 Spark 上取得当前仓库代码：
 
-### 3.3.1 可选：安装 Sherpa-ONNX Zipformer
+```bash
+cd /opt/voicescreen
+git clone https://github.com/choecode/VoiceScreen.git
+cd /opt/voicescreen/VoiceScreen/deploy/spark
+```
 
-只有在你想把主界面的「语音识别」切到 `本地 Sherpa-ONNX Zipformer` 时才需要这一步。
-加 `-Sherpa` 重跑同一个脚本即可，已经装好的部分会自动跳过：
+已有仓库时：
+
+```bash
+cd /opt/voicescreen/VoiceScreen
+git pull --ff-only
+cd deploy/spark
+```
+
+创建只允许当前用户读取的令牌文件：
+
+```bash
+umask 077
+TOKEN="$(openssl rand -hex 32)"
+printf 'VOICESCREEN_API_TOKEN=%s\n' "$TOKEN" > .env
+printf '把下面令牌填入 Windows VoiceScreen 高级设置：\n%s\n' "$TOKEN"
+unset TOKEN
+```
+
+构建使用清华 PyPI 镜像；Compose 已把该地址作为默认构建参数。只构建生产服务：
+
+```bash
+docker compose build model-service tts-service
+docker compose up -d model-service tts-service
+```
+
+不要为普通生产启动添加 `--profile experiments`。
+
+查看状态：
+
+```bash
+docker compose ps
+docker compose logs --tail=100 model-service
+docker compose logs --tail=100 tts-service
+curl -fsS http://127.0.0.1:18765/health
+curl -fsS http://127.0.0.1:18766/health
+```
+
+健康响应应包含 `"ready": true`，ASR 设备和 TTS 设备应为 `spark-gpu`。首次加载可能需要数分钟，Compose 健康检查已经为模型加载预留启动时间。
+
+当前运行部署的 Compose 配置位于：
+
+```text
+/opt/voicescreen/voicescreen-services/model-service/compose.yaml
+```
+
+如果改用仓库目录部署，应只保留一套同名容器，避免两个 Compose 项目争用 `18765/18766`。
+
+## 7. 可选：CosyVoice 实验服务
+
+CosyVoice 不是生产依赖。只有做 A/B 时才执行：
+
+```bash
+docker compose --profile experiments build cosyvoice-service
+docker compose --profile experiments up -d cosyvoice-service
+curl -fsS http://127.0.0.1:18767/health
+```
+
+它要求：
+
+- `/opt/voicescreen/voicescreen-experiments/CosyVoice` 中存在固定版本的官方源码；
+- `/opt/voicescreen/models/voicescreen/Fun-CosyVoice3-0.5B-2512` 中存在模型；
+- 额外约 9 GB 模型磁盘与运行显存。
+
+测试完成后停止，释放 GPU 资源：
+
+```bash
+docker compose --profile experiments stop cosyvoice-service
+```
+
+## 8. 构建 Windows 客户端
+
+推荐生成自包含 win-x64 目录，这样目标机不需要单独安装 .NET Runtime。源码构建机需要 .NET 8 SDK。
+
+中国大陆网络可使用华为云 NuGet 镜像：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1 -Sherpa
+Set-Location "$env:USERPROFILE\Desktop\VoiceScreen"
+
+dotnet restore src\VoiceScreen.App\VoiceScreen.App.csproj `
+  -r win-x64 `
+  --source https://mirrors.huaweicloud.com/repository/nuget/v3/index.json
+
+dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
+  -c Release -r win-x64 --self-contained true --no-restore `
+  -o dist\VoiceScreen-release
 ```
 
-它会额外完成：
+启动：
 
-1. 安装 `sherpa-onnx` Python 包。
-2. 从 HuggingFace 下载 `csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20`
-   的 INT8 模型文件（`tokens.txt` 与 encoder / decoder / joiner 三个 `.onnx`，合计约 190 MB）。
-3. 立刻加载一次模型做验证，确认这个引擎真的可用。
-
-看到下面这行才算成功：
-
-```text
-Sherpa-ONNX Zipformer loaded successfully
+```powershell
+.\dist\VoiceScreen-release\VoiceScreen.App.exe
 ```
 
-> **重要：Sherpa 这个模型只支持中文和英文，不支持泰语。**
-> 需要泰语字幕，请把 ASR 引擎保持在 Whisper。
-
-包和模型缺任何一样，Sherpa 都无法工作。**只装包不下模型是不够的** —— 应用会在点击
-「开始」时报 `Sherpa-ONNX Zipformer local model was not found`。从 2026-08-05 起，
-启动失败的弹窗会直接显示本地服务的真实报错（比如 `ModuleNotFoundError: No module
-named 'sherpa_onnx'`），不必再翻日志猜原因。
-
-### 3.4 安装 Windows 英文语音
-
-打开：
-
-```text
-设置 → 时间和语言 → 语音 → 管理语音 → 添加语音
-```
-
-安装“英语（美国）”或其他英文语音。若想切换男女声，请至少安装一个男声和一个女声；VoiceScreen 会把所有可用英文音色列在“英文音色”下拉框中。完成后重启 VoiceScreen。中文 Windows 如果没有英文语音，程序将拒绝启动正式链路，而不会误用中文音色。
-
-### 3.5 安装 VB-Audio Virtual Cable
-
-1. 从 VB-Audio 官方页面下载 VB-CABLE Driver ZIP。
-2. 解压 ZIP，右键 `VBCABLE_Setup_x64.exe`，选择“以管理员身份运行”。
-3. 点击 `Install Driver`。
-4. 安装完成后重启 Windows；不要只注销。
-5. 打开“设置 → 系统 → 声音 → 更多声音设置”，确认存在：
-   - 播放设备：`CABLE Input (VB-Audio Virtual Cable)`
-   - 录制设备：`CABLE Output (VB-Audio Virtual Cable)`
-
-打开 `CABLE Output` 的属性，确认“侦听”选项卡中的“侦听此设备”没有勾选。勾选它会让你听到自己的延迟回放，容易误以为程序产生回声。
-
-## 4. 获取 VoiceScreen
-
-### 4.1 直接使用已发布目录
-
-如果开发者已经把发布目录发给你，完整解压到固定目录，例如：
-
-```text
-C:\Apps\VoiceScreen\
-```
-
-目录内必须同时存在：
+发布目录必须整体保留。至少应包含：
 
 ```text
 VoiceScreen.App.exe
 VoiceScreen.App.dll
-VoiceScreen.Core.dll          <- 少了它程序会在启动时直接崩
+VoiceScreen.Core.dll
+Microsoft.ML.OnnxRuntime.dll
+Models\silero_vad_16k_op15.onnx
 LocalService\local_outgoing_service.py
-LocalService\online_providers.py
-LocalService\local_tts_provider.py
-LocalService\web\
-其他 .dll 和 .json 文件
+THIRD_PARTY_NOTICES.md
 ```
 
-**只复制 `VoiceScreen.App.exe` 是不行的。** 缺少同目录的 `VoiceScreen.Core.dll` 时，
-程序会弹出「启动失败 · Could not load file or assembly 'VoiceScreen.Core'」并无法继续。
-排查见 [9.13](#913-提示-could-not-load-file-or-assembly-voicescreencore)。
+不要只把 `VoiceScreen.App.exe` 拖到桌面。若需要桌面入口，应创建快捷方式。
 
-### 4.2 从源码编译
+## 9. Windows 音频准备
 
-先安装 Git 和 GitHub CLI，并登录有仓库权限的 GitHub 账号：
+### 9.1 仅字幕
 
-```powershell
-winget install --id Git.Git -e
-winget install --id GitHub.cli -e
-gh auth login
-```
+仅字幕不要求 VB-CABLE、实体麦克风或 Windows 英文音色。打开 VoiceScreen 后关闭发送复选框即可。
 
-克隆、编译、测试并发布：
+### 9.2 发送英文到 Discord
 
-```powershell
-Set-Location "$env:USERPROFILE\Desktop"
-gh repo clone choecode/VoiceScreen
-Set-Location VoiceScreen
-dotnet restore VoiceScreen.sln
-powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
-dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
-  -c Release -r win-x64 --self-contained false `
-  -o dist\VoiceScreen-latest
-```
+1. 从 [VB-Audio 官方网站](https://vb-audio.com/Cable/) 下载 VB-CABLE。
+2. 以管理员身份运行 `VBCABLE_Setup_x64.exe`。
+3. 安装后重启 Windows，不能只注销。
+4. 在 Windows“更多声音设置”中确认 `CABLE Input` 和 `CABLE Output` 已启用。
+5. 关闭 `CABLE Output` 属性中的“侦听此设备”。
 
-`run_tests.ps1` 会跑完 C# 与 Python 两套测试（分别 68 个和 30 个）。它在发布之前跑，
-是为了挡住一类真实发生过的事故：本地推理服务是 Python 脚本，编译期不会检查，
-文件坏掉时 `dotnet build` 照样成功，直到运行时才崩。
+设备方向很容易看反：
 
-发布结果位于：
-
-```text
-dist\VoiceScreen-latest\VoiceScreen.App.exe
-```
-
-发布后请从这个目录整体启动或整体打包，不要单独拷贝 exe。
-
-仓库是私有的；没有权限的账号无法克隆。
-
-## 5. Windows 与 Discord 配置
-
-### 5.1 Windows 麦克风权限
-
-进入：
-
-```text
-设置 → 隐私和安全性 → 麦克风
-```
-
-打开：
-
-- 麦克风访问权限。
-- 允许应用访问麦克风。
-- 允许桌面应用访问麦克风。
-
-### 5.2 Discord 配置
-
-先启动 Discord 桌面客户端，再进入“用户设置 → 语音和视频”：
-
-| Discord 项目 | 必须选择 |
+| 位置 | 正确设备 |
 |---|---|
-| 输入设备/麦克风 | `CABLE Output (VB-Audio Virtual Cable)` |
-| 输出设备/扬声器 | HyperX 实体耳机 |
-| 输入模式 | 语音活动，或根据个人习惯使用 Discord 按键说话 |
+| VoiceScreen 虚拟音频线 | `CABLE Input (VB-Audio Virtual Cable)` |
+| Discord 输入设备 | `CABLE Output (VB-Audio Virtual Cable)` |
+| Discord 输出设备 | 实体耳机 |
+| VoiceScreen 本地监听输出 | 同一实体耳机 |
 
-关键规则：
+Windows 本地音色只在不使用 Spark 私人音色时需要。在“设置 → 时间和语言 → 语音”中安装英文语音包，然后重启 VoiceScreen。
 
-- Discord 麦克风不能选 HyperX。否则对方只能听见未经 VoiceScreen 路由的原声，听不到合成英文。
-- Discord 扬声器不能选 `CABLE Input`。否则 Discord 对方的声音会被送回 Discord 输入，形成回声。
-- Windows 的“侦听此设备”必须关闭。
-- 建议首次测试时暂时关闭 Discord 的 Krisp 噪声抑制、自动增益和高级语音处理。如果英文 TTS 完整，再逐项开启并复测。
-- 用耳机测试，不要让扬声器声音重新进入实体麦克风。
+## 10. 首次配置 Windows 客户端
 
-点击 Discord 自带的麦克风测试，说话时应看到输入电平变化。
+1. 先启动要监听的应用。
+2. 打开 VoiceScreen，在“监听应用”中选中准确的应用和 PID。
+3. 只看字幕时关闭发送复选框；需要双向翻译时保持开启。
+4. 展开高级设置。
+5. 语音识别选择 `Spark Qwen3-ASR 1.7B（推荐）`。
+6. 翻译选择 `Spark Qwen3-4B（推荐）`。
+7. Spark 服务地址填写 `http://spark-host.local:18765/`。
+8. 填入 Spark `.env` 中同一个访问令牌；令牌会在当前 Windows 用户下加密保存。
+9. 需要发送时，选择实体麦克风、本地耳机和私人音色；确认虚拟音频线自动选中 `CABLE Input`。
+10. 点击“开始监听”，等待顶部状态变成“运行中”。
 
-## 6. VoiceScreen 首次启动
+TTS 地址不单独配置：客户端会从 Spark 地址取主机，并自动连接同一主机的 `18766`。
 
-1. 确认 Discord 桌面客户端已经启动并登录。
-2. 确认 `setup_local_models.ps1` 已成功完成。
-3. 双击 `VoiceScreen.App.exe`。
-4. 在“实体麦克风”中选择 HyperX 麦克风。
-5. 确认界面显示：
-   - Discord 声音捕获：自动，仅捕获 Discord 进程。
-   - 发送给 Discord：`CABLE Input`。
-6. 在“英文试听耳机”中选择 HyperX 实体耳机；按需要勾选“复读已发送英文”，并在“英文音色”中选择男声或女声。
-7. 首次建议将“文本翻译”和“英文 TTS”都选为本地，点击“启动”。
-8. 在中文测试框输入一句话，点击“翻译并试听（仅耳机）”。悬浮窗会显示测试中英文，你会在耳机听到英文，但该测试音不会进入 Discord。
-9. 需要在线效果时，可分别把翻译或 TTS 改为 API；运行中切换从下一句话开始生效，无须重启。
+如果目标应用以管理员身份运行而 VoiceScreen 无法捕获，可使用高级设置中的“以管理员身份重启”。两者权限级别尽量保持一致。
 
-第一次启动会加载 Whisper base/small 与三个 OPUS-MT 备用模型，可能需要数秒到几十秒。状态显示“运行中 · ASR=本地”后才算启动完成。若更看重稳定性，可取消“游戏低延迟字幕”后重启。
+## 11. 日常验收
 
-如果 Windows Defender SmartScreen 阻止启动，确认文件来自本项目仓库后，点击“更多信息 → 仍要运行”。不要从第三方网盘或下载站获取修改版程序。
+### 11.1 字幕链路
 
-## 7. 正式验收步骤
+1. 在目标应用中播放清晰英文。
+2. VoiceScreen 状态应显示持续收到目标进程音频，而不是“未检测到声音”。
+3. 悬浮窗先出现实时英文和中文，停顿后进入历史。
+4. 连续播放背景音乐时，不应持续生成无意义字幕。
+5. 使用鼠标滚轮或 `PgUp` 浏览旧字幕，确认新内容不会强行把视图拉到底部。
+6. 回到底部后，确认字幕重新自动跟随。
 
-建议找一名 Discord 好友配合，按顺序验证。
+### 11.2 发送链路
 
-### 7.1 原声直通
+1. Discord 麦克风测试中，普通说中文，对方应听见中文原声。
+2. 按住右 Alt 说完整中文，松开。
+3. 悬浮窗应显示“我说”和“已发送”。
+4. 对方应听见完整英文，特别检查开头和最后一个单词。
+5. 播放结束后再次普通说话，确认中文原声已恢复。
+6. 长中文应在第一段英文生成后开始播放，而不是等待整段音频完成。
 
-不按右 Alt，直接说中文。对方应该能听见中文原声，而且你自己不应听到延迟回放。
+## 12. Windows 本机回退部署
 
-### 7.2 中文转英文发送
-
-1. 按住键盘右侧的 Alt。
-2. 看到悬浮窗顶部状态提示“正在听你说中文……”后说一句完整中文；这只是临时状态，不会留在字幕历史中。
-3. 说完再松开右 Alt。
-4. 悬浮窗应依次显示：
-
-   ```text
-   我说：敌人在二楼
-   已发送：Enemies are on the second floor.
-   ```
-
-5. 对方应听到完整英文，尤其是最后一个单词。
-6. 英文播放结束后再次直接说中文，确认原声已自动恢复。
-
-### 7.3 对方英语转中文字幕
-
-让对方说英语。悬浮窗应显示类似：
-
-```text
-EN: Enemies are on the second floor.
-中: 敌人在二楼。
-```
-
-同时播放一个游戏中文视频或让游戏角色说中文，悬浮窗不应显示游戏内容，因为接收链路固定只捕获 Discord 进程树。
-
-如果 Discord 对方改说中文，Whisper 会自动检测语言，悬浮窗直接显示 `中：识别原文`，不会调用 OPUS-MT 再做一次中文到中文翻译。
-
-如果检测为泰语，悬浮窗显示 `TH：泰文原文` 和 `中：中文译文`。翻译在本地依次经过泰译英与英译中模型。
-
-### 7.4 防循环验证
-
-发送一次英文 TTS 后观察悬浮窗。程序不应把自己刚发送或在耳机试听的英文重新识别、翻译和累加。英文播放期间麦克风直通和接收识别都会暂停，虚拟声卡及耳机缓冲排空后才恢复。接收端还固定只捕获 Discord 进程声音，不会捕获本机耳机输出。
-
-## 8. 断网验证
-
-只有在模型准备脚本成功完成后再执行：
-
-1. 退出 VoiceScreen。
-2. 暂时断开网络。
-3. 重新启动 VoiceScreen，取消模拟模式并点击“启动”。
-4. 重复中译英和英译中测试。
-
-能够正常完成即证明运行链路不依赖外部 API。应用正常运行时只访问：
-
-```text
-127.0.0.1:18765  本地 faster-whisper + OPUS-MT 服务
-```
-
-可用以下命令检查本机监听端口：
-
-```powershell
-Get-NetTCPConnection -State Listen |
-  Where-Object LocalPort -eq 18765 |
-  Select-Object LocalAddress,LocalPort,OwningProcess
-```
-
-## 9. 常见问题排查
-
-### 9.1 点击启动后提示找不到 Python
+本机回退要求 Python 3.11 x64，且 `python` 必须能从普通 PowerShell 直接调用：
 
 ```powershell
 python --version
 where.exe python
-python -c "import faster_whisper; print('OK')"
 ```
 
-如果这些命令失败，重新安装 Python 3.11，确保 PATH 正确，并重新安装 faster-whisper。
-
-### 9.2 提示本地语音识别服务启动失败
-
-常见原因是 Whisper 模型没有提前下载，或缓存被清理。重新联网执行：
+准备 Whisper 和 OPUS-MT：
 
 ```powershell
-$env:HF_HUB_OFFLINE='0'
-python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+$env:HF_ENDPOINT='https://hf-mirror.com'
+powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1
 ```
 
-也可检查 18765 端口是否被其他程序占用：
+可选安装 Sherpa-ONNX：
 
 ```powershell
-Get-NetTCPConnection -LocalPort 18765 -ErrorAction SilentlyContinue
+$env:HF_ENDPOINT='https://hf-mirror.com'
+powershell -ExecutionPolicy Bypass -File .\tools\setup_local_models.ps1 -Sherpa
 ```
 
-### 9.3 提示缺少 OPUS-MT 模型
+下载前先确认镜像可达并未使用非预期海外代理。若镜像缺文件或校验失败，再改用官方 Hugging Face。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\setup_local_models.ps1
-```
-
-确认 `%LOCALAPPDATA%\VoiceScreen\Models` 下同时存在 `opus-mt-zh-en-ct2-int8`、`opus-mt-en-zh-ct2-int8` 与 `opus-mt-th-en-ct2-int8`，并且各自包含 `model.bin`。模型准备中途失败时，不要手动拼接文件；保留下载缓存并重新运行脚本即可续传，脚本会自动重试最多 3 次。
-
-### 9.4 程序检测不到 CABLE Input
-
-- 确认 VB-CABLE 驱动安装后已经重启 Windows。
-- 在“更多声音设置”里启用被禁用的 `CABLE Input` 和 `CABLE Output`。
-- 在 VoiceScreen 中点击“刷新设备”。
-- 不要选择名称相反的端点：程序播放端是 `CABLE Input`，Discord 录音端是 `CABLE Output`。
-
-### 9.5 对方听不到任何声音
-
-- Discord 麦克风必须为 `CABLE Output`。
-- VoiceScreen 必须已经点击“启动”。
-- 不按右 Alt 直接说中文，先确认 Discord 能收到原声输入电平；再按右 Alt 完成一次真实翻译发送。
-- 检查 Discord 是否启用了按键说话；若启用，播放 TTS 时也必须满足 Discord 的按键条件。
-- 检查 Discord 输入音量和 Windows 的 CABLE Output 录音音量是否为零。
-
-### 9.6 对方能听见中文，但听不见英文
-
-- 点击“翻译并试听（仅耳机）”，先确认本地翻译和英文 TTS 正常；然后用右 Alt 完成一次真实 Discord 发送测试。
-- 安装 Windows 英文语音并重启程序。
-- 暂时关闭 Discord 的 Krisp、自动增益和噪声抑制。
-- 查看悬浮窗是否出现“已发送”英文；没有则查看日志。
-
-### 9.7 英文缺少开头或句尾
-
-- 暂时关闭 Discord 降噪和自动输入灵敏度。
-- 将 Discord 输入灵敏度改成手动并适当降低阈值。
-- 确保没有同时运行会处理虚拟麦克风的声卡软件。
-- 程序已加入尾部静音和 WASAPI 排空保护；若仍稳定缺词，请保留测试句和日志用于定位。
-
-### 9.8 有回声或自己听到自己的声音
-
-依次检查：
-
-1. Discord 扬声器必须是 HyperX 实体耳机，不能是 `CABLE Input`。
-2. Discord 麦克风必须是 `CABLE Output`。
-3. Windows 的 CABLE Output 属性中“侦听此设备”必须关闭。
-4. HyperX 麦克风的“侦听此设备”也必须关闭。
-5. 使用耳机，不要外放。
-6. 退出其他音频路由软件，避免它们再次把 CABLE Output 回送到耳机或 CABLE Input。
-
-### 9.9 游戏有声音时也出现字幕
-
-当前版本不会回退到全系统捕获。如果发生：
-
-- 确认运行的是本仓库最新版。
-- 确认字幕确实来自 VoiceScreen，而不是 Discord 游戏串流或其他字幕软件。
-- 检查游戏声音是否通过某个机器人、直播或屏幕共享重新进入了 Discord 进程。
-- 保存日志并记录复现步骤。
-
-### 9.10 CPU 占用或延迟较高
-
-- 首次启动的模型加载不代表长期占用。
-- 关闭其他 CPU 密集程序。
-- 保持项目提供的 OPUS-MT INT8 模型，不要自行替换目录中的权重和 tokenizer。
-- 当前版本强制 CPU 推理以保护 3A 游戏显卡；低性能 CPU 上可能超过 5 秒。
-- 不要同时启动多个 VoiceScreen 实例。
-
-### 9.11 查看历史和调整悬浮窗
-
-- VoiceScreen 运行时，按键盘 `PgUp` 查看更早的字幕，按 `PgDn` 向最新字幕翻页；回到底部后会继续自动跟随新字幕。
-- 程序在内存中保留最近 200 条字幕，退出后不会保存字幕内容。
-- 点击主界面的“① 解锁移动/缩放”，看到悬浮窗顶部黄色提示后，拖动顶部移动位置，拖动右下角的黄色标记调整大小。
-- 完成后点击“② 完成并锁定”，恢复鼠标穿透，避免在游戏中挡住点击。位置和尺寸会自动保存。
-- 主界面的“字幕字号”滑块可在 14–42 之间即时调整并保存。
-
-### 9.12 多人同时说话
-
-当前 Windows Process Loopback 捕获的是 Discord 输出的混合音轨，Discord 没有把参与者用户名交给 VoiceScreen。因此当前字幕不能可靠标出真实说话人。后续可以增加纯本地说话人聚类并显示“说话人 1/2”，但它无法知道真实用户名，而且重叠说话时准确率有限。若必须显示 Discord 用户名，需要改成 Discord Bot 分用户接收音轨。
-
-### 9.13 提示 Could not load file or assembly 'VoiceScreen.Core'
-
-弹窗内容类似：
+模型位于：
 
 ```text
-启动失败
-Could not load file or assembly 'VoiceScreen.Core, Version=1.0.0.0,
-Culture=neutral, PublicKeyToken=null'. 系统找不到指定的文件。
+%LOCALAPPDATA%\VoiceScreen\Models
 ```
 
-说明你启动的那个 `VoiceScreen.App.exe` 旁边没有 `VoiceScreen.Core.dll`。常见原因：
+在高级设置中把 ASR 改为本地 Whisper 或 Sherpa，并将本地音色改为 Windows 英文音色。本机服务会由 VoiceScreen 自动启动，监听 `127.0.0.1:18765`；它与 Spark 服务不会同时占用 Windows 本机端口。
 
-- 只把 exe 单独复制了出来，没有带上同目录的其他文件；
-- 启动的是某个残留的旧发布目录，而它的内容已经被清理或不完整；
-- 机器上存在多份历史 `dist\` / `bin\` 副本，点开的不是最新那份。
+## 13. 更新
 
-处理办法——重新发布一份完整的，并从这个目录启动：
+### 13.1 Spark
+
+```bash
+cd /opt/voicescreen/VoiceScreen
+git pull --ff-only
+cd deploy/spark
+docker compose build model-service tts-service
+docker compose up -d model-service tts-service
+docker compose ps
+```
+
+不要删除模型和 `voice-profiles` 卷。镜像更新后先确认两个健康检查，再清理旧镜像。
+
+### 13.2 Windows
+
+更新前先退出 VoiceScreen，不要覆盖正在运行的发布目录：
 
 ```powershell
-Set-Location "$env:USERPROFILE\Desktop\VoiceScreen"
+git pull --ff-only
+powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
+dotnet restore src\VoiceScreen.App\VoiceScreen.App.csproj -r win-x64
 dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
-  -c Release -r win-x64 --self-contained false `
-  -o dist\VoiceScreen-latest
-.\dist\VoiceScreen-latest\VoiceScreen.App.exe
+  -c Release -r win-x64 --self-contained true --no-restore `
+  -o dist\VoiceScreen-release-new
 ```
 
-确认下列文件都在同一个目录里再启动：
+从新目录启动验证成功后，再更新快捷方式。设置和日志保存在 `%LOCALAPPDATA%\VoiceScreen`，不在发布目录中。
+
+## 14. 常见问题
+
+### 14.1 提示找不到 CABLE Input
+
+- 只看字幕：关闭发送复选框，然后开始监听。
+- 需要发送：确认安装驱动后已经重启 Windows；在声音设置中启用 CABLE Input/Output；点“刷新列表”。
+- VoiceScreen 选择的是播放端 `CABLE Input`，Discord 选择的是录音端 `CABLE Output`。
+
+### 14.2 一直停在加载模型
+
+Windows：
 
 ```powershell
-Get-ChildItem dist\VoiceScreen-latest\VoiceScreen.Core.dll,
-              dist\VoiceScreen-latest\VoiceScreen.App.dll,
-              dist\VoiceScreen-latest\LocalService\local_outgoing_service.py
+Test-NetConnection spark-host.local -Port 18765
+Test-NetConnection spark-host.local -Port 18766
 ```
 
-排查前先确认没有旧实例还开着：
+Spark：
+
+```bash
+docker ps --filter name=voicescreen
+docker logs --tail=200 voicescreen-model-service
+docker logs --tail=200 voicescreen-tts-service
+curl -fsS http://127.0.0.1:18765/health
+curl -fsS http://127.0.0.1:18766/health
+```
+
+`401 Unauthorized` 表示 Windows 与 Spark 令牌不一致；`503` 表示模型尚未加载完成或启动失败。
+
+### 14.3 应用显示运行中，但没有字幕
+
+- 确认选中的 PID 正在实际播放声音；浏览器重启后 PID 会变化，需要刷新列表。
+- 状态栏若显示“5 秒未检测到声音”，说明捕获已经建立，但当前目标是静音。
+- 不要选择浏览器启动器、更新器或无声音的辅助进程。
+- 目标以管理员身份运行时，让 VoiceScreen 使用相同权限。
+- 查看日志中的 `Process loopback metrics`；`peakPcm16` 长期接近 0 说明目标没有输出音频。
+
+### 14.4 延迟越来越高
+
+- 确认 Spark GPU 没有同时跑 CosyVoice 或其他大模型实验。
+- 检查局域网丢包和 Spark 负载。
+- 长文本应看到 `Outgoing TTS chunk` 日志；如果整句只有一个超长块，保留文本样本用于调整分块。
+- 不要同时运行多个 VoiceScreen 客户端请求同一个单 worker TTS 服务。
+- 临时字幕队列会自动丢弃过期预览；若永久历史仍持续落后，应保存日志中的 `end-to-end` 和 `translation` 指标。
+
+### 14.5 对方只听到英文开头
+
+- 暂时关闭 Discord Krisp、自动增益和噪声抑制。
+- 把 Discord 输入灵敏度改为手动并适当降低阈值。
+- 确认没有其他软件同时处理 VB-CABLE。
+- 检查 VoiceScreen 日志是否出现 TTS 超时、后续块失败或播放排空超时。
+
+### 14.6 只有一个音色
+
+- 私人音色由 Spark 提供，默认只有一个 `my-voice` profile。
+- 额外 Windows 音色需要在 Windows 语音设置中安装，重启应用后才会枚举。
+- Edge TTS 音色位于单独的在线音色下拉框，不会混入本地音色列表。
+
+### 14.7 重复翻译或历史内容丢失
+
+- 使用当前 `main` 构建，旧版本曾把临时结果错误追加到历史。
+- 临时区域允许反复修改，历史区只保存最终结果；两者视觉上靠近但含义不同。
+- 用户手动滚动时只是暂停自动跟随，不会停止新字幕写入。
+- 保留出现问题前后的日志和原始语句，重点查 `utteranceId`、`final subtitle` 和语义边界记录。
+
+### 14.8 Windows 安全中心阻止 DLL
+
+当前发布包未做商业代码签名，Windows 可能提示无法确认 DLL 发布者。只在确认包来自本仓库或自己构建后，对完整发布目录解除下载标记：
 
 ```powershell
-Get-Process VoiceScreen.App -ErrorAction SilentlyContinue
+Get-ChildItem -LiteralPath 'C:\path\to\VoiceScreen-release' -Recurse -File |
+  Unblock-File
 ```
 
-## 10. 日志与配置位置
+不要从第三方网盘或下载站获取修改版。正式外部分发应使用可信代码签名证书签名 EXE 和 DLL。
 
-运行日志：
+### 14.9 提示缺少 VoiceScreen.Core 或 ONNX Runtime
+
+说明发布目录不完整。重新复制或重新发布整个目录，不要只复制 EXE。确认 `VoiceScreen.Core.dll`、`Microsoft.ML.OnnxRuntime.dll`、`onnxruntime.dll` 和 `Models\silero_vad_16k_op15.onnx` 都存在。
+
+### 14.10 回声或听见自己的延迟声音
+
+1. Discord 输出必须是实体耳机。
+2. Discord 输入必须是 `CABLE Output`。
+3. Windows 的 CABLE Output“侦听此设备”必须关闭。
+4. 使用耳机，不要外放。
+5. 退出其他虚拟混音、直播和声卡路由软件后复测。
+
+## 15. 日志、设置与卸载
+
+日志：
 
 ```text
 %LOCALAPPDATA%\VoiceScreen\voicescreen.log
 ```
 
-打开日志：
+打开：
 
 ```powershell
 notepad "$env:LOCALAPPDATA\VoiceScreen\voicescreen.log"
 ```
 
-当前用户的加密设置：
+加密设置：
 
 ```text
 %LOCALAPPDATA%\VoiceScreen\settings.dat
 ```
 
-如果设备配置异常，可以在 VoiceScreen 退出后重置设置：
+重置设置前先退出应用：
 
 ```powershell
 Remove-Item "$env:LOCALAPPDATA\VoiceScreen\settings.dat" -ErrorAction SilentlyContinue
 ```
 
-这不会删除 Whisper 或 OPUS-MT 模型。
+卸载 Windows 客户端时删除发布目录；若也不再需要配置和日志，可删除 `%LOCALAPPDATA%\VoiceScreen`。删除 Spark 模型、私人音色或 Docker 卷属于独立操作，不应在普通客户端卸载时执行。
 
-## 11. 更新、迁移与卸载
+## 16. 官方项目
 
-### 11.1 更新源码部署
-
-```powershell
-Set-Location "$env:USERPROFILE\Desktop\VoiceScreen"
-git pull --ff-only
-dotnet restore VoiceScreen.sln
-powershell -ExecutionPolicy Bypass -File .\tools\run_tests.ps1
-dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
-  -c Release -r win-x64 --self-contained false `
-  -o dist\VoiceScreen-latest
-```
-
-更新前请先退出正在运行的 VoiceScreen，否则发布会因为文件被占用而失败。
-发布目录是整体替换的，旧目录可以直接删掉——里面没有任何配置或模型，
-设置存在 `%LOCALAPPDATA%\VoiceScreen\`，模型存在模型根目录。
-
-更新前先退出 VoiceScreen。不要在程序运行时覆盖发布目录。
-
-### 11.2 迁移到另一台电脑
-
-可以复制整个发布目录，但 Python 包、Whisper 缓存、OPUS-MT 模型、Windows 英文语音和 VB-CABLE 驱动必须在新电脑上重新安装。`settings.dat` 使用 Windows 当前用户加密，不应复制到另一台电脑或另一个账号。
-
-### 11.3 卸载
-
-1. 退出 VoiceScreen。
-2. 删除 VoiceScreen 发布目录。
-3. 可选删除配置与日志：
-
-   ```powershell
-   Remove-Item "$env:LOCALAPPDATA\VoiceScreen" -Recurse -Force
-   ```
-
-4. 在“设置 → 应用 → 已安装的应用”中按需卸载 Python、.NET Desktop Runtime 和 VB-CABLE。
-5. 本地模型位于 `%LOCALAPPDATA%\VoiceScreen\Models`；如需释放空间，请确认不再使用后再删除该目录。
-
-## 12. 官方下载与文档
-
+- [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)
+- [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
+- [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
+- [Silero VAD](https://github.com/snakers4/silero-vad)
+- [CosyVoice](https://github.com/FunAudioLLM/CosyVoice)
+- [VB-Audio Virtual Cable](https://vb-audio.com/Cable/)
 - [.NET Windows 安装文档](https://learn.microsoft.com/dotnet/core/install/windows)
-- [Python 3.11.9 Windows 发布页](https://www.python.org/downloads/release/python-3119/)
-- [Helsinki-NLP OPUS-MT 中译英模型](https://huggingface.co/Helsinki-NLP/opus-mt-zh-en)
-- [Helsinki-NLP OPUS-MT 英译中模型](https://huggingface.co/Helsinki-NLP/opus-mt-en-zh)
-- [Helsinki-NLP OPUS-MT 泰译英模型](https://huggingface.co/Helsinki-NLP/opus-mt-th-en)
-- [CTranslate2 官方项目](https://github.com/OpenNMT/CTranslate2)
-- [VB-Audio Virtual Cable 官方页面](https://vb-audio.com/Cable/)
-- [Discord 语音与视频故障排查](https://support.discord.com/hc/articles/360045138471)
-
-不要从第三方软件下载站获取 Python 或虚拟声卡驱动。
