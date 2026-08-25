@@ -69,6 +69,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
     private readonly bool _lowLatency;
     private readonly bool _streamingSessions;
     private readonly bool _supportsWordTimestamps;
+    private readonly SileroVoiceActivityDetector? _voiceActivityDetector;
     private readonly Func<string, string, int, CancellationToken, Task<LocalIncomingTranslation>>? _translateOverride;
 
     // 预滚环形缓冲：数组只在首次用到时分配一次，之后按帧覆盖写入。
@@ -139,6 +140,17 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         _streamingSessions = localService.UsesStreamingSessions;
         _supportsWordTimestamps = localService.SupportsWordTimestamps;
         _translateOverride = translateOverride;
+        var vadModelPath = Path.Combine(AppContext.BaseDirectory, "Models",
+            SileroVoiceActivityDetector.ModelFileName);
+        try
+        {
+            _voiceActivityDetector = new SileroVoiceActivityDetector(vadModelPath);
+            VoiceScreenLog.Info("Silero VAD enabled for selected-process audio (16kHz ONNX)");
+        }
+        catch (Exception ex)
+        {
+            VoiceScreenLog.Warn($"Silero VAD unavailable; using RMS fallback: {ex.Message}");
+        }
         _asrWorker = Task.Run(ProcessAudioSnapshotsAsync);
         _translationWorker = Task.Run(ProcessTranslationSnapshotsAsync);
     }
@@ -163,7 +175,8 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
                 return ValueTask.CompletedTask;
             }
 
-            var voiced = PcmLevel.CalculateRms(frame) >= VoiceRmsThreshold;
+            var rmsVoiced = PcmLevel.CalculateRms(frame) >= VoiceRmsThreshold;
+            var voiced = _voiceActivityDetector?.IsSpeech(frame, rmsVoiced) ?? rmsVoiced;
             if (!_utteranceActive)
             {
                 AddPreRollNoLock(frame);
@@ -379,6 +392,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         _semanticBoundaryFrame = 0;
         _lastSemanticDecisionFrame = 0;
         _semanticDecisionInFlight = false;
+        _voiceActivityDetector?.Reset();
         if (clearPreview) ClearPreview();
     }
 
@@ -841,6 +855,7 @@ public sealed class LocalIncomingAudioProcessor : IIncomingAudioProcessor
         try { await Task.WhenAll(_asrWorker, _translationWorker).ConfigureAwait(false); }
         catch (OperationCanceledException) { }
         DrainPendingAudioSnapshots();
+        _voiceActivityDetector?.Dispose();
         _utterance.Dispose();
         _lifetime.Dispose();
     }

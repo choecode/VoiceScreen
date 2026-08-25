@@ -1,0 +1,43 @@
+FROM nvcr.io/nvidia/pytorch:26.02-py3
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/voicescreen/compat:/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+# The NGC ARM64 image contains a CUDA-enabled PyTorch build but no matching
+# public torchaudio wheel. VoiceScreen supplies the small pure-Python inference
+# surface it needs and intentionally omits training/TRT/vLLM dependencies.
+RUN python -m pip install --no-cache-dir \
+    "conformer==0.3.2" \
+    "diffusers==0.29.0" \
+    "flask==3.1.2" \
+    "gdown==5.1.0" \
+    "gunicorn==23.0.0" \
+    "hydra-core==1.3.2" \
+    "HyperPyYAML==1.2.3" \
+    "inflect==7.3.1" \
+    "librosa==0.11.0" \
+    "lightning==2.2.4" \
+    "omegaconf==2.3.0" \
+    "onnxruntime==1.24.1" \
+    "openai-whisper==20250625" \
+    "pyarrow==21.0.0" \
+    "rich==13.7.1" \
+    "transformers==4.51.3" \
+    "wget==3.2" \
+    "x-transformers==2.11.24"
+
+WORKDIR /opt/CosyVoice
+# `cosyvoice` is a named build context pointing at the pinned upstream checkout.
+COPY --from=cosyvoice / /opt/CosyVoice
+COPY torchaudio_compat /opt/voicescreen/compat/torchaudio
+COPY cosyvoice_compat /opt/voicescreen/compat
+COPY voicescreen_cosyvoice_service.py /opt/voicescreen/voicescreen_cosyvoice_service.py
+
+WORKDIR /opt/voicescreen
+EXPOSE 18767
+ENTRYPOINT ["gunicorn", "--workers", "1", "--threads", "2", "--timeout", "300", "--graceful-timeout", "60", "--bind", "0.0.0.0:18767", "voicescreen_cosyvoice_service:create_app()"]

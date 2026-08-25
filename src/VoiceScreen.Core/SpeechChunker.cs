@@ -8,6 +8,16 @@ public static class SpeechChunker
 {
     public const int DefaultPreferredCharacters = 60;
     public const int DefaultMaximumCharacters = 80;
+    private static readonly HashSet<string> DanglingEndings = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "a", "an", "the", "and", "or", "but", "if", "because", "while", "when",
+        "after", "before", "until", "unless", "whether", "that", "which", "who",
+        "whose", "where", "to", "of", "for", "from", "with", "without", "into",
+        "onto", "at", "by", "as", "is", "are", "was", "were", "be", "been",
+        "being", "do", "does", "did", "don't", "doesn't", "didn't", "not", "no",
+        "can", "could", "should", "would", "will", "won't", "may", "might", "must",
+        "have", "has", "had"
+    };
 
     public static IReadOnlyList<string> SplitEnglish(string? text,
         int preferredCharacters = DefaultPreferredCharacters,
@@ -49,8 +59,31 @@ public static class SpeechChunker
         if (phrase > 0) return phrase;
 
         // 最后只在单词间切。极长 URL/标识符没有空格时才使用硬上限。
-        var whitespace = LastBoundary(text, minimum, maximum, char.IsWhiteSpace);
+        var whitespace = LastSafeWhitespaceBoundary(text, minimum, maximum);
         return whitespace > 0 ? whitespace : maximum;
+    }
+
+    private static int LastSafeWhitespaceBoundary(string text, int minimum, int maximum)
+    {
+        var fallback = -1;
+        for (var index = Math.Min(maximum, text.Length - 1); index >= minimum; index--)
+        {
+            if (!char.IsWhiteSpace(text[index])) continue;
+            fallback = fallback < 0 ? index : fallback;
+            if (!EndsWithDanglingWord(text.AsSpan(0, index))) return index;
+        }
+        return fallback;
+    }
+
+    private static bool EndsWithDanglingWord(ReadOnlySpan<char> text)
+    {
+        var end = text.Length - 1;
+        while (end >= 0 && !char.IsLetter(text[end]) && text[end] != '\'') end--;
+        if (end < 0) return false;
+
+        var start = end;
+        while (start >= 0 && (char.IsLetter(text[start]) || text[start] == '\'')) start--;
+        return DanglingEndings.Contains(text[(start + 1)..(end + 1)].ToString());
     }
 
     private static int LastBoundary(string text, int minimum, int maximum, Func<char, bool> predicate)

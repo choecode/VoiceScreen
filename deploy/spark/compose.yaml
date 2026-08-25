@@ -69,3 +69,45 @@ services:
       timeout: 5s
       retries: 8
       start_period: 180s
+
+  # Isolated A/B candidate. It is never started by the normal compose command;
+  # use `docker compose --profile experiments up -d cosyvoice-service` only
+  # after the pinned CosyVoice checkout is present on the Spark.
+  cosyvoice-service:
+    profiles: ["experiments"]
+    build:
+      context: .
+      dockerfile: Dockerfile.cosyvoice
+      additional_contexts:
+        cosyvoice: ${COSYVOICE_SOURCE_PATH:-/opt/voicescreen/voicescreen-experiments/CosyVoice}
+      args:
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    image: voicescreen/cosyvoice-service:2026.08.25.1
+    container_name: voicescreen-cosyvoice-service
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    shm_size: 4gb
+    environment:
+      VOICESCREEN_COSYVOICE_PORT: "18767"
+      VOICESCREEN_API_TOKEN: ${VOICESCREEN_API_TOKEN:?set VOICESCREEN_API_TOKEN in .env}
+      VOICESCREEN_COSYVOICE_MODEL: /models/Fun-CosyVoice3-0.5B-2512
+      VOICESCREEN_VOICE_ID: my-voice
+      VOICESCREEN_VOICE_REFERENCE: /profiles/my-voice-reference.wav
+      VOICESCREEN_VOICE_REFERENCE_TEXT: "Hello. This is my natural speaking voice. Today, I'm testing a real-time translation system."
+    volumes:
+      - /opt/voicescreen/models/voicescreen:/models:ro
+      - /opt/voicescreen/models/voicescreen/voice-profiles:/profiles:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18767/health', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 300s

@@ -48,6 +48,23 @@ public sealed class SpeechChunkerTests
         Assert.Equal("move left then wait", string.Join(' ', chunks));
     }
 
+    [Theory]
+    [InlineData(
+        "Stay put and move right only after the first team enters the warehouse—don't cross the open area.",
+        "don't")]
+    [InlineData(
+        "We need to first confirm how many people are still in the warehouse and whether they've noticed us.",
+        "whether")]
+    public void HardLimit_DoesNotLeaveAConnectorDangling(string text, string danglingWord)
+    {
+        var chunks = SpeechChunker.SplitEnglish(text);
+
+        Assert.True(chunks.Count >= 2);
+        Assert.False(chunks[0].EndsWith(danglingWord, StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(Normalize(text), Normalize(string.Join(' ', chunks)));
+        Assert.All(chunks, chunk => Assert.InRange(chunk.Length, 1, 80));
+    }
+
     [Fact]
     public void InvalidLimits_AreRejected()
     {
