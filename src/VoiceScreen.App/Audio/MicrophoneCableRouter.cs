@@ -12,6 +12,7 @@ public sealed class MicrophoneCableRouter : IDisposable
 {
     private const int Pcm16Mono16KhzBytesPerSecond = 32000;
     private const int TtsTrailingSilenceMilliseconds = 650;
+    private const int TtsChunkSilenceMilliseconds = 120;
     private const int WasapiDrainGuardMilliseconds = 180;
     private readonly object _recordingGate = new();
     private WasapiCapture? _capture;
@@ -185,7 +186,8 @@ public sealed class MicrophoneCableRouter : IDisposable
         bool playOnMonitor = true)
     {
         var monitor = playOnMonitor && _monitorTtsBuffer is not null;
-        EnqueueTts(pcm16Mono16Khz, sendToCable: true, playOnMonitor: monitor, replaceQueued: true);
+        EnqueueTts(pcm16Mono16Khz, sendToCable: true, playOnMonitor: monitor,
+            replaceQueued: true, trailingSilenceMilliseconds: TtsTrailingSilenceMilliseconds);
         await WaitForTtsDrainAsync(sendToCable: true, playOnMonitor: monitor, cancellationToken)
             .ConfigureAwait(false);
     }
@@ -193,7 +195,8 @@ public sealed class MicrophoneCableRouter : IDisposable
     public async Task PlayMonitorTtsAsync(byte[] pcm16Mono16Khz, CancellationToken cancellationToken)
     {
         if (_monitorTtsBuffer is null) throw new InvalidOperationException("没有配置英文试听耳机。");
-        EnqueueTts(pcm16Mono16Khz, sendToCable: false, playOnMonitor: true, replaceQueued: true);
+        EnqueueTts(pcm16Mono16Khz, sendToCable: false, playOnMonitor: true,
+            replaceQueued: true, trailingSilenceMilliseconds: TtsTrailingSilenceMilliseconds);
         await WaitForTtsDrainAsync(sendToCable: false, playOnMonitor: true, cancellationToken).ConfigureAwait(false);
     }
 
@@ -205,19 +208,30 @@ public sealed class MicrophoneCableRouter : IDisposable
     /// </summary>
     public void EnqueueTts(byte[] pcm16Mono16Khz, bool playOnMonitor)
         => EnqueueTts(pcm16Mono16Khz, sendToCable: true,
-            playOnMonitor: playOnMonitor && _monitorTtsBuffer is not null, replaceQueued: false);
+            playOnMonitor: playOnMonitor && _monitorTtsBuffer is not null, replaceQueued: false,
+            trailingSilenceMilliseconds: TtsTrailingSilenceMilliseconds);
+
+    /// <summary>
+    /// 长句流水线专用：中间块只补很短的自然停顿，最后一块仍保留完整尾静音，
+    /// 确保 Discord 的 VAD 不会裁掉末尾单词。
+    /// </summary>
+    public void EnqueueTtsChunk(byte[] pcm16Mono16Khz, bool playOnMonitor, bool isFinal)
+        => EnqueueTts(pcm16Mono16Khz, sendToCable: true,
+            playOnMonitor: playOnMonitor && _monitorTtsBuffer is not null, replaceQueued: false,
+            trailingSilenceMilliseconds: isFinal ? TtsTrailingSilenceMilliseconds : TtsChunkSilenceMilliseconds);
 
     /// <summary>队列里还有没有没播完的英文语音。</summary>
     public bool HasPendingTts
         => (_ttsBuffer?.BufferedBytes ?? 0) > 0 || (_monitorTtsBuffer?.BufferedBytes ?? 0) > 0;
 
-    private void EnqueueTts(byte[] pcm16Mono16Khz, bool sendToCable, bool playOnMonitor, bool replaceQueued)
+    private void EnqueueTts(byte[] pcm16Mono16Khz, bool sendToCable, bool playOnMonitor, bool replaceQueued,
+        int trailingSilenceMilliseconds)
     {
         if (_ttsBuffer is null) throw new InvalidOperationException("音频路由尚未启动。");
 
         // Discord 的语音活动检测和 VB-CABLE/WASAPI 都存在尾部缓冲。
         // 在句尾追加静音，确保最后一个单词完整穿过设备缓冲后再恢复原始麦克风。
-        var trailingSilence = new byte[Pcm16Mono16KhzBytesPerSecond * TtsTrailingSilenceMilliseconds / 1000];
+        var trailingSilence = new byte[Pcm16Mono16KhzBytesPerSecond * trailingSilenceMilliseconds / 1000];
         if (sendToCable)
         {
             if (replaceQueued) _ttsBuffer.ClearBuffer();

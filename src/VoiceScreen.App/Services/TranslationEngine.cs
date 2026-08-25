@@ -200,6 +200,91 @@ public sealed class TranslationEngine : IAsyncDisposable
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 私有克隆音色对长文本的整段生成延迟会非线性上升。这里把已经定稿的英文切成
+    /// 自然短块：第一块一合成好就开始播放，后面的块在前一块播放期间继续生成。
+    /// </summary>
+    private async Task PlayEnglishSelectedAsync(string english, bool useApi, bool appendToExisting,
+        CancellationToken cancellationToken)
+    {
+        var shouldChunk = !useApi
+                          && SparkVoiceCloneService.IsVoiceId(_settings.EnglishVoiceName)
+                          && english.Length > SpeechChunker.DefaultMaximumCharacters;
+        IReadOnlyList<string> chunks = shouldChunk
+            ? SpeechChunker.SplitEnglish(english)
+            : new[] { english.Trim() };
+
+        if (chunks.Count == 1)
+        {
+            var audio = await SynthesizeEnglishSelectedAsync(chunks[0], useApi, cancellationToken)
+                .ConfigureAwait(false);
+            if (appendToExisting)
+            {
+                _router.EnqueueTts(audio, _settings.MonitorTranslatedSpeech);
+                await _router.WaitForTtsDrainAsync(sendToCable: true,
+                    playOnMonitor: _settings.MonitorTranslatedSpeech, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await _router.PlayTtsAsync(audio, cancellationToken, _settings.MonitorTranslatedSpeech)
+                    .ConfigureAwait(false);
+            }
+            return;
+        }
+
+        var pipelineTimer = Stopwatch.StartNew();
+        var firstAudioMilliseconds = 0L;
+        var synthesizedChunks = 0;
+        try
+        {
+            for (var index = 0; index < chunks.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                StatusChanged?.Invoke(this, $"正在生成英文语音 {index + 1}/{chunks.Count}……");
+                var chunkTimer = Stopwatch.StartNew();
+                var audio = await SynthesizeEnglishSelectedAsync(chunks[index], useApi, cancellationToken)
+                    .ConfigureAwait(false);
+                chunkTimer.Stop();
+                _router.EnqueueTtsChunk(audio, _settings.MonitorTranslatedSpeech,
+                    isFinal: index == chunks.Count - 1);
+                synthesizedChunks++;
+                if (index == 0)
+                {
+                    firstAudioMilliseconds = pipelineTimer.ElapsedMilliseconds;
+                    VoiceScreenLog.Info(
+                        $"Outgoing TTS first audio queued in {firstAudioMilliseconds}ms; chunks={chunks.Count} chars={english.Length}");
+                }
+                VoiceScreenLog.Info(
+                    $"Outgoing TTS chunk {index + 1}/{chunks.Count} synthesized in {chunkTimer.ElapsedMilliseconds}ms chars={chunks[index].Length}");
+            }
+
+            await _router.WaitForTtsDrainAsync(sendToCable: true,
+                playOnMonitor: _settings.MonitorTranslatedSpeech, cancellationToken).ConfigureAwait(false);
+            VoiceScreenLog.Info(
+                $"Outgoing TTS chunk pipeline completed in {pipelineTimer.ElapsedMilliseconds}ms; firstAudio={firstAudioMilliseconds}ms chunks={chunks.Count}");
+        }
+        catch
+        {
+            // 前几块已经送入 Discord 后无法撤回。即使后一块失败，也先等已排队语音播完，
+            // 再恢复原声麦克风，避免中途把中文原声叠到尚未播完的英文上。
+            if (synthesizedChunks > 0 && _router.HasPendingTts)
+            {
+                using var drain = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                drain.CancelAfter(TimeSpan.FromSeconds(30));
+                try
+                {
+                    await _router.WaitForTtsDrainAsync(sendToCable: true,
+                        playOnMonitor: _settings.MonitorTranslatedSpeech, drain.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    VoiceScreenLog.Warn("Timed out draining already queued TTS chunks after pipeline failure");
+                }
+            }
+            throw;
+        }
+    }
+
     public async Task EndLocalCaptureAsync()
     {
         if (!_outgoingAvailable) return;
@@ -269,21 +354,9 @@ public sealed class TranslationEngine : IAsyncDisposable
             using var playbackTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
             playbackTimeout.CancelAfter(TimeSpan.FromSeconds(60));
             var playbackToken = playbackTimeout.Token;
-            var tts = await SynthesizeEnglishSelectedAsync(
-                translation.TranslatedText, useApiTts, playbackToken).ConfigureAwait(false);
-            if (alreadySpoken > 0)
-            {
-                // 抢跑的短句可能还在播。这里必须追加而不是替换，否则会把还没播完的
-                // 前半句直接掐掉，对方听到的就是一句被砍断的话。
-                _router.EnqueueTts(tts, _settings.MonitorTranslatedSpeech);
-                await _router.WaitForTtsDrainAsync(sendToCable: true,
-                    playOnMonitor: _settings.MonitorTranslatedSpeech, playbackToken).ConfigureAwait(false);
-            }
-            else
-            {
-                await _router.PlayTtsAsync(tts, playbackToken, _settings.MonitorTranslatedSpeech)
-                    .ConfigureAwait(false);
-            }
+            // 抢跑的短句可能仍在播；appendToExisting 保证补发尾句不会清空前面的队列。
+            await PlayEnglishSelectedAsync(translation.TranslatedText, useApiTts,
+                appendToExisting: alreadySpoken > 0, cancellationToken: playbackToken).ConfigureAwait(false);
             _state.TryBeginCooldown();
             await Task.Delay(500, playbackToken).ConfigureAwait(false);
             playbackTimer.Stop();
