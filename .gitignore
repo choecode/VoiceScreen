@@ -17,6 +17,10 @@ output/
 *.pyc
 .venv/
 .venv-translation-lab/
+.env
+.env.*
+!.env.example
+*.bak
 
 # 本地模型（体积巨大，用 tools/setup_local_models.ps1 下载）
 # 必须用前导斜杠锚定到仓库根：不加的话，Windows 大小写不敏感会让这条规则

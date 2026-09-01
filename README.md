@@ -78,7 +78,7 @@ Spark 生产服务：
 3. 在“监听应用”中选择目标进程；列表没有目标时点“刷新列表”。
 4. 只需要字幕时，关闭“同时把麦克风中文翻译成英文并发送到语音应用”。
 5. 需要发送英文时，安装 VB-CABLE，并在 Discord 中把输入设备设为 `CABLE Output`。
-6. 在高级设置中确认 Spark 地址为 `http://spark-host.local:18765/`，填入访问令牌。
+6. 在高级设置中填写你的 Spark 地址（例如 `http://spark-host.local:18765/`）和访问令牌。
 7. 选择 `Spark Qwen3-ASR 1.7B`、`Spark Qwen3-4B`，并在本地英文音色中选择私人音色。
 8. 点击“开始监听”。顶部出现“运行中”才代表启动完成。
 9. 正常说话会发送中文原声；按住右 Alt 说中文、松开后发送英文。
@@ -158,3 +158,7 @@ dotnet publish src\VoiceScreen.App\VoiceScreen.App.csproj `
 - 多人重叠说话、强背景音乐、极短语气词和不自然停顿仍可能降低识别与断句质量。
 - CosyVoice 已完成 A/B，但在当前 Spark 上没有胜过 Qwen 分块方案，因此不是生产默认服务。
 - 程序不注入游戏、不读取游戏内存，也不绕过反作弊或 Windows 权限边界。
+
+## 开源与免费使用
+
+应用源代码采用 [MIT License](LICENSE)，可免费使用、修改和再发布。Qwen、Whisper、OPUS-MT、Silero、CosyVoice、VB-CABLE、MyMemory 和 Edge TTS 等组件必须分别遵守其上游许可证、服务条款和模型使用限制。私人音色只允许在获得录音本人授权的前提下使用。

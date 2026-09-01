@@ -386,7 +386,7 @@ public sealed class LocalOutgoingService : IAsyncDisposable
         if (await IsHealthyAsync(_asr, "health", cancellationToken).ConfigureAwait(false)) return;
         if (_remoteMode)
             throw new InvalidOperationException(
-                $"Spark 模型服务不可用：{_asr.BaseAddress}。请确认 spark-host.local 已开机且 VoiceScreen 模型服务健康。");
+                $"Spark 模型服务不可用：{_asr.BaseAddress}。请确认 Spark 主机地址正确且 VoiceScreen 模型服务健康。");
         var script = Path.Combine(AppContext.BaseDirectory, "LocalService", "local_outgoing_service.py");
         if (!File.Exists(script)) throw new FileNotFoundException("缺少本地语音识别服务脚本。", script);
         var arguments = $"\"{script}\" --port {ServicePort} --asr-engine {_asrEngine} --asr-device {_asrDevice}";

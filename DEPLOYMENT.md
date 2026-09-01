@@ -48,16 +48,16 @@ Test-NetConnection spark-host.local -Port 18766
 - NVIDIA DGX Spark，`aarch64`；
 - 128 GB 统一内存；
 - 支持 GPU 的 Docker 与 Docker Compose v2；
-- 模型根目录 `/opt/voicescreen/models/voicescreen`；
+- 模型根目录由 `VOICESCREEN_MODEL_ROOT` 配置，示例为 `/opt/voicescreen/models`；
 - 生产容器使用 NGC ARM64 CUDA/PyTorch 基础镜像。
 
 模型目录及当前磁盘占用约为：
 
 ```text
-/opt/voicescreen/models/voicescreen/Qwen3-ASR-1.7B             4.4 GB
-/opt/voicescreen/models/voicescreen/Qwen3-4B-Instruct-2507    7.6 GB
-/opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base  2.4 GB
-/opt/voicescreen/models/voicescreen/voice-profiles             私人录音与 prompt
+<SPARK_MODEL_ROOT>/Qwen3-ASR-1.7B             4.4 GB
+<SPARK_MODEL_ROOT>/Qwen3-4B-Instruct-2507    7.6 GB
+<SPARK_MODEL_ROOT>/Qwen3-TTS-12Hz-0.6B-Base  2.4 GB
+<SPARK_PROFILE_ROOT>                          私人录音与 prompt
 ```
 
 至少预留 25 GB 磁盘，给模型、Docker 构建层和升级期间的旧镜像留出余量。
@@ -76,33 +76,33 @@ env | grep -i proxy
 安装 ModelScope 下载工具：
 
 ```bash
-python3 -m venv /opt/voicescreen/venvs/voicescreen-download
-source /opt/voicescreen/venvs/voicescreen-download/bin/activate
+python3 -m venv /opt/voicescreen/venvs/download
+source /opt/voicescreen/venvs/download/bin/activate
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -U modelscope
 ```
 
 下载三个生产模型：
 
 ```bash
-mkdir -p /opt/voicescreen/models/voicescreen
+mkdir -p /opt/voicescreen/models
 
 modelscope download --model Qwen/Qwen3-ASR-1.7B \
-  --local_dir /opt/voicescreen/models/voicescreen/Qwen3-ASR-1.7B
+  --local_dir /opt/voicescreen/models/Qwen3-ASR-1.7B
 
 modelscope download --model Qwen/Qwen3-4B-Instruct-2507 \
-  --local_dir /opt/voicescreen/models/voicescreen/Qwen3-4B-Instruct-2507
+  --local_dir /opt/voicescreen/models/Qwen3-4B-Instruct-2507
 
 modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-  --local_dir /opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base
+  --local_dir /opt/voicescreen/models/Qwen3-TTS-12Hz-0.6B-Base
 ```
 
 下载后检查目录，不要只相信命令退出码：
 
 ```bash
-du -sh /opt/voicescreen/models/voicescreen/Qwen3-*
-find /opt/voicescreen/models/voicescreen/Qwen3-ASR-1.7B -name '*.safetensors' -type f
-find /opt/voicescreen/models/voicescreen/Qwen3-4B-Instruct-2507 -name '*.safetensors' -type f
-find /opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base -name '*.safetensors' -type f
+du -sh /opt/voicescreen/models/Qwen3-*
+find /opt/voicescreen/models/Qwen3-ASR-1.7B -name '*.safetensors' -type f
+find /opt/voicescreen/models/Qwen3-4B-Instruct-2507 -name '*.safetensors' -type f
+find /opt/voicescreen/models/Qwen3-TTS-12Hz-0.6B-Base -name '*.safetensors' -type f
 ```
 
 只有 ModelScope 缺少对应文件、镜像版本不完整或校验失败时，才改用 Hugging Face 上游，并记录原因。
@@ -121,15 +121,15 @@ find /opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base -name '*.safet
 把 M4A 转成 24 kHz 单声道 WAV：
 
 ```bash
-mkdir -p /opt/voicescreen/models/voicescreen/voice-profiles
-ffmpeg -i Recording.m4a -ar 24000 -ac 1 -c:a pcm_s16le \
-  /opt/voicescreen/models/voicescreen/voice-profiles/my-voice-reference.wav
+mkdir -p /opt/voicescreen/voice-profiles
+ffmpeg -i your-reference-recording.m4a -ar 24000 -ac 1 -c:a pcm_s16le \
+  /opt/voicescreen/voice-profiles/my-voice-reference.wav
 ```
 
-当前 Compose 中的参考文本是：
+将参考文本写入 `.env` 的 `VOICESCREEN_VOICE_REFERENCE_TEXT`，必须与录音逐字一致。例如：
 
 ```text
-Hello. This is my natural speaking voice. Today, I'm testing a real-time translation system.
+Replace this example with the exact transcript of your reference recording.
 ```
 
 如果录音内容不同，必须同步修改 `VOICESCREEN_VOICE_REFERENCE_TEXT`。不要用近似文本，否则音色、韵律和清晰度都会下降。
@@ -137,7 +137,7 @@ Hello. This is my natural speaking voice. Today, I'm testing a real-time transla
 服务首次启动时会生成：
 
 ```text
-/opt/voicescreen/models/voicescreen/voice-profiles/my-voice.pt
+/opt/voicescreen/voice-profiles/my-voice.pt
 ```
 
 更换录音或参考文本后，需要先停止 TTS 服务，删除旧的 `my-voice.pt`，再启动服务重新生成。这个文件和参考录音都属于私人数据，不应提交到 Git 或放入 Windows 发布包。
@@ -179,6 +179,32 @@ docker compose up -d model-service tts-service
 
 不要为普通生产启动添加 `--profile experiments`。
 
+### 6.1 与其他 SGLang 模型共存
+
+如果同一台 Spark 还运行 Qwen 27B 等 SGLang 服务，必须为 VoiceScreen 预留显存。当前验证的共存配置把 SGLang 的静态显存比例从 `0.75` 调为 `0.60`：
+
+```yaml
+command:
+  - --mem-fraction-static
+  - "0.60"
+```
+
+修改后需要重建 SGLang 容器，而不是只重启进程：
+
+```bash
+docker compose -f <SGLANG_COMPOSE_FILE> up -d --force-recreate inference
+```
+
+等待 SGLang 的模型接口可用后，再启动 VoiceScreen 的 `model-service`。验收顺序：
+
+```bash
+curl -fsS http://127.0.0.1:8888/model_info
+curl -fsS http://127.0.0.1:18765/health
+curl -fsS http://127.0.0.1:18766/health
+```
+
+`--mem-fraction-static` 不是所有 SGLang 版本都使用的参数；如果启动器名称不同，请使用该版本等价的静态 KV-cache 显存参数。不要盲目降得过低，必须同时确认 27B 服务的上下文长度和吞吐仍满足需求。
+
 查看状态：
 
 ```bash
@@ -212,7 +238,7 @@ curl -fsS http://127.0.0.1:18767/health
 它要求：
 
 - `/opt/voicescreen/voicescreen-experiments/CosyVoice` 中存在固定版本的官方源码；
-- `/opt/voicescreen/models/voicescreen/Fun-CosyVoice3-0.5B-2512` 中存在模型；
+- `${VOICESCREEN_MODEL_ROOT}/Fun-CosyVoice3-0.5B-2512` 中存在模型；
 - 额外约 9 GB 模型磁盘与运行显存。
 
 测试完成后停止，释放 GPU 资源：
@@ -292,7 +318,7 @@ Windows 本地音色只在不使用 Spark 私人音色时需要。在“设置 �
 4. 展开高级设置。
 5. 语音识别选择 `Spark Qwen3-ASR 1.7B（推荐）`。
 6. 翻译选择 `Spark Qwen3-4B（推荐）`。
-7. Spark 服务地址填写 `http://spark-host.local:18765/`。
+7. Spark 服务地址填写你的 Spark 地址，例如 `http://spark-host.local:18765/`。
 8. 填入 Spark `.env` 中同一个访问令牌；令牌会在当前 Windows 用户下加密保存。
 9. 需要发送时，选择实体麦克风、本地耳机和私人音色；确认虚拟音频线自动选中 `CABLE Input`。
 10. 点击“开始监听”，等待顶部状态变成“运行中”。

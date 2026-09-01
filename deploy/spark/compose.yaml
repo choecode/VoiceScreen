@@ -18,7 +18,7 @@ services:
       VOICESCREEN_TRANSLATION_MODEL: /models/Qwen3-4B-Instruct-2507
       TOKENIZERS_PARALLELISM: "false"
     volumes:
-      - /opt/voicescreen/models/voicescreen:/models:ro
+      - ${VOICESCREEN_MODEL_ROOT:-/opt/voicescreen/models}:/models:ro
     deploy:
       resources:
         reservations:
@@ -51,11 +51,11 @@ services:
       VOICESCREEN_TTS_MODEL: /models/Qwen3-TTS-12Hz-0.6B-Base
       VOICESCREEN_VOICE_ID: my-voice
       VOICESCREEN_VOICE_REFERENCE: /profiles/my-voice-reference.wav
-      VOICESCREEN_VOICE_REFERENCE_TEXT: "Hello. This is my natural speaking voice. Today, I'm testing a real-time translation system."
+      VOICESCREEN_VOICE_REFERENCE_TEXT: ${VOICESCREEN_VOICE_REFERENCE_TEXT:?set VOICESCREEN_VOICE_REFERENCE_TEXT in .env}
       VOICESCREEN_VOICE_PROMPT: /profiles/my-voice.pt
     volumes:
-      - /opt/voicescreen/models/voicescreen:/models:ro
-      - /opt/voicescreen/models/voicescreen/voice-profiles:/profiles
+      - ${VOICESCREEN_MODEL_ROOT:-/opt/voicescreen/models}:/models:ro
+      - ${VOICESCREEN_VOICE_PROFILE_ROOT:-/opt/voicescreen/voice-profiles}:/profiles
     deploy:
       resources:
         reservations:
@@ -79,7 +79,7 @@ services:
       context: .
       dockerfile: Dockerfile.cosyvoice
       additional_contexts:
-        cosyvoice: ${COSYVOICE_SOURCE_PATH:-/opt/voicescreen/voicescreen-experiments/CosyVoice}
+        cosyvoice: ${COSYVOICE_SOURCE_PATH:-/opt/voicescreen-experiments/CosyVoice}
       args:
         PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
     image: voicescreen/cosyvoice-service:2026.08.25.1
@@ -94,10 +94,10 @@ services:
       VOICESCREEN_COSYVOICE_MODEL: /models/Fun-CosyVoice3-0.5B-2512
       VOICESCREEN_VOICE_ID: my-voice
       VOICESCREEN_VOICE_REFERENCE: /profiles/my-voice-reference.wav
-      VOICESCREEN_VOICE_REFERENCE_TEXT: "Hello. This is my natural speaking voice. Today, I'm testing a real-time translation system."
+      VOICESCREEN_VOICE_REFERENCE_TEXT: ${VOICESCREEN_VOICE_REFERENCE_TEXT:?set VOICESCREEN_VOICE_REFERENCE_TEXT in .env}
     volumes:
-      - /opt/voicescreen/models/voicescreen:/models:ro
-      - /opt/voicescreen/models/voicescreen/voice-profiles:/profiles:ro
+      - ${VOICESCREEN_MODEL_ROOT:-/opt/voicescreen/models}:/models:ro
+      - ${VOICESCREEN_VOICE_PROFILE_ROOT:-/opt/voicescreen/voice-profiles}:/profiles:ro
     deploy:
       resources:
         reservations:

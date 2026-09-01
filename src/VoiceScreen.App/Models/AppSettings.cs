@@ -6,7 +6,9 @@ public sealed class AppSettings
     // CloudMode is retained only to migrate settings written by older releases.
     public bool CloudMode { get; set; }
     public string AsrEngine { get; set; } = "qwen3-asr";
-    public string ModelServiceUrl { get; set; } = "http://spark-host.local:18765/";
+    // Public builds must not contain a machine-specific LAN address. Configure
+    // the Spark host in the UI or with --configure-model-service on first use.
+    public string ModelServiceUrl { get; set; } = "http://127.0.0.1:18765/";
     public string ModelServiceToken { get; set; } = string.Empty;
 
     /// <summary>

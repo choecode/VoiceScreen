@@ -21,14 +21,14 @@ Private reference recordings and generated voice-clone prompts are never part of
 - Model: [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
 - Project: [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)
 - Purpose: streaming and final speech recognition on the DGX Spark.
-- Runtime path: `/opt/voicescreen/models/voicescreen/Qwen3-ASR-1.7B`.
+- Runtime path: `<SPARK_MODEL_ROOT>/Qwen3-ASR-1.7B`.
 - Upstream model-card license: Apache-2.0 at the time of the 2026-08-25 review.
 
 ### Qwen3-4B-Instruct-2507
 
 - Model: [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
 - Purpose: Chinese/English/Thai translation and the constrained `BREAK` / `CONTINUE` subtitle-boundary classifier.
-- Runtime path: `/opt/voicescreen/models/voicescreen/Qwen3-4B-Instruct-2507`.
+- Runtime path: `<SPARK_MODEL_ROOT>/Qwen3-4B-Instruct-2507`.
 - Upstream model-card license: Apache-2.0 at the time of the 2026-08-25 review.
 
 ### Qwen3-TTS-12Hz-0.6B-Base
@@ -36,7 +36,7 @@ Private reference recordings and generated voice-clone prompts are never part of
 - Model: [Qwen/Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base)
 - Project: [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
 - Purpose: English voice cloning from a user-authorized reference recording.
-- Runtime path: `/opt/voicescreen/models/voicescreen/Qwen3-TTS-12Hz-0.6B-Base`.
+- Runtime path: `<SPARK_MODEL_ROOT>/Qwen3-TTS-12Hz-0.6B-Base`.
 - Upstream model-card license: Apache-2.0 at the time of the 2026-08-25 review.
 
 The generated voice output does not grant a right to imitate another person. Deployers must obtain consent for the reference recording and comply with applicable voice, likeness, privacy and disclosure rules.
@@ -107,7 +107,7 @@ The full required MIT notice is reproduced in `THIRD_PARTY_NOTICES.md`.
 
 - Project: [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice)
 - Purpose: isolated streaming TTS A/B against the production Qwen3-TTS path.
-- Runtime path: `/opt/voicescreen/models/voicescreen/Fun-CosyVoice3-0.5B-2512`.
+- Runtime path: `<SPARK_MODEL_ROOT>/Fun-CosyVoice3-0.5B-2512`.
 - Source checkout: supplied as a Docker named build context; it is not vendored here.
 - Deployment: Compose profile `experiments`, port `18767`; not started in production.
 - License: review both the pinned source revision and downloaded model card before use or redistribution.
@@ -117,8 +117,8 @@ The full required MIT notice is reproduced in `THIRD_PARTY_NOTICES.md`.
 The following files are deployment data, not redistributable project assets:
 
 ```text
-/opt/voicescreen/models/voicescreen/voice-profiles/my-voice-reference.wav
-/opt/voicescreen/models/voicescreen/voice-profiles/my-voice.pt
+<SPARK_PROFILE_ROOT>/my-voice-reference.wav
+<SPARK_PROFILE_ROOT>/my-voice.pt
 ```
 
 - `my-voice-reference.wav` is a user-authorized reference recording.

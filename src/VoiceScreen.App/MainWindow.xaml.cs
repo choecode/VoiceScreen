@@ -93,7 +93,7 @@ public partial class MainWindow : Window
         EnableOutgoingTranslationCheckBox.IsChecked = _settings.EnableOutgoingTranslation;
         OutgoingClauseStreamingCheckBox.IsChecked = _settings.OutgoingClauseStreaming;
         ModelServiceUrlTextBox.Text = string.IsNullOrWhiteSpace(_settings.ModelServiceUrl)
-            ? "http://spark-host.local:18765/"
+            ? "http://127.0.0.1:18765/"
             : _settings.ModelServiceUrl;
         ModelServiceTokenBox.Password = _settings.ModelServiceToken ?? string.Empty;
         MonitorTranslatedSpeechCheckBox.IsChecked = _settings.MonitorTranslatedSpeech;

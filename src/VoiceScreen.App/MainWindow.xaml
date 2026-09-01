@@ -408,8 +408,8 @@
                                               Foreground="{StaticResource AccentBrush}" Margin="0,2,0,10"
                                               Content="低延迟实时字幕" />
                                     <TextBlock Text="Spark 服务地址" Style="{StaticResource SectionLabel}" />
-                                    <TextBox x:Name="ModelServiceUrlTextBox" Text="http://spark-host.local:18765/"
-                                             Margin="0,5,0,10" ToolTip="Spark 上的 VoiceScreen 模型服务地址" />
+                                    <TextBox x:Name="ModelServiceUrlTextBox" Text="http://127.0.0.1:18765/"
+                                             Margin="0,5,0,10" ToolTip="Spark 上的 VoiceScreen 模型服务地址；请按部署环境填写" />
                                     <TextBlock Text="访问令牌" Style="{StaticResource SectionLabel}" />
                                     <PasswordBox x:Name="ModelServiceTokenBox" Margin="0,5,0,0"
                                                  ToolTip="已加密保存在本机" />

@@ -40,7 +40,7 @@ public sealed class SparkVoiceCloneService : IDisposable
     }
 
     public static bool IsVoiceId(string? voiceId) =>
-        string.Equals(voiceId, VoiceId, StringComparison.OrdinalIgnoreCase);
+        voiceId?.StartsWith("spark-clone:", StringComparison.OrdinalIgnoreCase) == true;
 
     public async Task<bool> IsHealthyAsync(CancellationToken cancellationToken)
     {
